@@ -1,0 +1,20 @@
+{
+  "name": "ai-council",
+  "interface": {
+    "displayName": "AI Council"
+  },
+  "plugins": [
+    {
+      "name": "ai-council-run-guard",
+      "source": {
+        "source": "local",
+        "path": "./plugins/ai-council-run-guard"
+      },
+      "policy": {
+        "installation": "INSTALLED_BY_DEFAULT",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "developer-tools"
+    }
+  ]
+}

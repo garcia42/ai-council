@@ -17,6 +17,7 @@ problems—or are they correlated copies producing expensive reassurance?
 | V1 append-only forecasts and Brier reporting | Operational |
 | V2 core lifecycle, exact custody, and finding capture | Implemented and tested |
 | V2 integrity-aware capture health and exogenous-only Brier | Implemented; not activated |
+| Bounded Codex runs, stuck detection, and durable handoffs | Implemented; repository hook plus portable plugin |
 | One-in-five independent finding audit | **Not implemented; activation blocker** |
 | Off-host durability age and verified-restore evidence | **Not supplied; activation blocker** |
 | Content-manifested local snapshot and clean restore | Rehearsal-only |
@@ -102,7 +103,14 @@ python3 -m venv .venv
 . .venv/bin/activate
 python -m pip install -e .
 PYTHONPATH=src:. python -m unittest discover -s tests -v
+python3 plugins/ai-council-run-guard/scripts/run_guard.py doctor --probe
 ```
+
+Codex work in this repository is governed by the checked-in bounded-run policy. It creates a
+90-minute checkpoint, stops tool use after four hours without a real-user renewal, caps council
+repair and full-qualification loops, and writes a durable `NOT READY` handoff when progress stalls.
+See [docs/RUN_GUARD.md](docs/RUN_GUARD.md) for the exact contract, new-machine setup, and the
+boundary between repository hooks and administrator-managed enforcement.
 
 For standalone use, always supply explicit local stores. Private prompts and answers belong outside
 the repository. When an explicit ledger is outside live council state and `--coordination-lock` is
