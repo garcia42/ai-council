@@ -1,0 +1,38 @@
+{
+  "schemaVersion": 2,
+  "createdAt": "2026-08-23T03:27:00Z",
+  "supersedes": "design/2026-08-22-council-usefulness-author-baseline.json",
+  "decisionFamilyId": "family-ai-council-usefulness-v2",
+  "question": "Should AI Council implement the corrected usefulness-measurement MVP now?",
+  "options": [
+    {"optionId": "OPT-01", "action": "implement-corrected-mvp"},
+    {"optionId": "OPT-02", "action": "keep-forecast-scoring-only"},
+    {"optionId": "OPT-03", "action": "adopt-external-observability-platform"}
+  ],
+  "intendedAction": {"optionId": "OPT-01", "status": "paused-for-binding-amendment"},
+  "knownConsiderations": [
+    {"considerationId": "KC-01", "claim": "Forecast calibration alone cannot measure novel useful findings."},
+    {"considerationId": "KC-02", "claim": "The current append-only ledger is a tested base for additive capture."},
+    {"considerationId": "KC-03", "claim": "Historical reconstructed baselines cannot support prospective novelty claims."},
+    {"considerationId": "KC-04", "claim": "Per-cell novelty and confidently-wrong adjudication was noisy."},
+    {"considerationId": "KC-05", "claim": "Recent councils are serially dependent within a few decision families."},
+    {"considerationId": "KC-06", "claim": "The evidence tree lacks a project-owned off-host backup path."},
+    {"considerationId": "KC-07", "claim": "Adding seats before finding capture creates more unscoreable output."},
+    {"considerationId": "KC-08", "claim": "Eligibility, activation, first-ten ordering, and handling-time clocks must be mechanical."},
+    {"considerationId": "KC-09", "claim": "V1 parsing must remain unchanged while V2 uses explicit dispatch and exact keys."},
+    {"considerationId": "KC-10", "claim": "Artifact references need content addressing, path containment, no-follow reads, and re-verification."},
+    {"considerationId": "KC-11", "claim": "Findings and dispositions need one frozen append-only state machine."},
+    {"considerationId": "KC-12", "claim": "Brier is descriptive forecast accuracy, not a calibration proof."},
+    {"considerationId": "KC-13", "claim": "Finding co-occurrence measures overlap, not causal redundancy or replaceability."}
+  ],
+  "mindChangers": [
+    {"mindChangerId": "MC-01", "claim": "Mixed V1 and V2 ledgers cannot be parsed without weakening strict failure behavior."},
+    {"mindChangerId": "MC-02", "claim": "The artifact protocol requires secrets, hidden reasoning, or irrelevant raw tool output."},
+    {"mindChangerId": "MC-03", "claim": "A timed structured rehearsal exceeds three minutes of active handling."},
+    {"mindChangerId": "MC-04", "claim": "Intervention-sensitive or legacy outcomes can enter headline Brier output."},
+    {"mindChangerId": "MC-05", "claim": "The evidence snapshot cannot be independently restored and verified."},
+    {"mindChangerId": "MC-06", "claim": "Parallel slices cannot integrate without weakening append-only guarantees."}
+  ],
+  "implementationDecision": "Proceed only after a correctly bound second council has no BLOCK; keep rollout capture-only.",
+  "authorForecast": 61
+}
