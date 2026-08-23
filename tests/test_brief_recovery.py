@@ -315,6 +315,22 @@ class BriefRecoveryTest(unittest.TestCase):
         self.assertEqual(result["cleanedTemporaries"], [str(Path("/") / leaked.relative_to(self.root))])
         self.assert_repaired(spec)
 
+    def test_resume_survives_a_peer_append_after_the_ledger_swap(self):
+        spec = self.plan()
+        with self.assertRaises(Crash):
+            self.recover(spec, checkpoint=crash_at("ledger-durable"))
+        # a legitimate council appends while the operator is asleep
+        with self.ledger.open("a", encoding="utf-8") as handle:
+            handle.write(canonical({"schemaVersion": 1, "kind": "council-attempt",
+                                    "runId": "run-" + "e" * 32}))
+        result = self.recover(spec, resume=True)
+        self.assertEqual(result["status"], "completed")
+        self.assertIn("ledger", result["reusedSteps"])
+        rows = [json.loads(l) for l in self.ledger.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(len(rows), 4)
+        self.assertEqual(rows[2]["blindSeat"]["brief"], spec["replacementBrief"]["destinationPath"])
+        self.assertEqual([r["status"] for r in self.audit_records(spec)], ["prepared", "completed"])
+
     def test_resume_refuses_a_completed_audit_over_an_unrepaired_ledger(self):
         spec = self.plan()
         self.recover(spec)
@@ -375,9 +391,21 @@ class BlindBriefIdentityGuardTest(unittest.TestCase):
         with self.assertRaisesRegex(Exception, "requires a blind brief path"):
             validate_blind_brief_identity(row, [])
 
-    def test_a_skipped_seat_may_omit_the_brief(self):
+    def test_a_skipped_seat_must_still_name_the_brief_it_was_given(self):
+        # The deployed kill criterion requires a brief on every explicit-run-state
+        # row. Accepting a briefless one here would append a line it then rejects.
         row = self.row(E8, {"ran": False, "required": False, "role": "SKIPPED"})
+        with self.assertRaisesRegex(Exception, "requires a blind brief path"):
+            validate_blind_brief_identity(row, [])
+
+    def test_a_pre_contract_row_without_a_ran_key_is_left_alone(self):
+        row = {"schemaVersion": 1, "kind": "council", "runId": E8, "blindSeat": {"role": "generic"}}
         validate_blind_brief_identity(row, [])
+
+    def test_a_malformed_run_id_raises_a_typed_error_not_a_key_error(self):
+        row = {"schemaVersion": 1, "kind": "council", "blindSeat": {"ran": True, "brief": "/x.md"}}
+        with self.assertRaisesRegex(Exception, "well-formed runId"):
+            validate_blind_brief_identity(row, [])
 
     def test_a_skipped_seat_that_names_a_brief_is_still_validated(self):
         row = self.row(E8, {"ran": False, "required": False, "brief": f"{BRIEFS}/x-{DDA}.md"})
@@ -406,6 +434,67 @@ class BlindBriefIdentityGuardTest(unittest.TestCase):
         row = self.row(E8, {"ran": True, "brief": f"~/knowledge/x-{E8}.md"})
         with self.assertRaisesRegex(Exception, "absolute and normalized"):
             validate_blind_brief_identity(row, [])
+
+
+class ValidatorAgreementTest(unittest.TestCase):
+    """The append rule must not admit a row the deployed kill criterion rejects.
+
+    The 2026-08-23 outage was one ledger line that the reader refused, halting
+    every later council. A row this validator accepts and that one rejects is
+    the same outage through a different door.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.log = Path(self.tmp.name) / "ledger.jsonl"
+
+    def criterion_errors(self, rows):
+        self.log.write_text(
+            "".join(json.dumps(r, sort_keys=True, separators=(",", ":")) + "\n" for r in rows),
+            encoding="utf-8",
+        )
+        out = __import__("subprocess").run(
+            [
+                "/usr/bin/python3.11",
+                "/home/trader/.claude/knowledge/council-eval/blind_seat_kill_criterion.py",
+                "--log",
+                str(self.log),
+                "--json",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        return json.loads(out.stdout)["errors"]
+
+    def seat_shapes(self):
+        base = {"required": True, "changedDecision": False, "role": "generic"}
+        return [
+            ("ran-true-with-brief", {**base, "ran": True, "brief": f"{BRIEFS}/a-{E8}.md"}),
+            ("ran-false-with-brief", {**base, "ran": False, "changedDecision": None,
+                                      "role": "SKIPPED", "blockedReason": "launcher failed",
+                                      "brief": f"{BRIEFS}/b-{E8}.md"}),
+            ("ran-false-no-brief", {**base, "ran": False, "changedDecision": None,
+                                    "role": "SKIPPED", "blockedReason": "launcher failed"}),
+            ("ran-true-no-brief", {**base, "ran": True}),
+        ]
+
+    def test_neither_validator_admits_what_the_other_refuses(self):
+        for name, seat in self.seat_shapes():
+            with self.subTest(shape=name):
+                row = {"schemaVersion": 1, "kind": "council", "runId": E8,
+                       "ts": "2026-08-23T18:00:00Z", "blindSeat": seat}
+                try:
+                    validate_blind_brief_identity(row, [])
+                    appended = True
+                except Exception:
+                    appended = False
+                accepted_by_criterion = not self.criterion_errors([row])
+                self.assertEqual(
+                    appended,
+                    accepted_by_criterion,
+                    f"{name}: append-rule={appended} kill-criterion={accepted_by_criterion}",
+                )
 
 
 if __name__ == "__main__":

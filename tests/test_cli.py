@@ -30,6 +30,7 @@ def completion(attempt):
             "required": False,
             "ran": False,
             "changedDecision": None,
+            "brief": f"/tmp/council-briefs/brief-{attempt['runId']}.md",
         },
         "forecastState": {
             "sealed": True,

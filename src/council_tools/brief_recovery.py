@@ -18,7 +18,7 @@ from .forecasts import LedgerError, _ledger_lock
 
 
 LIVE_KNOWLEDGE_ROOT = Path("/home/trader/.claude/knowledge")
-AUTHORITY_HOST = "manny"
+DEFAULT_AUTHORITY_HOST = "manny"
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 Checkpoint = Callable[[str], None]
 
@@ -215,10 +215,18 @@ def _assert_live_authority(*paths: Path) -> None:
         except ValueError:
             continue
         live.append(path)
-    if live and socket.gethostname().split(".")[0] != AUTHORITY_HOST:
+    if not live:
+        return
+    expected = os.environ.get(
+        "COUNCIL_LEDGER_AUTHORITY_HOST", DEFAULT_AUTHORITY_HOST
+    ).split(".")[0]
+    observed = socket.gethostname().split(".")[0]
+    if observed != expected:
         raise LedgerError(
-            f"valid-row recovery under live knowledge is authorized only on "
-            f"{AUTHORITY_HOST}; current host is {socket.gethostname().split('.')[0]}"
+            f"brief preparation and valid-row recovery under live knowledge are "
+            f"authorized only on {expected}; current host is {observed}. This is the "
+            f"same authority rule the ledger writers use; override it for a host "
+            f"migration with COUNCIL_LEDGER_AUTHORITY_HOST, not by editing source."
         )
 
 
@@ -357,6 +365,37 @@ def _load_spec(spec: Any) -> dict[str, Any]:
     return spec
 
 
+
+
+
+def _repaired_prefix_matches(observed: bytes, after: bytes, line_count: int) -> bool:
+    """True when the first ``line_count`` lines of ``observed`` are exactly ``after``.
+
+    A recovery that completes its ledger swap and then dies before its audit is
+    resumable only if a legitimate append landing in the meantime does not hide
+    the evidence. The ledger is append-only, so the repaired image survives as a
+    prefix; anything after it is somebody else's row and is none of our business.
+    """
+
+    lines = observed.splitlines(keepends=True)
+    if len(lines) < line_count:
+        return False
+    return b"".join(lines[:line_count]) == after
+
+
+def _is_repaired_image(observed: bytes, spec: dict[str, Any]) -> bool:
+    """Cheap pre-check that the target row is already repaired in ``observed``."""
+
+    lines = observed.splitlines(keepends=True)
+    target_index = spec["target"]["line"] - 1
+    if len(lines) < spec["ledger"]["expectedLineCount"] or target_index >= len(lines):
+        return False
+    if _digest(lines[target_index]) != spec["expectedAfter"]["targetRawLineSha256"]:
+        return False
+    return (
+        _digest(b"".join(lines[:target_index]))
+        == spec["expectedAfter"]["unaffectedPrefixSha256"]
+    )
 
 
 def _read_audit_records(path: Path) -> list[dict[str, Any]]:
@@ -508,7 +547,7 @@ def recover_blind_brief(
             ledger_phase = "before"
             before = observed
             before_stat = observed_stat
-        elif resume and observed_sha == spec["expectedAfter"]["ledgerSha256"]:
+        elif resume and _is_repaired_image(observed, spec):
             ledger_phase = "after"
             if not backup.is_file():
                 raise LedgerError(
@@ -613,7 +652,7 @@ def recover_blind_brief(
         ]
         if new_owners != [[spec["target"]["conflictingLine"]], [spec["target"]["line"]]]:
             raise LedgerError("recovery does not yield one owner per affected brief")
-        if ledger_phase == "after" and observed != after:
+        if ledger_phase == "after" and not _repaired_prefix_matches(observed, after, len(lines)):
             raise LedgerError("ledger is at neither the recorded before nor the planned after image")
         checkpoint("validated")
 
@@ -725,7 +764,7 @@ def recover_blind_brief(
         after_stat = _real_existing_file(ledger, "ledger")
         if stat.S_IMODE(after_stat.st_mode) != expected_mode:
             raise LedgerError("ledger mode was not preserved")
-        if ledger.read_bytes() != after:
+        if not _repaired_prefix_matches(ledger.read_bytes(), after, len(lines)):
             raise LedgerError("post-recovery ledger bytes differ from the planned image")
         if already_completed:
             reused.append("completion-audit")

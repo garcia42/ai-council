@@ -600,31 +600,40 @@ def evidence_write_lock(path: str | Path | None):
 
 
 
+RUN_ID_RE = re.compile(r"run-[0-9a-f]{32}")
+
 def validate_blind_brief_identity(
     row: dict[str, Any], prior_rows: Iterable[dict[str, Any]]
 ) -> None:
     """One immutable run-scoped brief path per council row.
 
-    A blind seat that actually ran must name the brief it read. A skipped or
-    blocked seat may omit it, but any brief it does record is held to the same
-    run-scoped uniqueness, because reuse is what lets one council's answer be
-    attributed to another's question.
+    Any row carrying an explicit ``ran`` state must name the brief that state
+    refers to, whether the seat ran or was skipped — a skipped seat was still
+    given a question, and the deployed kill criterion has required a brief on
+    every explicit-run-state row since before this rule existed. Accepting a
+    briefless row here would append a line that the criterion then rejects,
+    halting every later council: the same outage through a different door.
+
+    Rows with no ``ran`` key at all are pre-contract legacy and are left alone,
+    exactly as the kill criterion leaves them alone.
     """
 
     blind_seat = row.get("blindSeat")
     if not isinstance(blind_seat, dict):
         raise LedgerError("new council completion requires blindSeat object")
-    brief = blind_seat.get("brief")
-    ran = blind_seat.get("ran") is True
-    if not isinstance(brief, str) or not brief.strip():
-        if ran:
-            raise LedgerError("new council completion requires a blind brief path")
+    if "ran" not in blind_seat:
         return
+    run_id = row.get("runId")
+    if not isinstance(run_id, str) or not RUN_ID_RE.fullmatch(run_id):
+        raise LedgerError("new council completion requires a well-formed runId")
+    brief = blind_seat.get("brief")
+    if not isinstance(brief, str) or not brief.strip():
+        raise LedgerError("new council completion requires a blind brief path")
     brief = brief.strip()
     brief_path = Path(brief)
     if not brief_path.is_absolute() or brief_path != Path(os.path.abspath(brief_path)):
         raise LedgerError("new council blind brief path must be absolute and normalized")
-    if row["runId"] not in brief_path.name:
+    if run_id not in brief_path.name:
         raise LedgerError("new council blind brief path must contain its exact runId")
     resolved_brief = brief_path.resolve(strict=False)
     for prior in prior_rows:
