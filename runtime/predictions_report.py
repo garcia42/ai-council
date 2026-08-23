@@ -3,6 +3,7 @@
 
 import hashlib
 import os
+import pwd
 import subprocess
 import sys
 from pathlib import Path
@@ -11,11 +12,12 @@ from pathlib import Path
 SOURCE_ROOT = Path("@@COUNCIL_TOOLS_SOURCE_ROOT@@")
 EXPECTED_COMMIT = "@@COUNCIL_TOOLS_COMMIT@@"
 EXPECTED_SOURCE_SHA256 = "@@COUNCIL_TOOLS_SOURCE_SHA256@@"
-COUNCIL_LOG = Path.home() / ".claude/knowledge/futures-panel-log.jsonl"
+ACCOUNT_HOME = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
+COUNCIL_LOG = ACCOUNT_HOME / ".claude/knowledge/futures-panel-log.jsonl"
 COUNCIL_RESOLVED = (
-    Path.home() / ".claude/knowledge/council-eval/predictions_resolved.jsonl"
+    ACCOUNT_HOME / ".claude/knowledge/council-eval/predictions_resolved.jsonl"
 )
-LIVE_KNOWLEDGE_ROOT = (Path.home() / ".claude/knowledge").resolve()
+LIVE_KNOWLEDGE_ROOT = (ACCOUNT_HOME / ".claude/knowledge").resolve()
 
 
 def _install_deny_path_audit_hook() -> None:
@@ -132,4 +134,9 @@ if __name__ == "__main__":
             "timestamp/index resolution is retired; use resolve <outcomeId> "
             "true|false|void with evidence"
         )
-    raise SystemExit(main())
+    raise SystemExit(
+        main(
+            runtime_source_commit=EXPECTED_COMMIT,
+            runtime_source_root=SOURCE_ROOT,
+        )
+    )

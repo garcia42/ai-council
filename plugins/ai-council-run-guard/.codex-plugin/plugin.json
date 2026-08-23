@@ -1,0 +1,22 @@
+{
+  "name": "ai-council-run-guard",
+  "version": "0.1.0",
+  "description": "Bound long Codex and council runs with deterministic budgets, stuck detection, and handoffs.",
+  "author": {
+    "name": "AI Council contributors"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "AI Council Run Guard",
+    "shortDescription": "Stop costly, circular agent runs cleanly.",
+    "longDescription": "Applies repository-owned time, review, agent, qualification, and stuck-loop limits, then writes a durable checkpoint or NOT READY handoff.",
+    "developerName": "AI Council contributors",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Run budgets",
+      "Stuck-loop detection",
+      "Machine-written handoffs"
+    ],
+    "defaultPrompt": "Use the repository bounded-run contract and report the remaining budget before starting."
+  }
+}

@@ -4,10 +4,14 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
-from council_tools import cli
+from council_tools import capture_runtime, cli
+from council_tools import safe_files
+from council_tools.artifacts import ArtifactStore
 from council_tools.forecasts import append_ledger_row, make_attempt, new_id
 
 
@@ -50,7 +54,9 @@ def completion(attempt):
 
 class ForecastCliTest(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
+        # /tmp is intentionally marked as a Git work tree on this host, while
+        # capture artifacts must live outside every repository boundary.
+        self.temp = tempfile.TemporaryDirectory(dir="/var/tmp")
         self.root = Path(self.temp.name)
         self.log = self.root / "panel.jsonl"
         self.events = self.root / "events.jsonl"
@@ -59,15 +65,31 @@ class ForecastCliTest(unittest.TestCase):
         self.temp.cleanup()
 
     def run_cli(self, *args):
+        arguments = list(args)
         env = dict(os.environ)
         env["PYTHONPATH"] = str(Path(__file__).parents[1] / "src")
         return subprocess.run(
-            [sys.executable, "-m", "council_tools.cli", *args],
+            [sys.executable, "-m", "council_tools.cli", *arguments],
             text=True,
             capture_output=True,
             env=env,
             check=False,
         )
+
+    def activation_manifest(self, commit):
+        controls = sorted(cli._ACTIVATION_CONTROL_KEYS)
+        return {
+            "schemaVersion": 1,
+            "runtimeSourceCommit": commit,
+            "approvals": {control: "APPROVED" for control in controls},
+            "evidence": {
+                control: {
+                    "status": "VERIFIED",
+                    "evidenceRef": f"evidence:{control}",
+                }
+                for control in controls
+            },
+        }
 
     def test_report_json_uses_injected_paths_and_clock(self):
         result = self.run_cli(
@@ -341,15 +363,1613 @@ class ForecastCliTest(unittest.TestCase):
             with self.assertRaisesRegex(cli.LedgerError, "authorized only on manny"):
                 cli._require_write_authority(cli.DEFAULT_LOG)
 
+    def test_derived_ledger_lock_alias_into_live_tree_requires_authority(self):
+        attempt_spec = self.root / "attempt.json"
+        attempt_spec.write_text(
+            json.dumps(
+                {
+                    "question": "Reject a redirected derived lock?",
+                    "expectedSeats": ["code"],
+                    "sharedOutcome": {
+                        "claim": "The derived ledger lock remains local",
+                        "resolutionDate": "2026-09-30",
+                        "resolvedBy": "Inspect the derived lock target",
+                        "decisionLink": "Local rehearsal safety",
+                        "materiality": "A redirected lock can mutate live state",
+                        "actionIfTrue": "Continue local rehearsal",
+                        "actionIfFalse": "Repair the lock boundary",
+                        "evidenceCutoffAt": "2026-08-22T12:00:00Z",
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        derived = cli.derived_ledger_lock_path(self.log)
+        derived.symlink_to(
+            cli.LIVE_RUNTIME_STATE_ROOT / "dangling-derived-lock"
+        )
+        args = SimpleNamespace(
+            log=str(self.log),
+            spec=str(attempt_spec),
+            ts="2026-08-22T12:00:00Z",
+            coordination_lock=str(self.root / "coordination.lock"),
+        )
+        with mock.patch.object(cli.socket, "gethostname", return_value="not-manny"):
+            with self.assertRaisesRegex(cli.LedgerError, "authorized only on manny"):
+                cli.command_attempt(args)
+        self.assertFalse(self.log.exists())
+
+    def test_capture_resolve_authorizes_live_source_ledger_before_any_open(self):
+        fake_live_root = self.root / "fake-live"
+        fake_live_root.mkdir()
+        live_log = fake_live_root / "capture.jsonl"
+        live_log_lock = cli.derived_ledger_lock_path(live_log)
+        args = SimpleNamespace(
+            log=str(live_log),
+            events=str(self.events),
+            coordination_lock=str(self.root / "external-coordination.lock"),
+            outcome_id=new_id("outcome"),
+            outcome="true",
+            evidence="external evidence",
+            resolver="operator",
+            method="deterministic",
+            reviewer=None,
+            void_reason=None,
+            supersedes=None,
+        )
+        with (
+            mock.patch.object(cli, "LIVE_WRITE_ROOTS", (fake_live_root.resolve(),)),
+            mock.patch.object(cli.socket, "gethostname", return_value="not-manny"),
+            mock.patch.object(cli, "append_capture_resolution") as append,
+            mock.patch("builtins.print") as output,
+        ):
+            with self.assertRaisesRegex(cli.LedgerError, "authorized only on manny"):
+                cli.command_capture_resolve(args)
+        append.assert_not_called()
+        output.assert_not_called()
+        self.assertFalse(live_log.exists())
+        self.assertFalse(live_log_lock.exists())
+        self.assertFalse(self.events.exists())
+        self.assertFalse(Path(args.coordination_lock).exists())
+
+    def test_capture_resolve_allows_entirely_external_paths_off_authority_host(self):
+        args = SimpleNamespace(
+            log=str(self.log),
+            events=str(self.events),
+            coordination_lock=str(self.root / "external-coordination.lock"),
+            outcome_id=new_id("outcome"),
+            outcome="false",
+            evidence="external evidence",
+            resolver="operator",
+            method="deterministic",
+            reviewer=None,
+            void_reason=None,
+            supersedes=None,
+        )
+        event = {"resolutionId": new_id("resolution")}
+        with (
+            mock.patch.object(cli.socket, "gethostname", return_value="not-manny"),
+            mock.patch.object(
+                cli, "append_capture_resolution", return_value=event
+            ) as append,
+            mock.patch("builtins.print") as output,
+        ):
+            self.assertEqual(cli.command_capture_resolve(args), 0)
+        append.assert_called_once()
+        payload = json.loads(output.call_args.args[0])
+        self.assertEqual(payload["resolutionId"], event["resolutionId"])
+        self.assertEqual(payload["transactionEscrows"], [])
+
+    def test_capture_resolve_allows_live_source_ledger_on_authority_host(self):
+        fake_live_root = self.root / "fake-live"
+        fake_live_root.mkdir()
+        args = SimpleNamespace(
+            log=str(fake_live_root / "capture.jsonl"),
+            events=str(self.events),
+            coordination_lock=str(self.root / "external-coordination.lock"),
+            outcome_id=new_id("outcome"),
+            outcome="true",
+            evidence="external evidence",
+            resolver="operator",
+            method="deterministic",
+            reviewer=None,
+            void_reason=None,
+            supersedes=None,
+        )
+        event = {"resolutionId": new_id("resolution")}
+        with (
+            mock.patch.object(cli, "LIVE_WRITE_ROOTS", (fake_live_root.resolve(),)),
+            mock.patch.object(cli.socket, "gethostname", return_value="manny"),
+            mock.patch.object(
+                cli, "append_capture_resolution", return_value=event
+            ) as append,
+            mock.patch("builtins.print") as output,
+        ):
+            self.assertEqual(cli.command_capture_resolve(args), 0)
+        append.assert_called_once()
+        payload = json.loads(output.call_args.args[0])
+        self.assertEqual(payload["resolutionId"], event["resolutionId"])
+        self.assertEqual(payload["transactionEscrows"], [])
+
+    def test_capture_resolve_secret_unknown_outcome_is_nonreflective(self):
+        secret = "sk-proj-" + "Q" * 40
+        events = self.root / "secret-resolution-events.jsonl"
+
+        result = self.run_cli(
+            "capture-resolve",
+            secret,
+            "true",
+            "--log",
+            str(self.log),
+            "--events",
+            str(events),
+            "--evidence",
+            "deterministic fixture",
+            "--resolver",
+            "test-harness",
+            "--method",
+            "deterministic",
+            "--coordination-lock",
+            str(self.root / "secret-resolution.lock"),
+        )
+
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertNotIn(secret, result.stderr)
+        self.assertIn("secret preflight", result.stderr)
+        self.assertFalse(events.exists())
+
+    def test_capture_resolve_canonical_json_aws_secret_is_nonreflective(self):
+        secret_value = "B" * 40
+        evidence = json.dumps(
+            {"AWS_SECRET_ACCESS_KEY": secret_value},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        events = self.root / "aws-secret-resolution-events.jsonl"
+        coordination = self.root / "aws-secret-resolution.lock"
+
+        result = self.run_cli(
+            "capture-resolve",
+            "outcome-" + "a" * 32,
+            "true",
+            "--log",
+            str(self.log),
+            "--events",
+            str(events),
+            "--evidence",
+            evidence,
+            "--resolver",
+            "test-harness",
+            "--method",
+            "deterministic",
+            "--coordination-lock",
+            str(coordination),
+        )
+
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertNotIn(secret_value, result.stderr)
+        self.assertIn("secret preflight", result.stderr)
+        self.assertIn("aws-secret-assignment", result.stderr)
+        self.assertFalse(self.log.exists())
+        self.assertFalse(events.exists())
+        self.assertFalse(coordination.exists())
+
+    def test_outside_hardlink_to_live_ledger_fails_before_append(self):
+        fake_live_root = self.root / "fake-live"
+        fake_live_root.mkdir()
+        fake_live_ledger = fake_live_root / "panel.jsonl"
+        fake_live_ledger.write_bytes(b"")
+        os.link(fake_live_ledger, self.log)
+        attempt_spec = self.root / "attempt.json"
+        attempt_spec.write_text(
+            json.dumps(
+                {
+                    "question": "Reject a live-ledger hardlink?",
+                    "expectedSeats": ["code"],
+                    "sharedOutcome": {
+                        "claim": "The outside hardlink is not appended",
+                        "resolutionDate": "2026-09-30",
+                        "resolvedBy": "Inspect the simulated live ledger",
+                        "decisionLink": "Ledger identity safety",
+                        "materiality": "A hardlink bypass mutates live evidence",
+                        "actionIfTrue": "Continue local testing",
+                        "actionIfFalse": "Repair identity checks",
+                        "evidenceCutoffAt": "2026-08-22T12:00:00Z",
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        args = SimpleNamespace(
+            log=str(self.log),
+            spec=str(attempt_spec),
+            ts="2026-08-22T12:00:00Z",
+            coordination_lock=str(self.root / "coordination.lock"),
+        )
+        with (
+            mock.patch.object(cli, "LIVE_WRITE_ROOTS", (fake_live_root.resolve(),)),
+            mock.patch.object(cli.socket, "gethostname", return_value="not-manny"),
+        ):
+            with self.assertRaisesRegex(cli.LedgerError, "hardlink alias"):
+                cli.command_attempt(args)
+        self.assertEqual(fake_live_ledger.read_bytes(), b"")
+        self.assertEqual(self.log.read_bytes(), b"")
+
+    def test_activation_parent_swap_to_live_symlink_fails_at_mutation_boundary(self):
+        fake_live_root = self.root / "fake-live"
+        fake_live_root.mkdir()
+        store_parent = self.root / "activation-store"
+        store_parent.mkdir()
+        displaced_parent = self.root / "activation-store-before-swap"
+        log = store_parent / "capture.jsonl"
+        activation_spec = self.root / "activation.json"
+        activation_spec.write_text(
+            json.dumps(
+                {
+                    "cohortName": "parent-swap-test",
+                    "captureVersion": "capture-v2.0.0",
+                    "runtimeSourceCommit": "a" * 40,
+                    "artifactRootPolicy": "private-content-addressed-v1",
+                }
+            ),
+            encoding="utf-8",
+        )
+        args = SimpleNamespace(
+            log=str(log),
+            spec=str(activation_spec),
+            approval_manifest_file=None,
+            artifact_root=None,
+            coordination_lock=str(self.root / "coordination.lock"),
+        )
+
+        def swap_then_mutate(path, _spec, *, coordination_lock):
+            self.assertEqual(coordination_lock, args.coordination_lock)
+            store_parent.rename(displaced_parent)
+            store_parent.symlink_to(fake_live_root, target_is_directory=True)
+            safe_files.atomic_append_bytes(
+                path,
+                b'{}\n',
+                require_trailing_newline=True,
+            )
+
+        with (
+            mock.patch.object(
+                cli,
+                "LIVE_WRITE_ROOTS",
+                (*cli.LIVE_WRITE_ROOTS, fake_live_root.resolve()),
+            ),
+            mock.patch.object(cli.socket, "gethostname", return_value="not-manny"),
+            mock.patch.object(
+                cli,
+                "append_capture_activation",
+                side_effect=swap_then_mutate,
+            ),
+        ):
+            with self.assertRaisesRegex(
+                safe_files.SafeFileError, "unsafe parent component"
+            ):
+                cli.command_capture_activate(args)
+        self.assertFalse((fake_live_root / "capture.jsonl").exists())
+
+    def test_cli_activation_rejects_plain_live_parent_substitution_before_derived_lock(self):
+        fake_live_root = self.root / "fake-live-plain"
+        fake_live_root.mkdir()
+        store_parent = self.root / "plain-activation-store"
+        store_parent.mkdir()
+        displaced_parent = self.root / "plain-activation-store-before-swap"
+        log = store_parent / "capture.jsonl"
+        activation_spec = self.root / "plain-activation.json"
+        activation_spec.write_text(
+            json.dumps(
+                {
+                    "cohortName": "plain-parent-swap-test",
+                    "captureVersion": "capture-v2.0.0",
+                    "runtimeSourceCommit": "a" * 40,
+                    "artifactRootPolicy": "private-content-addressed-v1",
+                }
+            ),
+            encoding="utf-8",
+        )
+        coordination_lock = self.root / "plain-coordination.lock"
+        args = SimpleNamespace(
+            log=str(log),
+            spec=str(activation_spec),
+            approval_manifest_file=None,
+            artifact_root=None,
+            coordination_lock=str(coordination_lock),
+        )
+        real_classifier = capture_runtime._is_live_activation_target
+
+        def classify_then_swap(path, roots):
+            classified = real_classifier(path, roots)
+            self.assertFalse(classified)
+            store_parent.rename(displaced_parent)
+            fake_live_root.rename(store_parent)
+            return classified
+
+        with (
+            mock.patch.object(
+                capture_runtime,
+                "_os_account_live_write_roots",
+                return_value=(fake_live_root.resolve(),),
+            ),
+            mock.patch.object(
+                capture_runtime,
+                "_is_live_activation_target",
+                side_effect=classify_then_swap,
+            ),
+        ):
+            with self.assertRaisesRegex(
+                capture_runtime.CaptureRuntimeError,
+                "direct live capture activation is blocked",
+            ):
+                cli.command_capture_activate(args)
+
+        self.assertFalse(log.exists())
+        self.assertFalse(log.with_name("capture.jsonl.lock").exists())
+        self.assertEqual(list(displaced_parent.iterdir()), [])
+
+    def test_omitted_coordination_lock_is_local_for_standalone_store(self):
+        attempt_spec = self.root / "attempt.json"
+        attempt_spec.write_text(
+            json.dumps(
+                {
+                    "question": "Use a standalone local store?",
+                    "expectedSeats": ["code"],
+                    "sharedOutcome": {
+                        "claim": "The local invocation avoids live runtime state",
+                        "resolutionDate": "2026-09-30",
+                        "resolvedBy": "Inspect local filesystem paths",
+                        "decisionLink": "Off-host rehearsal",
+                        "materiality": "Touching the live lock defeats isolation",
+                        "actionIfTrue": "Continue rehearsal",
+                        "actionIfFalse": "Repair lock derivation",
+                        "evidenceCutoffAt": "2026-08-22T12:00:00Z",
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        args = cli.build_parser().parse_args(
+            ["attempt", "--log", str(self.log), "--spec", str(attempt_spec)]
+        )
+        self.assertIsNone(args.coordination_lock)
+        cli._resolve_coordination_lock(args)
+        expected = self.log.with_name(f"{self.log.name}.evidence.lock")
+        self.assertEqual(Path(args.coordination_lock), expected)
+        with mock.patch.object(cli.socket, "gethostname", return_value="not-manny"):
+            self.assertEqual(cli.command_attempt(args), 0)
+        self.assertTrue(expected.is_file())
+        self.assertNotEqual(
+            Path(cli.DEFAULT_COORDINATION_LOCK).resolve(strict=False),
+            expected.resolve(strict=False),
+        )
+
+    def test_default_live_store_retains_live_coordination_lock(self):
+        args = cli.build_parser().parse_args(
+            ["attempt", "--spec", str(self.root / "attempt.json")]
+        )
+        cli._resolve_coordination_lock(args)
+        self.assertEqual(args.coordination_lock, cli.DEFAULT_COORDINATION_LOCK)
+
+    def test_local_resolution_uses_the_ledger_coordination_lock(self):
+        args = cli.build_parser().parse_args(
+            [
+                "resolve",
+                "outcome-" + "a" * 32,
+                "true",
+                "--log",
+                str(self.log),
+                "--events",
+                str(self.events),
+                "--evidence",
+                "local evidence",
+                "--resolver",
+                "operator",
+                "--method",
+                "deterministic",
+            ]
+        )
+        cli._resolve_coordination_lock(args)
+        self.assertEqual(
+            Path(args.coordination_lock),
+            self.log.with_name(f"{self.log.name}.evidence.lock"),
+        )
+
+    def test_complete_check_only_neither_authorizes_nor_binds_a_lock(self):
+        seeded = make_attempt(
+            question="Validate a completion without writing?",
+            expected_seats=["code"],
+            claim="Check-only makes no filesystem mutation",
+            resolution_date="2026-09-30",
+            resolved_by="Inspect the local ledger",
+            decision_link="Completion validation",
+            materiality="Validation must be safe off-host",
+            action_if_true="Append separately",
+            action_if_false="Repair the completion",
+            evidence_cutoff_at="2026-08-22T12:00:00Z",
+            ts="2026-08-22T12:00:00Z",
+        )
+        append_ledger_row(self.log, seeded)
+        complete_spec = self.root / "complete.json"
+        complete_spec.write_text(
+            json.dumps(
+                {
+                    "runId": seeded["runId"],
+                    "councilFields": {
+                        "verdicts": {"code": "APPROVE"},
+                        "blindSeat": {
+                            "role": "SKIPPED",
+                            "required": False,
+                            "ran": False,
+                            "changedDecision": None,
+                        },
+                    },
+                    "seatStates": {"code": "submitted"},
+                    "probabilities": {"code": 50},
+                }
+            ),
+            encoding="utf-8",
+        )
+        args = cli.build_parser().parse_args(
+            [
+                "complete",
+                "--log",
+                str(self.log),
+                "--spec",
+                str(complete_spec),
+                "--check-only",
+            ]
+        )
+        cli._resolve_coordination_lock(args)
+        self.assertIsNone(args.coordination_lock)
+        with mock.patch.object(cli, "_require_ledger_write_authority") as authority:
+            self.assertEqual(cli.command_complete(args), 0)
+        authority.assert_not_called()
+
+    def test_live_write_authority_ignores_caller_environment_override(self):
+        with (
+            mock.patch.object(cli.socket, "gethostname", return_value="attacker-host"),
+            mock.patch.dict(
+                os.environ,
+                {"COUNCIL_LEDGER_AUTHORITY_HOST": "attacker-host"},
+            ),
+        ):
+            with self.assertRaisesRegex(cli.LedgerError, "authorized only on manny"):
+                cli._require_write_authority(cli.DEFAULT_LOG)
+
+    def test_live_paths_use_os_account_home_not_caller_home_environment(self):
+        env = dict(os.environ)
+        env["HOME"] = str(self.root / "forged-home")
+        env["PYTHONPATH"] = str(Path(__file__).parents[1] / "src")
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import os,pwd; from pathlib import Path; "
+                    "from council_tools import cli; "
+                    "home=Path(pwd.getpwuid(os.getuid()).pw_dir).resolve(); "
+                    "assert cli.ACCOUNT_HOME == home; "
+                    "assert Path(cli.DEFAULT_LOG).is_relative_to(home); "
+                    "assert str(cli.DEFAULT_LOG).startswith(str(home / '.claude'))"
+                ),
+            ],
+            text=True,
+            capture_output=True,
+            env=env,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_authority_covers_custom_live_subpaths_and_symlink_aliases(self):
+        custom_paths = (
+            cli.LIVE_KNOWLEDGE_ROOT / "custom/capture-artifacts",
+            cli.LIVE_RUNTIME_STATE_ROOT / "custom/capture-artifacts",
+            cli.LIVE_RUNTIME_SOURCE_ROOT / "custom/capture-artifacts",
+        )
+        outside_alias = self.root / "live-alias"
+        outside_alias.symlink_to(cli.LIVE_RUNTIME_STATE_ROOT, target_is_directory=True)
+        with mock.patch.object(cli.socket, "gethostname", return_value="not-manny"):
+            for path in (*custom_paths, outside_alias / "nested"):
+                with self.subTest(path=path):
+                    with self.assertRaisesRegex(
+                        cli.LedgerError, "authorized only on manny"
+                    ):
+                        cli._require_write_authority(path)
+
+    def test_non_live_temp_write_paths_do_not_require_authority(self):
+        snapshot_args = SimpleNamespace(
+            log=str(self.log),
+            events=str(self.events),
+            control_store=str(self.root / "control"),
+            artifact_root=str(self.root / "artifacts"),
+            coordination_lock=str(self.root / "coordination.lock"),
+            target=str(self.root / "snapshot"),
+            repository_root=str(self.root / "repository"),
+        )
+        restore_args = SimpleNamespace(
+            snapshot=str(self.root / "snapshot"),
+            target=str(self.root / "restore"),
+            repository_root=str(self.root / "repository"),
+        )
+        with (
+            mock.patch.object(cli.socket, "gethostname", return_value="not-manny"),
+            mock.patch.object(
+                cli, "create_evidence_snapshot", return_value={"status": "created"}
+            ) as snapshot,
+            mock.patch.object(
+                cli, "restore_evidence_snapshot", return_value={"status": "restored"}
+            ) as restore,
+        ):
+            cli._require_write_authority(
+                self.root / "artifacts",
+                self.root / "snapshot",
+                self.root / "restore",
+                self.root / "coordination.lock",
+            )
+            self.assertEqual(cli.command_evidence_snapshot(snapshot_args), 0)
+            self.assertEqual(cli.command_evidence_restore(restore_args), 0)
+        snapshot.assert_called_once()
+        restore.assert_called_once()
+
+    def test_snapshot_and_restore_live_targets_require_authority(self):
+        snapshot_args = SimpleNamespace(
+            log=str(self.log),
+            events=str(self.events),
+            control_store=str(self.root / "control"),
+            artifact_root=str(self.root / "artifacts"),
+            coordination_lock=str(self.root / "coordination.lock"),
+            target=str(cli.LIVE_RUNTIME_STATE_ROOT / "custom-snapshot"),
+            repository_root=str(self.root / "repository"),
+        )
+        restore_args = SimpleNamespace(
+            snapshot=str(self.root / "snapshot"),
+            target=str(cli.LIVE_KNOWLEDGE_ROOT / "custom-restore"),
+            repository_root=str(self.root / "repository"),
+        )
+        with (
+            mock.patch.object(cli.socket, "gethostname", return_value="not-manny"),
+            mock.patch.object(cli, "create_evidence_snapshot") as snapshot,
+            mock.patch.object(cli, "restore_evidence_snapshot") as restore,
+        ):
+            with self.assertRaisesRegex(cli.LedgerError, "authorized only on manny"):
+                cli.command_evidence_snapshot(snapshot_args)
+            with self.assertRaisesRegex(cli.LedgerError, "authorized only on manny"):
+                cli.command_evidence_restore(restore_args)
+        snapshot.assert_not_called()
+        restore.assert_not_called()
+
+    def test_custom_live_artifact_subpath_requires_authority(self):
+        args = SimpleNamespace(
+            run_id=None,
+            log=None,
+            operator=None,
+            evidence_ref=None,
+            control_artifact=True,
+            artifact_root=str(cli.LIVE_RUNTIME_STATE_ROOT / "custom-artifacts"),
+            coordination_lock=str(self.root / "coordination.lock"),
+            file=str(self.root / "input.txt"),
+            secret_token_file=[],
+        )
+        with (
+            mock.patch.object(cli.socket, "gethostname", return_value="not-manny"),
+            mock.patch.object(cli, "ArtifactStore") as store,
+        ):
+            with self.assertRaisesRegex(cli.LedgerError, "authorized only on manny"):
+                cli.command_capture_artifact(args)
+        store.assert_not_called()
+
     def test_live_report_refuses_injected_test_clock(self):
-        args = mock.Mock(
-            today="2026-01-01",
-            log=cli.DEFAULT_LOG,
-            events=cli.DEFAULT_EVENTS,
+        for log, events in (
+            (cli.DEFAULT_LOG, cli.DEFAULT_EVENTS),
+            (
+                str(cli.LIVE_RUNTIME_STATE_ROOT / "custom-log.jsonl"),
+                str(cli.LIVE_RUNTIME_STATE_ROOT / "custom-events.jsonl"),
+            ),
+        ):
+            with self.subTest(log=log):
+                args = mock.Mock(
+                    today="2026-01-01",
+                    log=log,
+                    events=events,
+                    json=True,
+                )
+                with self.assertRaisesRegex(cli.LedgerError, "test-only"):
+                    cli.command_report(args)
+
+        capture_args = mock.Mock(
+            as_of="2026-01-01T00:00:00Z",
+            log=str(cli.LIVE_RUNTIME_STATE_ROOT / "capture-log.jsonl"),
+            events=str(cli.LIVE_RUNTIME_STATE_ROOT / "capture-events.jsonl"),
+            artifact_root=str(self.root / "artifacts"),
             json=True,
         )
         with self.assertRaisesRegex(cli.LedgerError, "test-only"):
-            cli.command_report(args)
+            cli.command_capture_report(capture_args)
+
+    def test_resolution_cli_rejects_operator_timestamp_and_uses_system_clock(self):
+        outcome_id = new_id("outcome")
+        rejected = self.run_cli(
+            "resolve",
+            outcome_id,
+            "true",
+            "--log",
+            str(self.log),
+            "--events",
+            str(self.events),
+            "--evidence",
+            "test evidence",
+            "--resolver",
+            "operator",
+            "--method",
+            "deterministic",
+            "--resolved-at",
+            "2099-01-01T00:00:00Z",
+        )
+        self.assertEqual(rejected.returncode, 2)
+        self.assertIn("unrecognized arguments: --resolved-at", rejected.stderr)
+
+        args = SimpleNamespace(
+            events=str(self.events),
+            log=str(self.log),
+            coordination_lock=str(self.root / "coordination.lock"),
+            outcome_id=outcome_id,
+            outcome="true",
+            void_reason=None,
+            evidence="test evidence",
+            resolver="operator",
+            method="deterministic",
+            reviewer=None,
+            supersedes=None,
+        )
+        fingerprint = "a" * 64
+        report = {
+            "invalidRecords": [],
+            "knownOutcomeIds": [outcome_id],
+            "outcomeResolutionDates": {outcome_id: "2026-09-30"},
+            "outcomeFingerprints": {outcome_id: fingerprint},
+        }
+        with (
+            mock.patch.object(cli, "audit", return_value=report),
+            mock.patch.object(cli, "_now", return_value="2026-10-01T12:00:00Z"),
+            mock.patch.object(
+                cli,
+                "append_resolution",
+                return_value={"resolutionId": new_id("resolution")},
+            ) as append,
+        ):
+            self.assertEqual(cli.command_resolve(args), 0)
+        self.assertEqual(append.call_args.kwargs["resolved_at"], "2026-10-01T12:00:00Z")
+        self.assertEqual(append.call_args.kwargs["outcome_fingerprint"], fingerprint)
+
+    def test_strict_spec_duplicate_key_error_never_echoes_secret_shaped_key(self):
+        secret_key = "ghp_" + "x" * 40
+        spec = self.root / "secret-duplicate.json"
+        spec.write_text(
+            '{"question":"safe","'
+            + secret_key
+            + '":1,"'
+            + secret_key
+            + '":2}',
+            encoding="utf-8",
+        )
+
+        result = self.run_cli(
+            "attempt",
+            "--log",
+            str(self.log),
+            "--spec",
+            str(spec),
+        )
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("attempt spec is not valid strict JSON", result.stderr)
+        self.assertNotIn(secret_key, result.stderr)
+
+    def test_strict_spec_excessive_nesting_is_generic_without_traceback(self):
+        spec = self.root / "deeply-nested.json"
+        spec.write_bytes(b"[" * 2000 + b"0" + b"]" * 2000)
+
+        result = self.run_cli(
+            "attempt",
+            "--log",
+            str(self.log),
+            "--spec",
+            str(spec),
+        )
+
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stderr.strip(), "attempt spec is not valid strict JSON")
+        self.assertNotIn("recursion", result.stderr.lower())
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_v1_report_jsonl_parse_error_keeps_context_without_secret_key(self):
+        secret_key = "ghp_" + "v" * 40
+        self.log.write_text(
+            '{"' + secret_key + '":1,"' + secret_key + '":2}\n',
+            encoding="utf-8",
+        )
+
+        result = self.run_cli(
+            "report",
+            "--log",
+            str(self.log),
+            "--events",
+            str(self.events),
+            "--today",
+            "2026-08-22",
+            "--json",
+        )
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(f"{self.log.name} line 1: invalid JSON", result.stderr)
+        self.assertNotIn(secret_key, result.stderr)
+
+    def test_v1_report_excessive_json_nesting_is_one_generic_line_error(self):
+        self.log.write_bytes(b"[" * 2000 + b"0" + b"]" * 2000 + b"\n")
+
+        result = self.run_cli(
+            "report",
+            "--log",
+            str(self.log),
+            "--events",
+            str(self.events),
+            "--today",
+            "2026-08-22",
+            "--json",
+        )
+
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(
+            result.stderr.strip(), f"{self.log.name} line 1: invalid JSON"
+        )
+        self.assertNotIn("recursion", result.stderr.lower())
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_v2_report_jsonl_parse_error_keeps_context_without_secret_key(self):
+        secret_key = "caller_controlled_duplicate_key_" + "w" * 40
+        self.log.write_text(
+            '{"' + secret_key + '":1,"' + secret_key + '":2}\n',
+            encoding="utf-8",
+        )
+
+        result = self.run_cli(
+            "capture-report",
+            "--log",
+            str(self.log),
+            "--events",
+            str(self.root / "capture-events.jsonl"),
+            "--artifact-root",
+            str(self.root / "artifacts"),
+            "--as-of",
+            "2026-08-22T12:00:00Z",
+            "--json",
+        )
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(f"{self.log.name} line 1: invalid JSON", result.stderr)
+        self.assertNotIn(secret_key, result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_capture_report_raw_secret_v2_line_is_nonreflective(self):
+        coordination = self.root / "raw-secret-report.lock"
+        capture_runtime.append_capture_activation(
+            self.log,
+            {
+                "cohortName": "raw-secret-report",
+                "captureVersion": "capture-v2.0.0",
+                "runtimeSourceCommit": "a" * 40,
+                "artifactRootPolicy": "private-content-addressed-v1",
+            },
+            clock=lambda: "2026-08-23T10:00:00Z",
+            coordination_lock=coordination,
+        )
+        secret = "sk-proj-" + "V" * 40
+        with self.log.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    {
+                        "schemaVersion": 2,
+                        "kind": "council-v2",
+                        "runId": secret,
+                    },
+                    sort_keys=True,
+                )
+                + "\n"
+            )
+
+        result = self.run_cli(
+            "capture-report",
+            "--log",
+            str(self.log),
+            "--events",
+            str(self.root / "raw-secret-events.jsonl"),
+            "--artifact-root",
+            str(self.root / "raw-secret-artifacts"),
+            "--as-of",
+            "2026-08-27T00:00:00Z",
+            "--json",
+        )
+
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertNotIn(secret, result.stderr)
+        self.assertIn("secret preflight", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_capture_report_raw_secret_sidecar_kind_is_nonreflective(self):
+        coordination = self.root / "raw-secret-sidecar-report.lock"
+        capture_runtime.append_capture_activation(
+            self.log,
+            {
+                "cohortName": "raw-secret-sidecar-report",
+                "captureVersion": "capture-v2.0.0",
+                "runtimeSourceCommit": "a" * 40,
+                "artifactRootPolicy": "private-content-addressed-v1",
+            },
+            clock=lambda: "2026-08-23T10:00:00Z",
+            coordination_lock=coordination,
+        )
+        secret = "sk-proj-" + "Z" * 40
+        events = self.root / "raw-secret-sidecar-events.jsonl"
+        events.write_text(
+            json.dumps({"kind": secret}, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        ledger_before = self.log.read_bytes()
+        events_before = events.read_bytes()
+
+        result = self.run_cli(
+            "capture-report",
+            "--log",
+            str(self.log),
+            "--events",
+            str(events),
+            "--artifact-root",
+            str(self.root / "raw-secret-sidecar-artifacts"),
+            "--as-of",
+            "2026-08-27T00:00:00Z",
+            "--json",
+        )
+
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertNotIn(secret, result.stderr)
+        self.assertIn("secret preflight", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertEqual(self.log.read_bytes(), ledger_before)
+        self.assertEqual(events.read_bytes(), events_before)
+
+    def test_capture_report_json_escaped_sidecar_fields_are_nonreflective(self):
+        coordination = self.root / "escaped-secret-sidecar-report.lock"
+        capture_runtime.append_capture_activation(
+            self.log,
+            {
+                "cohortName": "escaped-secret-sidecar-report",
+                "captureVersion": "capture-v2.0.0",
+                "runtimeSourceCommit": "a" * 40,
+                "artifactRootPolicy": "private-content-addressed-v1",
+            },
+            clock=lambda: "2026-08-23T10:00:00Z",
+            coordination_lock=coordination,
+        )
+        secret = "sk-proj-" + "J" * 40
+        escaped = "sk\\u002dproj\\u002d" + "J" * 40
+        cases = {
+            "kind": '{"kind":"' + escaped + '"}\n',
+            "key": (
+                '{"kind":"outcome-resolution","'
+                + escaped
+                + '":"safe"}\n'
+            ),
+            "identifier": (
+                '{"kind":"outcome-resolution","outcomeId":"'
+                + escaped
+                + '"}\n'
+            ),
+            "value": (
+                '{"kind":"outcome-resolution","evidence":"'
+                + escaped
+                + '"}\n'
+            ),
+        }
+        events = self.root / "escaped-secret-sidecar-events.jsonl"
+        artifact_root = self.root / "escaped-secret-sidecar-artifacts"
+        ledger_before = self.log.read_bytes()
+        for field, encoded in cases.items():
+            with self.subTest(field=field):
+                self.assertNotIn(secret.encode(), encoded.encode())
+                events.write_bytes(encoded.encode())
+                events_before = events.read_bytes()
+
+                result = self.run_cli(
+                    "capture-report",
+                    "--log",
+                    str(self.log),
+                    "--events",
+                    str(events),
+                    "--artifact-root",
+                    str(artifact_root),
+                    "--as-of",
+                    "2026-08-27T00:00:00Z",
+                    "--json",
+                )
+
+                self.assertEqual(result.returncode, 1)
+                self.assertEqual(result.stdout, "")
+                self.assertNotIn(secret, result.stderr)
+                self.assertIn("secret preflight", result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertEqual(self.log.read_bytes(), ledger_before)
+                self.assertEqual(events.read_bytes(), events_before)
+                self.assertFalse(artifact_root.exists())
+
+    def test_capture_report_unhashable_enums_are_invalid_v2_without_traceback(self):
+        coordination = self.root / "coordination.lock"
+        capture_runtime.append_capture_activation(
+            self.log,
+            {
+                "cohortName": "typed-enum-report",
+                "captureVersion": "capture-v2.0.0",
+                "runtimeSourceCommit": "a" * 40,
+                "artifactRootPolicy": "private-content-addressed-v1",
+            },
+            clock=lambda: "2026-08-23T10:00:00Z",
+            coordination_lock=coordination,
+        )
+        malformed = (
+            {
+                "schemaVersion": [],
+                "kind": "council-attempt-v2",
+                "runId": "run-" + "f" * 32,
+            },
+            {
+                "schemaVersion": 2,
+                "kind": ["council-attempt-v2"],
+                "runId": "run-" + "e" * 32,
+            },
+        )
+        with self.log.open("a", encoding="utf-8") as handle:
+            for row in malformed:
+                handle.write(json.dumps(row, sort_keys=True) + "\n")
+
+        result = self.run_cli(
+            "capture-report",
+            "--log",
+            str(self.log),
+            "--events",
+            str(self.root / "capture-events.jsonl"),
+            "--artifact-root",
+            str(self.root / "artifacts"),
+            "--as-of",
+            "2026-08-23T12:00:00Z",
+            "--json",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["ledger"]["invalidV2RecordCount"], 2)
+        self.assertEqual(
+            [item["error"] for item in payload["ledger"]["invalidV2Records"]],
+            ["invalid V2 record field type"] * 2,
+        )
+        self.assertEqual(
+            [item["kind"] for item in payload["ledger"]["invalidV2Records"]],
+            ["council-attempt-v2", "invalid-v2-record"],
+        )
+
+    def test_record_check_only_strict_duplicate_question_is_generic_and_nonleaking(self):
+        secret_value = "ghp_" + "q" * 40
+        row = self.root / "duplicate-question.json"
+        row.write_text(
+            '{"question":"' + secret_value + '","question":"safe"}',
+            encoding="utf-8",
+        )
+
+        result = self.run_cli(
+            "record",
+            "--log",
+            str(self.log),
+            "--row",
+            str(row),
+            "--check-only",
+        )
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("record is not valid strict JSON", result.stderr)
+        self.assertNotIn(secret_value, result.stderr)
+
+    def test_capture_cli_owns_boundaries_and_serializes_incomplete_durations(self):
+        activation_spec = self.root / "activation.json"
+        activation_spec.write_text(
+            json.dumps(
+                {
+                    "cohortName": "first-ten-cli",
+                    "captureVersion": "capture-v2.0.0",
+                    "runtimeSourceCommit": "a" * 40,
+                    "artifactRootPolicy": "private-content-addressed-v1",
+                }
+            ),
+            encoding="utf-8",
+        )
+        coordination = self.root / "evidence.lock"
+        activated = self.run_cli(
+            "capture-activate",
+            "--log",
+            str(self.log),
+            "--spec",
+            str(activation_spec),
+            "--coordination-lock",
+            str(coordination),
+        )
+        self.assertEqual(activated.returncode, 0, activated.stderr)
+        activated_payload = json.loads(activated.stdout)
+        activation_id = activated_payload["activationId"]
+        self.assertEqual(activated_payload["transactionEscrows"], [])
+        initiated = self.run_cli(
+            "capture-initiate",
+            "--log",
+            str(self.log),
+            "--activation-id",
+            activation_id,
+            "--idempotency-key",
+            "cli-incomplete-run",
+            "--coordination-lock",
+            str(coordination),
+        )
+        self.assertEqual(initiated.returncode, 0, initiated.stderr)
+        initiated_payload = json.loads(initiated.stdout)
+        self.assertEqual(len(initiated_payload["transactionEscrows"]), 1)
+        self.assertTrue(
+            Path(initiated_payload["transactionEscrows"][0]).is_file()
+        )
+
+        injected = self.run_cli(
+            "capture-initiate",
+            "--log",
+            str(self.log),
+            "--activation-id",
+            activation_id,
+            "--idempotency-key",
+            "forbidden-clock",
+            "--ts",
+            "2026-08-23T00:00:00Z",
+        )
+        self.assertEqual(injected.returncode, 2)
+        self.assertIn("unrecognized arguments: --ts", injected.stderr)
+
+        report = self.run_cli(
+            "capture-report",
+            "--log",
+            str(self.log),
+            "--events",
+            str(self.events),
+            "--artifact-root",
+            str(self.root / "artifacts"),
+            "--as-of",
+            "2026-09-01T00:00:00Z",
+            "--json",
+        )
+        self.assertEqual(report.returncode, 0, report.stderr)
+        payload = json.loads(report.stdout)
+        self.assertEqual(payload["cohort"]["eligibleInitiationCount"], 1)
+        self.assertIsNone(payload["timing"]["activeHandlingSeconds"][0])
+        self.assertEqual(payload["transactionEscrows"]["count"], 1)
+        self.assertEqual(
+            payload["transactionEscrows"]["entries"][0]["path"],
+            initiated_payload["transactionEscrows"][0],
+        )
+
+        human = self.run_cli(
+            "capture-report",
+            "--log",
+            str(self.log),
+            "--events",
+            str(self.events),
+            "--artifact-root",
+            str(self.root / "artifacts"),
+            "--as-of",
+            "2026-09-01T00:00:00Z",
+        )
+        self.assertEqual(human.returncode, 0, human.stderr)
+        self.assertIn("activation=BLOCKED", human.stdout)
+        self.assertIn("prospective-audit-not-implemented", human.stdout)
+        self.assertIn("durability-evidence-not-supplied", human.stdout)
+        self.assertIn("transaction_escrows=1", human.stdout)
+
+        aliased = self.run_cli(
+            "capture-report",
+            "--log",
+            str(self.log),
+            "--events",
+            str(self.log),
+            "--artifact-root",
+            str(self.root / "artifacts"),
+        )
+        self.assertEqual(aliased.returncode, 1)
+        self.assertIn("must be separate files", aliased.stderr)
+
+    def test_capture_artifact_requires_incident_context_or_control_mode(self):
+        source = self.root / "artifact.txt"
+        source.write_text("review input", encoding="utf-8")
+        artifact_root = self.root / "artifacts"
+        coordination = self.root / "evidence.lock"
+
+        ambiguous = self.run_cli(
+            "capture-artifact",
+            "--file",
+            str(source),
+            "--artifact-root",
+            str(artifact_root),
+            "--coordination-lock",
+            str(coordination),
+        )
+        self.assertEqual(ambiguous.returncode, 1)
+        self.assertIn("or explicit --control-artifact", ambiguous.stderr)
+        self.assertFalse(artifact_root.exists())
+
+        control = self.run_cli(
+            "capture-artifact",
+            "--file",
+            str(source),
+            "--artifact-root",
+            str(artifact_root),
+            "--control-artifact",
+            "--coordination-lock",
+            str(coordination),
+        )
+        self.assertEqual(control.returncode, 0, control.stderr)
+        self.assertEqual(json.loads(control.stdout)["bytes"], len(b"review input"))
+
+        mixed = self.run_cli(
+            "capture-artifact",
+            "--file",
+            str(source),
+            "--artifact-root",
+            str(artifact_root),
+            "--control-artifact",
+            "--run-id",
+            new_id("run"),
+        )
+        self.assertEqual(mixed.returncode, 1)
+        self.assertIn("cannot be combined", mixed.stderr)
+
+    def test_run_artifact_requires_a_strict_ledger_and_one_prior_initiation(self):
+        source = self.root / "artifact.txt"
+        source.write_text("review input", encoding="utf-8")
+        artifact_root = self.root / "artifacts"
+        coordination = self.root / "evidence.lock"
+        run_id = new_id("run")
+
+        missing = self.run_cli(
+            "capture-artifact",
+            "--file",
+            str(source),
+            "--artifact-root",
+            str(artifact_root),
+            "--run-id",
+            run_id,
+            "--log",
+            str(self.log),
+            "--operator",
+            "test-operator",
+            "--evidence-ref",
+            "incident:missing-initiation",
+            "--coordination-lock",
+            str(coordination),
+        )
+        self.assertEqual(missing.returncode, 1)
+        self.assertIn("exactly one prior capture-initiation", missing.stderr)
+        self.assertFalse(artifact_root.exists())
+
+        self.log.write_text('{"kind":"broken","kind":"duplicate"}\n')
+        invalid = self.run_cli(
+            "capture-artifact",
+            "--file",
+            str(source),
+            "--artifact-root",
+            str(artifact_root),
+            "--run-id",
+            run_id,
+            "--log",
+            str(self.log),
+            "--operator",
+            "test-operator",
+            "--evidence-ref",
+            "incident:invalid-ledger",
+            "--coordination-lock",
+            str(coordination),
+        )
+        self.assertEqual(invalid.returncode, 1)
+        self.assertIn("panel.jsonl line 1: invalid JSON", invalid.stderr)
+        self.assertFalse(artifact_root.exists())
+
+    def test_secret_rejection_is_nonleaking_but_invalidation_is_not_crash_atomic_without_preflight_intent(self):
+        activation_spec = self.root / "activation.json"
+        activation_spec.write_text(
+            json.dumps(
+                {
+                    "cohortName": "secret-incident-test",
+                    "captureVersion": "capture-v2.0.0",
+                    "runtimeSourceCommit": "a" * 40,
+                    "artifactRootPolicy": "private-content-addressed-v1",
+                }
+            ),
+            encoding="utf-8",
+        )
+        coordination = self.root / "evidence.lock"
+        activated = self.run_cli(
+            "capture-activate",
+            "--log",
+            str(self.log),
+            "--spec",
+            str(activation_spec),
+            "--coordination-lock",
+            str(coordination),
+        )
+        self.assertEqual(activated.returncode, 0, activated.stderr)
+        initiated = self.run_cli(
+            "capture-initiate",
+            "--log",
+            str(self.log),
+            "--activation-id",
+            json.loads(activated.stdout)["activationId"],
+            "--idempotency-key",
+            "secret-incident-run",
+            "--coordination-lock",
+            str(coordination),
+        )
+        self.assertEqual(initiated.returncode, 0, initiated.stderr)
+        run_id = json.loads(initiated.stdout)["runId"]
+        token = "ghp_" + "x" * 40
+        source = self.root / "secret.txt"
+        source.write_text(token, encoding="utf-8")
+
+        rejected = self.run_cli(
+            "capture-artifact",
+            "--file",
+            str(source),
+            "--artifact-root",
+            str(self.root / "artifacts"),
+            "--run-id",
+            run_id,
+            "--log",
+            str(self.log),
+            "--operator",
+            "test-operator",
+            "--evidence-ref",
+            "incident:test-secret-detector",
+            "--coordination-lock",
+            str(coordination),
+        )
+        self.assertEqual(rejected.returncode, 1)
+        rows = [json.loads(line) for line in self.log.read_text().splitlines()]
+        self.assertEqual(rows[-1]["kind"], "capture-invalidation")
+        self.assertEqual(rows[-1]["runId"], run_id)
+        self.assertEqual(rows[-1]["reason"], "secret-detected")
+        self.assertNotIn(token, self.log.read_text())
+        self.assertNotIn(token, rejected.stderr)
+
+    def test_attempt_duplicate_secret_seat_is_nonleaking_and_invalidated(self):
+        activation_spec = self.root / "activation-secret-seat.json"
+        activation_spec.write_text(
+            json.dumps(
+                {
+                    "cohortName": "secret-seat-test",
+                    "captureVersion": "capture-v2.0.0",
+                    "runtimeSourceCommit": "a" * 40,
+                    "artifactRootPolicy": "private-content-addressed-v1",
+                }
+            ),
+            encoding="utf-8",
+        )
+        coordination = self.root / "secret-seat-evidence.lock"
+        activated = self.run_cli(
+            "capture-activate",
+            "--log",
+            str(self.log),
+            "--spec",
+            str(activation_spec),
+            "--coordination-lock",
+            str(coordination),
+        )
+        self.assertEqual(activated.returncode, 0, activated.stderr)
+        initiated = self.run_cli(
+            "capture-initiate",
+            "--log",
+            str(self.log),
+            "--activation-id",
+            json.loads(activated.stdout)["activationId"],
+            "--idempotency-key",
+            "secret-seat-run",
+            "--coordination-lock",
+            str(coordination),
+        )
+        self.assertEqual(initiated.returncode, 0, initiated.stderr)
+
+        secret = "sk-proj-" + "D" * 40
+        attempt_spec = self.root / "attempt-secret-seat.json"
+        attempt_spec.write_text(
+            json.dumps(
+                {
+                    "initiationId": json.loads(initiated.stdout)["initiationId"],
+                    "seatInputArtifacts": {},
+                    "seatPlan": [
+                        {"seatId": secret},
+                        {"seatId": secret},
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        baseline = self.root / "secret-seat-baseline.json"
+        baseline.write_text("{}", encoding="utf-8")
+
+        rejected = self.run_cli(
+            "capture-attempt",
+            "--log",
+            str(self.log),
+            "--artifact-root",
+            str(self.root / "secret-seat-artifacts"),
+            "--spec",
+            str(attempt_spec),
+            "--decision-before-file",
+            str(baseline),
+            "--coordination-lock",
+            str(coordination),
+        )
+
+        self.assertEqual(rejected.returncode, 1)
+        self.assertEqual(rejected.stdout, "")
+        self.assertNotIn(secret, rejected.stderr)
+        self.assertNotIn(secret, self.log.read_text())
+        rows = [json.loads(line) for line in self.log.read_text().splitlines()]
+        self.assertEqual(rows[-1]["kind"], "capture-invalidation")
+        self.assertEqual(rows[-1]["runId"], json.loads(initiated.stdout)["runId"])
+        self.assertEqual(rows[-1]["reason"], "secret-detected")
+
+    def test_secret_invalidation_appends_before_coordination_lock_release(self):
+        source = self.root / "secret.txt"
+        source.write_text("safe fixture bytes", encoding="utf-8")
+        run_id = new_id("run")
+        lock_state = {"held": False}
+
+        @contextmanager
+        def observed_lock(_path):
+            lock_state["held"] = True
+            try:
+                yield
+            finally:
+                lock_state["held"] = False
+
+        store = mock.Mock()
+        store.capture.side_effect = cli.SecretDetectedError(
+            SimpleNamespace(
+                code="secret-detected", stage="preflight", recovery_path=None
+            )
+        )
+
+        def observed_invalidation(_log, _payload, *, coordination_lock):
+            self.assertTrue(lock_state["held"])
+            self.assertIsNone(coordination_lock)
+            return {"kind": "capture-invalidation"}
+
+        args = SimpleNamespace(
+            run_id=run_id,
+            log=str(self.log),
+            operator="test-operator",
+            evidence_ref="incident:lock-order",
+            control_artifact=False,
+            artifact_root=str(self.root / "artifacts"),
+            coordination_lock=str(self.root / "coordination.lock"),
+            file=str(source),
+            secret_token_file=[],
+        )
+        with (
+            mock.patch.object(cli, "evidence_write_lock", side_effect=observed_lock),
+            mock.patch.object(cli, "ArtifactStore", return_value=store),
+            mock.patch.object(
+                cli,
+                "validate_capture_ledger",
+                return_value=([], [{"kind": "capture-initiation", "runId": run_id}]),
+            ),
+            mock.patch.object(
+                cli,
+                "append_capture_invalidation",
+                side_effect=observed_invalidation,
+            ) as invalidation,
+        ):
+            with self.assertRaises(cli.SecretDetectedError):
+                cli.command_capture_artifact(args)
+        invalidation.assert_called_once()
+        self.assertFalse(lock_state["held"])
+
+    def test_live_activation_requires_in_process_wrapper_binding_and_remains_blocked(self):
+        commit = "b" * 40
+        artifact_root = self.root / "artifacts"
+        manifest_file = self.root / "approval.json"
+        manifest_bytes = json.dumps(
+            self.activation_manifest(commit), sort_keys=True
+        ).encode("utf-8")
+        manifest_file.write_bytes(manifest_bytes)
+        manifest_ref = ArtifactStore(artifact_root).capture(manifest_bytes)
+        activation_spec = self.root / "activation.json"
+        activation_spec.write_text(
+            json.dumps(
+                {
+                    "cohortName": "governed-live-test",
+                    "captureVersion": "capture-v2.0.0",
+                    "runtimeSourceCommit": commit,
+                    "artifactRootPolicy": "private-content-addressed-v1",
+                    "approvalManifest": manifest_ref,
+                }
+            ),
+            encoding="utf-8",
+        )
+        args = SimpleNamespace(
+            log=str(self.log),
+            spec=str(activation_spec),
+            approval_manifest_file=str(manifest_file),
+            artifact_root=str(artifact_root),
+            coordination_lock=str(self.root / "evidence.lock"),
+        )
+        live_path = mock.patch.object(cli, "_is_live_write_path", return_value=True)
+        authority = mock.patch.object(cli, "_require_write_authority")
+
+        with live_path, authority:
+            with self.assertRaisesRegex(cli.LedgerError, "source-pinned wrapper"):
+                cli.command_capture_activate(args)
+        self.assertFalse(self.log.exists())
+
+        args._runtime_source_commit = "c" * 40
+        args._runtime_source_root = Path(cli.__file__).parents[2]
+        with (
+            mock.patch.object(cli, "_is_live_write_path", return_value=True),
+            mock.patch.object(cli, "_require_write_authority"),
+        ):
+            with self.assertRaisesRegex(cli.LedgerError, "installed runtime pin"):
+                cli.command_capture_activate(args)
+        self.assertFalse(self.log.exists())
+
+        args._runtime_source_commit = commit
+        with (
+            mock.patch.object(cli, "_is_live_write_path", return_value=True),
+            mock.patch.object(cli, "_require_write_authority"),
+        ):
+            with self.assertRaisesRegex(
+                cli.LedgerError,
+                "prospective-audit-not-implemented.*durability-evidence-not-supplied",
+            ):
+                cli.command_capture_activate(args)
+        self.assertFalse(self.log.exists())
+
+    def test_live_activation_ignores_forgeable_runtime_environment(self):
+        commit = "e" * 40
+        activation_spec = self.root / "activation.json"
+        activation_spec.write_text(
+            json.dumps(
+                {
+                    "cohortName": "environment-forgery-test",
+                    "captureVersion": "capture-v2.0.0",
+                    "runtimeSourceCommit": commit,
+                    "artifactRootPolicy": "private-content-addressed-v1",
+                }
+            ),
+            encoding="utf-8",
+        )
+        args = SimpleNamespace(
+            log=str(self.log),
+            spec=str(activation_spec),
+            approval_manifest_file=None,
+            artifact_root=None,
+            coordination_lock=str(self.root / "evidence.lock"),
+        )
+        with (
+            mock.patch.object(cli, "_is_live_write_path", return_value=True),
+            mock.patch.object(cli, "_require_write_authority"),
+            mock.patch.dict(
+                os.environ,
+                {"COUNCIL_RUNTIME_EXPECTED_COMMIT": commit},
+            ),
+        ):
+            with self.assertRaisesRegex(cli.LedgerError, "source-pinned wrapper"):
+                cli.command_capture_activate(args)
+        self.assertFalse(self.log.exists())
+
+    def test_activation_manifest_is_strict_complete_and_exact_bytes(self):
+        commit = "d" * 40
+        valid = self.activation_manifest(commit)
+        cli._validate_activation_approval_manifest(
+            json.dumps(valid).encode(), runtime_source_commit=commit
+        )
+
+        denied = self.activation_manifest(commit)
+        denied["approvals"]["cleanRestore"] = "DENIED"
+        with self.assertRaisesRegex(cli.LedgerError, "exactly APPROVED"):
+            cli._validate_activation_approval_manifest(
+                json.dumps(denied).encode(), runtime_source_commit=commit
+            )
+
+        incomplete = self.activation_manifest(commit)
+        incomplete["evidence"]["cleanRestore"]["evidenceRef"] = ""
+        with self.assertRaisesRegex(cli.LedgerError, "cleanRestore"):
+            cli._validate_activation_approval_manifest(
+                json.dumps(incomplete).encode(), runtime_source_commit=commit
+            )
+
+        unverified = self.activation_manifest(commit)
+        unverified["evidence"]["cleanRestore"]["status"] = "PENDING"
+        with self.assertRaisesRegex(cli.LedgerError, "exactly VERIFIED"):
+            cli._validate_activation_approval_manifest(
+                json.dumps(unverified).encode(), runtime_source_commit=commit
+            )
+
+        sentinel = self.activation_manifest(commit)
+        sentinel["evidence"]["cleanRestore"]["evidenceRef"] = "not supplied"
+        with self.assertRaisesRegex(cli.LedgerError, "negative sentinel"):
+            cli._validate_activation_approval_manifest(
+                json.dumps(sentinel).encode(), runtime_source_commit=commit
+            )
+
+        duplicate = (
+            '{"schemaVersion":1,"schemaVersion":1,"runtimeSourceCommit":"'
+            + commit
+            + '","approvals":{},"evidence":{}}'
+        )
+        with self.assertRaisesRegex(
+            cli.LedgerError, "activation approval manifest is not valid strict JSON"
+        ):
+            cli._validate_activation_approval_manifest(
+                duplicate.encode(), runtime_source_commit=commit
+            )
+
+        artifact_root = self.root / "artifacts"
+        manifest_file = self.root / "approval.json"
+        original = json.dumps(valid, sort_keys=True).encode()
+        ref = ArtifactStore(artifact_root).capture(original)
+        manifest_file.write_bytes(original + b"\n")
+        with self.assertRaisesRegex(cli.LedgerError, "does not match"):
+            cli._verify_activation_manifest(
+                {"runtimeSourceCommit": commit, "approvalManifest": ref},
+                manifest_file=str(manifest_file),
+                artifact_root=str(artifact_root),
+            )
+
+    def test_installed_wrapper_passes_authenticated_runtime_binding_in_process(self):
+        wrapper = (Path(__file__).parents[1] / "runtime/predictions_report.py").read_text()
+        self.assertNotIn("COUNCIL_RUNTIME_EXPECTED_COMMIT", wrapper)
+        self.assertIn("runtime_source_commit=EXPECTED_COMMIT", wrapper)
+        self.assertIn("runtime_source_root=SOURCE_ROOT", wrapper)
+        self.assertIn("pwd.getpwuid(os.getuid()).pw_dir", wrapper)
+        self.assertNotIn("Path.home()", wrapper)
+
+    def test_evidence_restore_requires_and_forwards_repository_root(self):
+        missing = self.run_cli(
+            "evidence-restore",
+            str(self.root / "snapshot"),
+            str(self.root / "restore"),
+        )
+        self.assertEqual(missing.returncode, 2)
+        self.assertIn("--repository-root", missing.stderr)
+
+        args = SimpleNamespace(
+            snapshot=str(self.root / "snapshot"),
+            target=str(self.root / "restore"),
+            repository_root=str(Path(__file__).parents[1]),
+        )
+        with mock.patch.object(
+            cli, "restore_evidence_snapshot", return_value={"status": "restored"}
+        ) as restore:
+            self.assertEqual(cli.command_evidence_restore(args), 0)
+        restore.assert_called_once_with(
+            args.snapshot,
+            args.target,
+            repository_root=args.repository_root,
+        )
 
 
 if __name__ == "__main__":

@@ -1,0 +1,81 @@
+{
+  "description": "Enforce AI Council bounded-run budgets from the repository checkout.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/bin/python3 \"$(git rev-parse --show-toplevel)/plugins/ai-council-run-guard/scripts/run_guard.py\" hook",
+            "timeout": 5,
+            "statusMessage": "Loading bounded-run policy",
+            "additionalContextLimit": 800
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/bin/python3 \"$(git rev-parse --show-toplevel)/plugins/ai-council-run-guard/scripts/run_guard.py\" hook",
+            "timeout": 5,
+            "additionalContextLimit": 800
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/bin/python3 \"$(git rev-parse --show-toplevel)/plugins/ai-council-run-guard/scripts/run_guard.py\" hook",
+            "timeout": 5,
+            "statusMessage": "Checking bounded-run budget",
+            "additionalContextLimit": 800
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/bin/python3 \"$(git rev-parse --show-toplevel)/plugins/ai-council-run-guard/scripts/run_guard.py\" hook",
+            "timeout": 5,
+            "statusMessage": "Checking run progress",
+            "additionalContextLimit": 800
+          }
+        ]
+      }
+    ],
+    "PostCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/bin/python3 \"$(git rev-parse --show-toplevel)/plugins/ai-council-run-guard/scripts/run_guard.py\" hook",
+            "timeout": 5,
+            "additionalContextLimit": 800
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/bin/python3 \"$(git rev-parse --show-toplevel)/plugins/ai-council-run-guard/scripts/run_guard.py\" hook",
+            "timeout": 3
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,67 +1,100 @@
 # AI Council
 
-**Measure whether a multi-agent review council is useful—not merely verbose.**
+**An evidence layer for finding out whether a multi-agent review council is actually useful.**
 
-AI Council is an append-only evidence and scoring layer for consequential multi-agent reviews.
-Before reviewers answer, the operator records one material, resolvable outcome. Each seat then
-prices the same claim independently. The completed set is sealed, the outcome is resolved later,
-and the forecasts are scored with the Brier score.
+AI Council records what each reviewer saw, what it returned, how the operator dispositioned its
+findings, and how every reviewer priced the same future outcome. Later, it can measure forecast
+accuracy, finding overlap, capture quality, and grading debt without pretending those are all the
+same thing.
 
-The current release makes forecast collection and grading operational. It does **not** yet prove
-that any seat improves decisions, catches novel problems, or deserves to remain on the council.
-Those are the next measurements this project is intended to support.
+The central question is deliberately uncomfortable: are four agents catching different, useful
+problems—or are they correlated copies producing expensive reassurance?
+
+## Project status
+
+| Capability | Status |
+| --- | --- |
+| V1 append-only forecasts and Brier reporting | Operational |
+| V2 core lifecycle, exact custody, and finding capture | Implemented and tested |
+| V2 integrity-aware capture health and exogenous-only Brier | Implemented; not activated |
+| Bounded Codex runs, stuck detection, and durable handoffs | Implemented; repository hook plus portable plugin |
+| One-in-five independent finding audit | **Not implemented; activation blocker** |
+| Off-host durability age and verified-restore evidence | **Not supplied; activation blocker** |
+| Content-manifested local snapshot and clean restore | Rehearsal-only |
+| Live V2 capture activation | **Disabled in this release by audit and durability blockers** |
+| Seat ranking, weighting, admission, or retirement | Deliberately not implemented |
+
+Installing this repository does not activate V2 on a live ledger. The first prospective cohort is
+frozen in advance, and activation remains a separate operational decision.
 
 ## Why this exists
 
-An AI council can look impressive while every seat repeats the same idea. A consensus can also be
-confidently wrong, and a long review can create the feeling of safety without changing the final
-decision.
+Multi-agent review has several easy failure modes:
 
-AI Council starts with a narrower question: **did each reviewer make a contemporaneous,
-falsifiable judgment that can later be graded?** It preserves the evidence needed to ask harder
-questions about correctness, novelty, redundancy, and marginal decision value.
+- every seat repeats the same underlying model bias;
+- consensus looks like independent confirmation when it is not;
+- long reviews create a feeling of safety without changing the decision;
+- successes get remembered while abandoned runs and missed grades disappear;
+- a seat with good forecasts may still contribute no novel, actionable findings.
 
-## What works today
+AI Council collects the evidence needed to test those failure modes. It separately reports forecast
+accuracy, seat-supplied finding evidence summaries, operator-reported novelty, within-run overlap,
+latency, cost, and capture completeness. It does not independently adjudicate evidentiary support,
+and it does not yet estimate error correlation, statistical independence, or
+replaceability, and it never collapses the measures into a composite “council score.”
 
-- A pre-review `council-attempt` records the question, expected seats, evidence cutoff, decision
-  link, and a shared binary outcome before any forecast is visible.
-- A completion is accepted only when every expected seat is explicitly `submitted`, `abstained`,
-  or `unavailable`.
-- Submitted forecasts use stable run, outcome, and prediction IDs and are sealed as one set.
-- Resolutions live in an append-only sidecar and support reviewed voids and superseding
-  corrections without rewriting history.
-- Reports show forecast coverage, overdue grading debt, voids, repeated issuances, unresolved
-  outcomes, and descriptive per-seat Brier scores.
-- Scores include a constant-50% reference and an explicitly labelled in-sample base-rate bound.
-- JSONL parsing and validation fail closed; appends use file locks, flushes, and `fsync`.
-- A narrowly scoped repair command can quarantine one confirmed torn final line. It will not skip
-  malformed history.
-- The repository contains isolated unit tests plus a copied-runtime rehearsal and reversible local
-  installer.
+## Two additive contracts
 
-The current council adapter has four canonical seats: `code`, `theory`, `ops`, and `blind`.
-The scoring core is useful independently, but the installer and runtime contract are intentionally
-specific to the deployment that motivated the project.
+### V1: forecast discipline
 
-## Lifecycle
+Before reviewers answer, V1 appends a price-free `council-attempt` with one material, binary,
+resolvable shared outcome. Every submitted seat independently returns a probability for that same
+claim. The sealed completion records explicit `submitted`, `abstained`, or `unavailable` states.
+Outcomes are resolved later by stable ID and scored with the Brier score.
+
+V1 reports coverage, unresolved outcomes, voids, grading debt, repeated issuances, a constant-50%
+reference, and descriptive per-seat Brier scores.
+
+### V2: usefulness evidence
+
+V2 adds a durable lifecycle around each council run:
 
 ```mermaid
 flowchart LR
-    A[Define decision and<br/>shared outcome] --> B[Append attempt]
-    B --> C[Run seats independently]
-    C --> D[Seal explicit seat states<br/>and probabilities]
-    D --> E[Append completion]
-    E --> F[Resolve outcome later]
-    F --> G[Audit coverage and<br/>calculate Brier scores]
+    A[Activate frozen cohort] --> B[Durable initiation]
+    B --> C[Capture decision baseline]
+    C --> D[Capture and bind exact seat inputs]
+    D --> E[Launch seats independently]
+    E --> F[Record terminal seat states]
+    F --> G[Capture exact visible outputs]
+    G --> H[Normalize findings and dispositions]
+    H --> I[Seal forecasts and completion]
+    I --> J[Reverify artifacts and report health]
+    J --> K[Resolve exogenous outcomes later]
 ```
 
-The attempt and completion are stored in the council ledger. Outcome resolutions and temporary
-grading-debt overrides are stored separately. Both stores are append-only JSONL.
+The V2 ledger records:
 
-## Quick start
+- a system-timestamped initiation before brief preparation;
+- a preassigned decision family and prospective outcome class;
+- content-addressed references for the decision baseline, every planned seat's exact visible input,
+  and every submitted seat's exact visible output;
+- seat role, agent version, agent-definition digest, model, tool policy, repository commit, and
+  optional supplied latency/token/cost metadata;
+- atomic findings, within-run finding groups, and one forced operator disposition per finding;
+- an artifact-bound structured `no-findings` declaration when a submitted seat found nothing;
+- an append-only invalidation when custody, identity, timing, disposition, or secret handling fails
+  while the process remains able to record it; a crash still leaves the durable initiation visible
+  and incomplete.
 
-AI Council requires Python 3.11 or newer and a Unix-like platform (`fcntl` is used for locking).
-It has no third-party runtime dependencies.
+Only resolved **exogenous V2** outcomes enter the V2 headline Brier summary.
+Intervention-sensitive and V1 outcomes remain visible in separate counts and are not silently
+promoted.
+
+## Install and test
+
+AI Council requires Python 3.11 or newer and a Unix-like system because it uses `fcntl` locks. It
+has no third-party runtime dependencies.
 
 ```sh
 git clone https://github.com/garcia42/ai-council.git
@@ -69,28 +102,60 @@ cd ai-council
 python3 -m venv .venv
 . .venv/bin/activate
 python -m pip install -e .
+PYTHONPATH=src:. python -m unittest discover -s tests -v
+python3 plugins/ai-council-run-guard/scripts/run_guard.py doctor --probe
 ```
 
-Run the isolated test suite:
+Codex work in this repository is governed by the checked-in bounded-run policy. It creates a
+90-minute checkpoint, stops tool use after four hours without a real-user renewal, caps council
+repair and full-qualification loops, and writes a durable `NOT READY` handoff when progress stalls.
+See [docs/RUN_GUARD.md](docs/RUN_GUARD.md) for the exact contract, new-machine setup, and the
+boundary between repository hooks and administrator-managed enforcement.
 
-```sh
-PYTHONPATH=src:. python -m unittest \
-  tests.test_forecasts \
-  tests.test_cli \
-  tests.test_install \
-  tests.test_legacy_report \
-  tests.test_rehearse -v
-```
+For standalone use, always supply explicit local stores. Private prompts and answers belong outside
+the repository. When an explicit ledger is outside live council state and `--coordination-lock` is
+omitted, the CLI derives a sibling local evidence lock; it never falls back to the live deployment
+lock. Supply one explicit shared lock when coordinating several stores or snapshots.
 
-Inspect an empty or existing pair of explicit stores:
+### Installer retained-escrow runbook
 
-```sh
-python -m council_tools.cli report \
-  --log ./council.jsonl \
-  --events ./resolutions.jsonl
-```
+`install.py install` and `install.py restore` use atomic Linux name exchange and deliberately do
+not auto-delete displaced runtime files. Each successful operation retains one old runtime inode
+per managed target—currently four—and records their exact relative paths in the operation backup's
+`RETAINED_ESCROWS.tsv`. Replacing an existing backup `LATEST` pointer similarly retains the prior
+pointer and records it in `RETAINED_BACKUP_POINTERS.tsv`. The CLI prints the backup and retained
+escrow report location. Accumulation is intentional: a mutable namespace cannot support a safe
+check-then-delete cleanup.
 
-### 1. Record the attempt before calling reviewers
+Treat any custody-report error as authoritative even when publication is already committed; the
+error names the state, backup, report, and every retained path known. Do not rerun or remove an
+escrow until the installer and all runtime editors are quiescent. In that exclusive maintenance
+window, verify the active targets against the intended source commit, verify `MANIFEST.tsv`, and
+reconcile each reported escrow with its corresponding backup payload. Only then may an operator
+archive or remove the reviewed escrows. The installer never performs that disposition itself.
+
+### JSONL transaction-escrow runbook
+
+Crash-atomic JSONL replacement retains the displaced prior inode instead of using an unsafe
+identity-check-then-unlink cleanup. The filename convention is
+`.<ledger-name>.<32-hex>.tmp.escrow.<32-hex>` in the ledger's directory. Successful CLI append
+responses list newly retained paths in `transactionEscrows`; `report --json`, `capture-report
+--json`, and their human output inventory every matching path, its byte size, and aggregate bytes.
+Reporters inspect names and no-follow metadata only. They never parse an escrow as ledger evidence.
+
+Monitor `transactionEscrows.count` and `transactionEscrows.aggregateBytes`. Because each append
+writes the whole ledger and retains the prior generation, byte usage can grow quadratically with
+record count. This is expected custody overhead, not a backup policy, and there is no automatic
+deletion or rotation.
+
+Reconcile or dispose of escrows only in a maintenance window with every writer, reporter snapshot,
+and restore process quiescent. Preserve an off-host copy first; match each reported path to its
+store, confirm it is the expected private regular file, hash and compare it with the applicable
+prior ledger generation, and record the operator disposition. Only after that review may the
+operator archive or remove the named entries. Restart writers only after rerunning the report and
+confirming its inventory matches the recorded disposition.
+
+## V1 quick start
 
 Create an attempt specification:
 
@@ -111,152 +176,167 @@ Create an attempt specification:
 }
 ```
 
-Append it and retain the emitted `runId` and `outcomeId`:
+Append the attempt, run the reviewers without sharing probabilities, then validate and append the
+sealed completion:
 
 ```sh
 python -m council_tools.cli attempt \
-  --log ./council.jsonl \
-  --spec ./attempt.json \
-  --ts 2027-03-01T12:00:00Z
+  --log ./council.jsonl --spec ./attempt.json --ts 2027-03-01T12:00:00Z
+python -m council_tools.cli complete \
+  --log ./council.jsonl --spec ./completion.json --check-only
+python -m council_tools.cli complete \
+  --log ./council.jsonl --spec ./completion.json
 ```
 
-Every reviewer receives the byte-identical shared claim and evidence cutoff. Reviewers must not see
-one another's probabilities.
-
-### 2. Seal the completed council
-
-After all calls return, build a completion specification using the emitted `runId`:
-
-```json
-{
-  "runId": "run-REPLACE_WITH_EMITTED_ID",
-  "councilFields": {
-    "verdicts": {
-      "code": "APPROVE",
-      "theory": "CONCERN",
-      "ops": "APPROVE"
-    },
-    "blindSeat": {
-      "required": true,
-      "ran": true,
-      "changedDecision": false
-    }
-  },
-  "seatStates": {
-    "code": "submitted",
-    "theory": "submitted",
-    "ops": "submitted",
-    "blind": "submitted"
-  },
-  "probabilities": {
-    "code": 80,
-    "theory": 55,
-    "ops": 70,
-    "blind": 60
-  }
-}
-```
-
-Validate before appending:
+Resolve by stable `outcomeId` only after the resolution date has fully ended in America/New_York:
 
 ```sh
-python -m council_tools.cli complete \
-  --log ./council.jsonl \
-  --spec ./completion.json \
-  --check-only
-
-python -m council_tools.cli complete \
-  --log ./council.jsonl \
-  --spec ./completion.json
-```
-
-### 3. Resolve and score
-
-Once the complete resolution date has passed in America/New_York, record durable evidence by the
-stable `outcomeId`:
-
-```sh
-python -m council_tools.cli resolve outcome-REPLACE_WITH_EMITTED_ID true \
+python -m council_tools.cli resolve outcome-REPLACE true \
   --log ./council.jsonl \
   --events ./resolutions.jsonl \
-  --evidence "deployment record 1042; no rollback during the observation window" \
-  --resolver "release-operator" \
+  --evidence "deployment record 1042; observation window completed" \
+  --resolver release-operator \
   --method deterministic
 
 python -m council_tools.cli report \
-  --log ./council.jsonl \
-  --events ./resolutions.jsonl
+  --log ./council.jsonl --events ./resolutions.jsonl
 ```
 
-For a binary outcome, the Brier score is:
+Resolution time is system-owned. New resolution events also bind the issued outcome fingerprint;
+reports reject a changed resolution date, pre-issuance timestamp, or event later than the report's
+observation time.
+
+For a binary outcome, Brier is `(forecast probability - observed outcome)^2`. Lower is better:
+`0` is perfect, `0.25` is the score from always forecasting 50%, and `1` is a fully confident miss.
+
+## V2 workflow
+
+V2 is intentionally more demanding because it is preserving evidence, not just a score. The
+standalone sequence is:
 
 ```text
-(forecast probability - observed outcome)^2
+capture-activate          one frozen cohort, once
+capture-initiate          first durable write for every attempted run
+capture-artifact          exact baseline, prompt, and visible-answer bytes
+capture-attempt           uniform-binding and input-manifest preflight
+capture-seats-finished    explicit terminal state for every planned seat
+capture-complete          custody verification, findings validation, and seal
+capture-report            first-ten health and descriptive outcome report
+capture-resolve           V2-only resolution sidecar
 ```
 
-Lower is better: `0` is perfect, `0.25` is the score from always forecasting 50%, and `1` is a
-fully confident miss. Early scores remain descriptive because outcomes may be correlated,
-seat-controlled, selectively resolved, or too few to support comparisons.
+Use `python -m council_tools.cli <command> --help` for exact inputs. Lifecycle timestamps are
+system-generated; V2 commands do not accept operator-supplied boundary times. `capture-attempt` and
+`capture-complete` require the exact visible input files again and verify them against their
+content-addressed references. Structured empty results must be present in the seat's visible JSON
+output, not invented later by an operator. Every submitted visible JSON output must also contain a
+`capture` object binding the run, outcome, outcome fingerprint, evidence cutoff, forecast-request
+digest, seat, input-artifact digest, and integer `sharedProbability`. Every visible input contains
+one canonical, machine-readable forecast-request block showing the actual claim, resolution rule,
+resolution date, materiality, and actions as well as the run and outcome identities. Its
+`forecastRequestSha256` is derived from those disclosed fields. The operator cannot substitute a
+different visible question, prompt, or forecast: completion and reporting parse and recheck the
+retained bytes. The same `capture` object contains a canonical `findings` list with the exact
+seven seat-owned finding fields; the operator assigns cross-seat groups and dispositions
+separately, without changing what a seat returned. Completion must occur before the outcome's
+resolution date.
 
-## Safety model
+The frozen first-ten report counts crashes, abandoned attempts, unavailable seats, invalidations,
+rejected completions, and post-activation V1 runs as denominator members. It does not select only
+the successful rows. The initial operational bars are at least 90% complete capture and median
+active handling time no greater than three minutes.
 
-The ledger is evidence, not a cache:
+## Evidence custody and recovery
 
-- Existing records are never edited in place.
-- Duplicate IDs, malformed JSON, unknown seats, invalid dates, partial completions, and invalid
-  corrections are rejected.
-- Repeated forecasts remain visible but do not silently replace the earliest forecast for the same
-  seat and outcome.
-- Three or more outcomes overdue by more than 14 days block decision finalization unless an
-  explicit, expiring override is recorded.
-- Missing or selectively unresolved outcomes make score status `INCOMPLETE`.
-- Runtime logs, prompts, responses, and resolution evidence are private operational data and are
-  not included in this repository.
+Artifacts are immutable SHA-256-addressed files under a private root outside Git. Directories are
+mode `0700`; files are mode `0600`. Capture and verification reject traversal, symlinks, hard-link
+aliases, changed bytes, wrong ownership/modes, and built-in or caller-supplied secret tokens.
 
-See [the implemented scoring contract](design/2026-08-22-forecast-scoring-mvp.md) for the full set
-of invariants and explicit non-goals.
+All evidence writers use one coordination lock. A local rehearsal snapshot takes a shared lock,
+copies the ledger, V2 resolution store, control store, and artifact root, writes its content
+manifest last, verifies it, and restores only into a clean target:
 
-## What comes next
+```sh
+python -m council_tools.cli evidence-snapshot \
+  --log ./council.jsonl \
+  --events ./capture-resolved.jsonl \
+  --control-store ./control \
+  --artifact-root /absolute/private/artifacts \
+  --coordination-lock /absolute/private/evidence.lock \
+  --repository-root "$PWD" \
+  --target /absolute/new/snapshot
 
-Forecast accuracy is necessary but insufficient. The next phase is designed to measure whether
-the council changes decisions for the better:
+python -m council_tools.cli evidence-verify /absolute/new/snapshot
+python -m council_tools.cli evidence-restore \
+  /absolute/new/snapshot /absolute/new/restore-target \
+  --repository-root "$PWD"
+```
 
-1. Record immutable references and digests for each seat's exact input and output.
-2. Normalize responses into atomic findings with forced operator dispositions.
-3. Blindly adjudicate finding correctness, novelty, actionability, and confident errors.
-4. Record the decision before and after council review, separating exogenous outcomes from outcomes
-   the decision itself controls.
-5. Measure finding co-occurrence, error correlation, duplicate coverage, and leave-one-seat-out
-   decision effects.
-6. Add, replace, or remove seats only after those measurements reveal a coverage gap.
+A passing local snapshot is **not** proof of off-host backup. Live V2 activation is disabled in
+this release even with a valid content-addressed approval manifest. The independent audit
+implementation and off-host durability evidence remain hardcoded blockers; activation attempts
+append nothing until a later reviewed release implements and rehearses those controls.
 
-This is deliberately not presented as a seat leaderboard. A low Brier score alone does not show
-that a reviewer caught something novel or changed the action usefully.
+## What the reports may—and may not—say
+
+Allowed descriptive outputs include:
+
+- capture fraction and lifecycle failure counts;
+- artifact completeness and re-verification failures;
+- active and elapsed timing;
+- findings per submitted seat;
+- operator-reported disposition mix;
+- within-run finding overlap;
+- an upper bound on unique finding coverage;
+- exogenous-only descriptive forecast accuracy and outcome-polarity warnings.
+
+The MVP does **not** establish causal decision value, statistical independence, redundancy,
+replaceability, or a reviewer leaderboard. No seat comparison verdict is allowed below 20
+capture-complete independent decision families, and later comparison requires separately frozen
+adjudication and statistical rules.
 
 ## Repository map
 
 | Path | Purpose |
 | --- | --- |
-| `src/council_tools/forecasts.py` | Ledger validation, append operations, resolution rules, audit, and scoring |
-| `src/council_tools/cli.py` | Explicit-store command-line interface |
-| `runtime/` | Pinned local runtime shim and council contract |
-| `install.py` | Checked, backed-up, reversible integration installer |
-| `rehearse.py` | Copied-runtime activation rehearsal; does not write live evidence |
-| `design/` | Pre-mortem, implementation contract, and design evidence |
-| `tests/` | Unit, compatibility, installer, rehearsal, and runtime-contract tests |
+| `src/council_tools/forecasts.py` | V1 append-only forecasts, resolution rules, audit, and Brier scoring |
+| `src/council_tools/capture_schema.py` | Exact V2 record schemas and lifecycle state machine |
+| `src/council_tools/artifacts.py` | Private content-addressed artifact custody and re-verification |
+| `src/council_tools/findings.py` | Atomic findings, dispositions, and non-causal summaries |
+| `src/council_tools/data_health.py` | Frozen first-ten capture and outcome report |
+| `src/council_tools/evidence_backup.py` | Manifested local snapshot, verification, and clean restore |
+| `src/council_tools/capture_runtime.py` | Cross-module atomic integration and uniform-binding preflight |
+| `src/council_tools/cli.py` | Standalone and deployment command-line interface |
+| `runtime/` | Pinned Claude-based runtime adapter and operating contract |
+| `install.py` | Checked, backed-up, reversible local runtime installer |
+| `rehearse.py` | Copied-runtime rehearsal; never writes live evidence |
+| `design/` | Preregistration, amendments, author baselines, and design evidence |
+| `tests/` | Unit, adversarial, concurrency, integration, installer, and rehearsal tests |
 
-## Deployment-specific integration
+## Design evidence
 
-The checked-in runtime adapter integrates with an existing Claude-based council under
-`/home/trader`. It pins the installed shim to a clean source commit and source-tree SHA-256,
-backs up all changed targets, rehearses against copied runtime files, keeps a legacy forecasting
-store isolated, and restricts live ledger writes to the configured authority host.
+The prospective measurement contract was frozen before V2 data collection and then amended
+append-only when the council found flaws in the proposed denominator, custody, timing, empty-result,
+and prompt-binding rules. See
+[`design/2026-08-22-council-usefulness-preregistration.md`](design/2026-08-22-council-usefulness-preregistration.md)
+and its sibling amendments.
 
-That adapter is included as an auditable real deployment, not as a claim of portability. Use
-explicit `--log` and `--events` paths for standalone evaluation. Generalizing the seat registry,
-runtime paths, and writer authority is future work.
+That process is itself a dogfood test: seventeen integrated review rounds caught defects after green
+component and full-suite test runs, and each blocked release until another repair. Those events are
+retained; they are evidence that the process changed this implementation, not proof that the
+council is generally useful.
+
+## Deployment-specific adapter
+
+The checked-in runtime adapter targets an existing Claude-based council under `/home/trader`. It
+pins the installed entry point to a clean source commit and source-tree SHA-256, backs up changed
+runtime files, rehearses against copied data, keeps a legacy forecasting store isolated, and
+restricts live knowledge-store writes to the configured authority host.
+
+That adapter is an auditable real deployment, not a claim of portability. The Python library and
+explicit-path CLI are the reusable core.
 
 ## License
 
-No open-source license has been selected yet. Public availability of the source does not itself
-grant reuse rights. Add a license before treating the project as an open-source dependency.
+No license has been selected yet. Until one is added, the repository is source-visible but does
+not grant reuse or redistribution rights.

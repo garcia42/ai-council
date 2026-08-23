@@ -107,6 +107,10 @@ constant-50-percent Brier reference, an `inSampleBaseRateBrier` hindsight bound,
 due-or-void outcomes. The in-sample base-rate value is not an achievable ex-ante climatology. All
 scores remain descriptive and outcomes may be seat-controlled and non-independent.
 
+The resolution timestamp is system-owned. New events bind the issued outcome fingerprint, and
+reporting rejects a changed resolution date, a pre-issuance grade, or a resolution later than the
+report observation time.
+
 ### Corrupt trailing write recovery
 
 Malformed JSON fails closed. Never delete or silently skip an invalid row. If inspection proves
@@ -120,3 +124,35 @@ python3 /home/trader/.claude/knowledge/council-eval/predictions_report.py \
 
 The command holds the append lock, refuses earlier or multiple corruption, saves the byte-exact
 original with its SHA-256 in the backup name, and atomically removes only the confirmed final line.
+
+### V2 usefulness capture activation gate
+
+V2 is additive and capture-only. It records durable initiation before work begins, exact input
+artifact references for every planned seat, exact output artifact references for submitted seats,
+seat roles and versions, atomic findings, operator dispositions, outcome class, system boundary
+timestamps, invalidations, and a first-ten data-health report. It does not rank seats or claim
+causal decision value. Only resolved exogenous V2 outcomes enter its descriptive Brier output; V1
+and intervention-sensitive outcomes remain visible but excluded.
+
+Every planned input contains one canonical machine-readable forecast-request block disclosing the
+actual claim, resolution procedure and date, materiality, actions, run, outcome, fingerprint, and
+evidence cutoff. Its `forecastRequestSha256` is derived from those visible fields. Every submitted
+visible JSON output has a `capture` object that binds the same request plus its seat, input-artifact
+digest, and integer `sharedProbability`. A `no-findings` result uses the same object with `kind:
+no-findings` and `findings: []`. Otherwise `capture.findings` contains the canonical exact
+seven seat-owned finding fields; later operator grouping and dispositions cannot invent or alter
+them. Reporting parses and re-reads the retained bytes and rechecks those bindings.
+`finalizedAt` is the issuance boundary and must precede the shared outcome's resolution date.
+
+All evidence writers take the same evidence coordination lock. `evidence-snapshot` takes the
+corresponding shared lock so a local snapshot is wholly before or after an append. This is still a
+local-filesystem rehearsal, not an off-host backup claim.
+
+The live `capture-activate` command is disabled in this release. Even through the installed
+source-pinned wrapper with a verified approval manifest, it fails on hardcoded one-in-five audit and
+off-host durability blockers and appends nothing. A later reviewed release may remove those
+blockers only after implementing and rehearsing the controls.
+Before activation, exercise `capture-artifact`, `capture-initiate`, `capture-attempt`,
+`capture-seats-finished`, `capture-complete`, `capture-report`, and the evidence snapshot commands
+only against copied or explicit non-live paths. No capture command accepts an operator-supplied
+lifecycle timestamp.

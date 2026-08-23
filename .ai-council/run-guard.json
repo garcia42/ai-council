@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 1,
+  "enabled": true,
+  "checkpointMinutes": 90,
+  "hardStopMinutes": 240,
+  "renewalMaxMinutes": 120,
+  "maxReviewRounds": 2,
+  "maxAgentStarts": 8,
+  "maxQualificationRuns": 2,
+  "exactRepeatLimit": 3,
+  "alternatingCycleRepeats": 3,
+  "noProgressRounds": 2,
+  "maxReplans": 1,
+  "blockingSeverities": [
+    "P0",
+    "P1"
+  ],
+  "qualificationPatterns": [
+    "(?:^|\\s)unittest\\s+discover(?:\\s|$)",
+    "(?:^|\\s)pytest(?:\\s+[^\\n]*?)?\\s+tests(?:\\s|$)",
+    "(?:^|\\s)pytest(?:\\s+-[A-Za-z0-9_.=-]+)*\\s*$"
+  ],
+  "reviewPatterns": [
+    "(?:^|[\\s\\\"'])/council(?:$|[\\s\\\"'])",
+    "council[-_ ](?:review|round|seat)",
+    "review[-_ ]?(?:round|seat|agent)",
+    "blind[-_ ]?seat"
+  ]
+}
