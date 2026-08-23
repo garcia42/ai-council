@@ -49,9 +49,22 @@ _assert_source_integrity()
 sys.path.insert(0, str(SOURCE_ROOT / "src"))
 
 from council_tools.cli import main  # noqa: E402
+from council_tools.legacy_report import main as legacy_main  # noqa: E402
 
 
 if __name__ == "__main__":
+    legacy_log = os.environ.get("PANEL_LOG")
+    legacy_resolved = os.environ.get("PANEL_RESOLVED")
+    if legacy_log or legacy_resolved:
+        if not legacy_log or not legacy_resolved:
+            raise SystemExit("legacy mode requires both PANEL_LOG and PANEL_RESOLVED")
+        raise SystemExit(
+            legacy_main(
+                sys.argv[1:],
+                log_path=legacy_log,
+                resolved_path=legacy_resolved,
+            )
+        )
     if len(sys.argv) == 1:
         sys.argv.append("report")
     elif sys.argv[1] == "--all":
@@ -61,9 +74,4 @@ if __name__ == "__main__":
             "timestamp/index resolution is retired; use resolve <outcomeId> "
             "true|false|void with evidence"
         )
-    if sys.argv[1] == "report":
-        if "--log" not in sys.argv and os.environ.get("PANEL_LOG"):
-            sys.argv.extend(("--log", os.environ["PANEL_LOG"]))
-        if "--events" not in sys.argv and os.environ.get("PANEL_RESOLVED"):
-            sys.argv.extend(("--events", os.environ["PANEL_RESOLVED"]))
     raise SystemExit(main())

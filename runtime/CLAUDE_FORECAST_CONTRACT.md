@@ -21,3 +21,7 @@ Grading debt never blocks incident containment or rollback. A rollback preserves
 tally's forward-compatible `council-attempt` allowlist because appended attempt rows are permanent.
 The runtime reporter is pinned to the installed source commit and source digest and fails closed on
 working-tree drift; develop later changes in a separate worktree and activate a new clean commit.
+
+`PANEL_LOG` plus `PANEL_RESOLVED` selects the pinned legacy compatibility reporter for the separate
+T&R forecast store. Both variables are required together. This mode never reads or writes the
+council ledger and retains the legacy timestamp/index resolution interface only for that store.

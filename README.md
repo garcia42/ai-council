@@ -12,7 +12,8 @@ Run the isolated suite and copied-runtime rehearsal before installation:
 
 ```sh
 PYTHONPATH=src:. python3 -m unittest \
-  tests.test_forecasts tests.test_cli tests.test_install tests.test_rehearse -v
+  tests.test_forecasts tests.test_cli tests.test_install tests.test_legacy_report \
+  tests.test_rehearse -v
 python3 rehearse.py --root /home/trader
 python3 install.py check --root /home/trader
 ```
@@ -61,3 +62,7 @@ python3 /home/trader/.claude/knowledge/council-eval/predictions_report.py \
 `--today` exists only for isolated tests and copied-ledger rehearsal; the CLI rejects it on live
 council paths. A host migration requires a versioned authority change, rehearsal, and new council
 review before writes move away from `manny`.
+
+The existing T&R wrapper is deliberately separate: when both `PANEL_LOG` and `PANEL_RESOLVED` are
+set, the pinned runtime dispatches to a version-controlled legacy reporter for that store. It does
+not feed T&R records or timestamp/index resolutions into the council scorer.

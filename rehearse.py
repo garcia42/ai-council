@@ -80,6 +80,7 @@ def rehearse(source_root: Path, *, today: str) -> dict:
             "tests.test_forecasts",
             "tests.test_cli",
             "tests.test_install",
+            "tests.test_legacy_report",
             "-v",
         ],
         cwd=REPO,

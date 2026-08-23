@@ -38,20 +38,55 @@ class RuntimeContractTest(unittest.TestCase):
             root = Path(temporary)
             log = root / "separate-log.jsonl"
             events = root / "separate-events.jsonl"
-            log.write_text("", encoding="utf-8")
-            events.write_text("", encoding="utf-8")
+            log.write_text(
+                json.dumps(
+                    {
+                        "ts": "2026-08-18T00:00:00Z",
+                        "kind": "phase0",
+                        "predictions": [
+                            {
+                                "seat": "research",
+                                "claim": "A separate venture outcome",
+                                "probability": 80,
+                                "resolutionDate": "2026-08-19",
+                                "resolvedBy": "Inspect separate evidence",
+                            }
+                        ],
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            events.write_text(
+                json.dumps(
+                    {
+                        "key": "2026-08-18T00:00:00Z#0",
+                        "ts": "2026-08-18T00:00:00Z",
+                        "index": 0,
+                        "seat": "research",
+                        "claim": "A separate venture outcome",
+                        "probability": 80,
+                        "came_true": True,
+                        "note": "separate evidence",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
             env = dict(os.environ)
             env["PANEL_LOG"] = str(log)
             env["PANEL_RESOLVED"] = str(events)
             result = subprocess.run(
-                [sys.executable, str(reporter), "report", "--json"],
+                [sys.executable, str(reporter), "--all"],
                 text=True,
                 capture_output=True,
                 env=env,
                 check=False,
             )
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(json.loads(result.stdout)["rawPredictions"], 0)
+        self.assertIn("CALIBRATION (1 resolved)", result.stdout)
+        self.assertIn("Brier score:", result.stdout)
+        self.assertNotIn("councilRows", result.stdout)
 
 
 if __name__ == "__main__":
