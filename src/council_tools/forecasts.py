@@ -2,19 +2,31 @@
 
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import json
-import os
 import re
-import time
 import uuid
 from collections import defaultdict
 from contextlib import contextmanager
-from datetime import date, datetime, timezone
+from datetime import date, datetime, time as datetime_time, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable, Mapping
 from zoneinfo import ZoneInfo
+
+from .capture_schema import strict_json_loads
+from .safe_files import (
+    PinnedFileTransaction,
+    SafeFileError,
+    create_bytes_exclusive as safe_create_bytes_exclusive,
+    exclusive_lock as safe_exclusive_lock,
+    fsync_directory as safe_fsync_directory,
+    inventory_transaction_escrows as safe_inventory_transaction_escrows,
+    locked_file_transaction as safe_locked_file_transaction,
+)
+from .resolution_integrity import (
+    ResolutionIntegrityError,
+    validate_resolution_event_integrity,
+)
 
 
 SCHEMA_VERSION = 1
@@ -42,6 +54,7 @@ ID_RE = re.compile(
     r"^(run|outcome|prediction|resolution|override)-[0-9a-f]{32}$"
 )
 LOCK_TIMEOUT_SECONDS = 10.0
+OUTCOME_FINGERPRINT_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 class LedgerError(ValueError):
@@ -379,49 +392,218 @@ def validate_completion(row: dict[str, Any], prior_rows: Iterable[dict[str, Any]
         )
 
 
-def load_jsonl(path: str | Path) -> list[tuple[int, dict[str, Any]]]:
+def _load_jsonl_bytes_with_raw_identity(
+    data: bytes, *, label: str
+) -> list[tuple[int, dict[str, Any], str]]:
+    rows = []
+    for line_number, raw in enumerate(data.splitlines(keepends=True), 1):
+        if not raw.strip():
+            continue
+        try:
+            text = raw.decode("utf-8")
+            value = strict_json_loads(text)
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+            raise LedgerError(
+                f"{label} line {line_number}: invalid JSON"
+            ) from exc
+        if not isinstance(value, dict):
+            raise LedgerError(f"{label} line {line_number}: record must be an object")
+        rows.append((line_number, value, hashlib.sha256(raw).hexdigest()))
+    return rows
+
+
+def load_jsonl_with_raw_identity(
+    path: str | Path,
+) -> list[tuple[int, dict[str, Any], str]]:
+    """Load JSONL records with an identity for their exact durable bytes.
+
+    The digest covers the complete physical line, including its line ending.  It is
+    intentionally returned out of band rather than inserted into the decoded value:
+    callers can validate the durable record without report-only metadata changing its
+    schema.  Capture reporting uses this identity to recognize a byte-exact retry; two
+    JSON objects that merely decode to equal mappings remain distinct ledger events.
+    """
+
     path = Path(path)
     if not path.exists():
         return []
-    rows = []
-    with path.open(encoding="utf-8") as handle:
-        for line_number, raw in enumerate(handle, 1):
-            if not raw.strip():
-                continue
-            try:
-                value = json.loads(raw)
-            except json.JSONDecodeError as exc:
-                raise LedgerError(f"{path.name} line {line_number}: invalid JSON: {exc}") from exc
-            if not isinstance(value, dict):
-                raise LedgerError(f"{path.name} line {line_number}: record must be an object")
-            rows.append((line_number, value))
-    return rows
+    with path.open("rb") as handle:
+        return _load_jsonl_bytes_with_raw_identity(handle.read(), label=path.name)
+
+
+def load_jsonl(path: str | Path) -> list[tuple[int, dict[str, Any]]]:
+    """Load JSONL records while preserving the historical two-tuple API."""
+
+    return [
+        (line_number, value)
+        for line_number, value, _raw_sha256 in load_jsonl_with_raw_identity(path)
+    ]
+
+
+def load_transaction_jsonl_with_raw_identity(
+    transaction: PinnedFileTransaction,
+) -> list[tuple[int, dict[str, Any], str]]:
+    """Read JSONL through the parent dirfd pinned by a ledger transaction."""
+
+    return _load_jsonl_bytes_with_raw_identity(
+        transaction.read_bytes(missing_ok=True),
+        label=transaction.path.name,
+    )
+
+
+def load_transaction_jsonl(
+    transaction: PinnedFileTransaction,
+) -> list[tuple[int, dict[str, Any]]]:
+    return [
+        (line_number, value)
+        for line_number, value, _raw_sha256 in load_transaction_jsonl_with_raw_identity(
+            transaction
+        )
+    ]
+
+
+def _canonical_json_line(value: Mapping[str, Any]) -> str:
+    """Serialize one ledger record using strict JSON number semantics."""
+
+    try:
+        return (
+            json.dumps(
+                value,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            + "\n"
+        )
+    except (TypeError, ValueError) as exc:
+        raise LedgerError("record must be serializable as strict JSON") from exc
+
+
+def _fsync_directory(path: Path) -> None:
+    try:
+        safe_fsync_directory(path)
+    except SafeFileError as exc:
+        raise LedgerError(str(exc)) from exc
+
+
+def _append_jsonl_line(
+    transaction: PinnedFileTransaction, row: Mapping[str, Any]
+) -> None:
+    encoded = _canonical_json_line(row).encode("utf-8")
+    transaction.append_bytes(encoded)
+
+
+def atomic_append_transaction_jsonl(
+    transaction: PinnedFileTransaction, encoded_line: bytes
+) -> Path | None:
+    """Crash-atomically append one preflighted JSONL row in a pinned transaction.
+
+    V2 capture owns canonical serialization and secret detection, then calls
+    this function while holding :func:`ledger_write_transaction`.
+    """
+
+    if not isinstance(encoded_line, bytes) or not encoded_line.endswith(b"\n"):
+        raise LedgerError("atomic JSONL append requires one newline-terminated byte row")
+    try:
+        return transaction.atomic_append_bytes(
+            encoded_line,
+            require_trailing_newline=True,
+        )
+    except SafeFileError as exc:
+        raise LedgerError(str(exc)) from exc
+
+
+def transaction_escrow_inventory(
+    *paths: str | Path,
+) -> dict[str, Any]:
+    """Return read-only JSONL escrow custody metadata, never escrow contents."""
+
+    entries: dict[str, dict[str, Any]] = {}
+    for raw_path in paths:
+        store_path = Path(raw_path).absolute()
+        try:
+            discovered = safe_inventory_transaction_escrows(store_path)
+        except SafeFileError as exc:
+            raise LedgerError(str(exc)) from exc
+        for escrow in discovered:
+            rendered = str(escrow.path)
+            entries[rendered] = {
+                "storePath": str(store_path),
+                "path": rendered,
+                "bytes": escrow.size,
+                "entryType": escrow.entry_type,
+            }
+    ordered = [entries[path] for path in sorted(entries)]
+    return {
+        "count": len(ordered),
+        "aggregateBytes": sum(item["bytes"] for item in ordered),
+        "entries": ordered,
+    }
+
+
+def derived_ledger_lock_path(path: str | Path) -> Path:
+    """Return the exact sibling lock used to serialize one JSONL store."""
+
+    target = Path(path)
+    return target.with_name(f"{target.name}.lock")
+
+
+@contextmanager
+def ledger_write_transaction(path: str | Path):
+    """Pin ledger parent identity across its sibling lock, read, and mutation."""
+
+    path = Path(path)
+    try:
+        with safe_locked_file_transaction(
+            path,
+            timeout_seconds=LOCK_TIMEOUT_SECONDS,
+            on_directory_fsync=_fsync_directory,
+        ) as transaction:
+            yield transaction
+    except SafeFileError as exc:
+        raise LedgerError(str(exc)) from exc
 
 
 @contextmanager
 def _ledger_lock(path: Path):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    lock_path = path.with_name(f"{path.name}.lock")
-    with lock_path.open("a+", encoding="utf-8") as lock:
-        deadline = time.monotonic() + LOCK_TIMEOUT_SECONDS
-        while True:
-            try:
-                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
-            except BlockingIOError as exc:
-                if time.monotonic() >= deadline:
-                    raise LedgerError(
-                        f"timed out after {LOCK_TIMEOUT_SECONDS:g}s waiting for "
-                        f"ledger lock: {lock_path}"
-                    ) from exc
-                time.sleep(0.05)
-        try:
+    """Compatibility name for V2 callers; yields the pinned transaction."""
+
+    with ledger_write_transaction(path) as transaction:
+        yield transaction
+
+
+@contextmanager
+def evidence_write_lock(path: str | Path | None):
+    """Take the exact exclusive lock shared by all evidence-store writers.
+
+    Unlike ``_ledger_lock``, this locks the path supplied by the caller rather
+    than deriving a per-file lock name.  Evidence snapshots take a shared flock
+    on this same inode, producing one coherent cut across the ledger, resolution
+    sidecar, control store, and artifact root.
+    """
+
+    if path is None:
+        yield
+        return
+    target = Path(path)
+    if not target.is_absolute():
+        raise LedgerError("evidence coordination lock path must be absolute")
+    try:
+        with safe_exclusive_lock(
+            target,
+            timeout_seconds=LOCK_TIMEOUT_SECONDS,
+            on_directory_fsync=_fsync_directory,
+        ):
             yield
-        finally:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+    except SafeFileError as exc:
+        raise LedgerError(str(exc)) from exc
 
 
 def validate_ledger_row(row: dict[str, Any], prior_rows: Iterable[dict[str, Any]]) -> None:
+    # This is also the CLI's check-only boundary. Serializing here prevents
+    # otherwise unvalidated nested council metadata from poisoning the ledger
+    # with Python's non-standard NaN/Infinity tokens.
+    _canonical_json_line(row)
     prior_rows = list(prior_rows)
     kind = row.get("kind")
     if kind == "council-attempt":
@@ -464,31 +646,66 @@ def validate_ledger_row(row: dict[str, Any], prior_rows: Iterable[dict[str, Any]
         raise LedgerError(f"record command does not accept kind: {kind}")
 
 
-def append_ledger_row(path: str | Path, row: dict[str, Any]) -> None:
+def append_ledger_row(
+    path: str | Path,
+    row: dict[str, Any],
+    *,
+    coordination_lock: str | Path | None = None,
+) -> None:
     path = Path(path)
-    with _ledger_lock(path):
-        prior = [row_value for _, row_value in load_jsonl(path)]
-        validate_ledger_row(row, prior)
-        with path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n")
-            handle.flush()
-            os.fsync(handle.fileno())
+    with evidence_write_lock(coordination_lock):
+        with ledger_write_transaction(path) as transaction:
+            prior = [
+                row_value for _, row_value in load_transaction_jsonl(transaction)
+            ]
+            validate_ledger_row(row, prior)
+            _append_jsonl_line(transaction, row)
 
 
 def _validate_resolution_event(
     event: dict[str, Any], prior_events: Iterable[dict[str, Any]]
 ) -> None:
+    required_keys = {
+        "schemaVersion",
+        "kind",
+        "resolutionId",
+        "outcomeId",
+        "resolutionDate",
+        "status",
+        "cameTrue",
+        "voidReason",
+        "evidence",
+        "resolver",
+        "reviewer",
+        "method",
+        "resolvedAt",
+        "supersedesResolutionId",
+    }
+    optional_keys = {"outcomeFingerprint"}
+    if not isinstance(event, dict) or not required_keys.issubset(event) or (
+        set(event) - required_keys - optional_keys
+    ):
+        raise LedgerError(
+            "resolution event must contain the exact resolution schema with optional "
+            "outcomeFingerprint"
+        )
     if event.get("schemaVersion") != SCHEMA_VERSION:
         raise LedgerError("resolution schemaVersion must be 1")
     if event.get("kind") != "outcome-resolution":
         raise LedgerError("resolution kind must be outcome-resolution")
     _require_id(event.get("resolutionId"), "resolution", "resolutionId")
     outcome_id = _require_id(event.get("outcomeId"), "outcome", "outcomeId")
+    fingerprint = event.get("outcomeFingerprint")
+    if fingerprint is not None and (
+        not isinstance(fingerprint, str)
+        or OUTCOME_FINGERPRINT_RE.fullmatch(fingerprint) is None
+    ):
+        raise LedgerError("outcomeFingerprint must be a lowercase SHA-256 digest")
     resolved_at = _parse_timestamp(event.get("resolvedAt"), "resolvedAt")
     resolution_date = _parse_date(event.get("resolutionDate"), "resolutionDate")
     _require_text(event.get("evidence"), "evidence")
     resolver = _require_text(event.get("resolver"), "resolver")
-    method = event.get("method")
+    method = _require_text(event.get("method"), "method")
     if method not in RESOLUTION_METHODS:
         raise LedgerError(f"method must be one of {sorted(RESOLUTION_METHODS)}")
     reviewer = event.get("reviewer")
@@ -499,11 +716,14 @@ def _validate_resolution_event(
     elif reviewer not in (None, ""):
         raise LedgerError("deterministic resolution must not name a reviewer")
 
-    status = event.get("status")
+    status = _require_text(event.get("status"), "status")
+    void_reason = event.get("voidReason")
+    if void_reason is not None:
+        void_reason = _require_text(void_reason, "voidReason")
     if status == "resolved":
         if not isinstance(event.get("cameTrue"), bool):
             raise LedgerError("resolved outcome requires Boolean cameTrue")
-        if event.get("voidReason") not in (None, ""):
+        if void_reason not in (None, ""):
             raise LedgerError("resolved outcome cannot have voidReason")
         if resolved_at.astimezone(ZoneInfo("America/New_York")).date() <= resolution_date:
             raise LedgerError(
@@ -512,7 +732,7 @@ def _validate_resolution_event(
     elif status == "void":
         if event.get("cameTrue") is not None:
             raise LedgerError("void outcome requires cameTrue=null")
-        if event.get("voidReason") not in VOID_REASONS:
+        if void_reason not in VOID_REASONS:
             raise LedgerError(f"voidReason must be one of {sorted(VOID_REASONS)}")
         if method != "manual-reviewed":
             raise LedgerError("void outcome requires manual-reviewed method")
@@ -537,6 +757,7 @@ def append_resolution(
     *,
     outcome_id: str,
     resolution_date: str,
+    outcome_fingerprint: str,
     came_true: bool | None,
     evidence: str,
     resolver: str,
@@ -546,6 +767,10 @@ def append_resolution(
     void_reason: str | None = None,
     supersedes_resolution_id: str | None = None,
     resolution_id: str | None = None,
+    coordination_lock: str | Path | None = None,
+    _row_writer: Callable[[PinnedFileTransaction, Mapping[str, Any]], None]
+    | None = None,
+    _transaction: PinnedFileTransaction | None = None,
 ) -> dict[str, Any]:
     status = "void" if void_reason is not None else "resolved"
     event = {
@@ -564,14 +789,29 @@ def append_resolution(
         "resolvedAt": resolved_at,
         "supersedesResolutionId": supersedes_resolution_id,
     }
+    event["outcomeFingerprint"] = outcome_fingerprint
     path = Path(path)
-    with _ledger_lock(path):
-        prior = [item for _, item in load_jsonl(path)]
+
+    def validate_and_append(transaction: PinnedFileTransaction) -> None:
+        prior = [item for _, item in load_transaction_jsonl(transaction)]
         _validate_resolution_event(event, prior)
-        with path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n")
-            handle.flush()
-            os.fsync(handle.fileno())
+        if _row_writer is None:
+            _append_jsonl_line(transaction, event)
+        else:
+            _row_writer(transaction, event)
+
+    if _transaction is not None:
+        if coordination_lock is not None:
+            raise LedgerError(
+                "supplied resolution transaction requires coordination_lock=None"
+            )
+        if path.absolute() != _transaction.path.absolute():
+            raise LedgerError("supplied resolution transaction does not match event path")
+        validate_and_append(_transaction)
+    else:
+        with evidence_write_lock(coordination_lock):
+            with ledger_write_transaction(path) as transaction:
+                validate_and_append(transaction)
     return event
 
 
@@ -583,6 +823,7 @@ def append_override(
     created_at: str,
     expires_date: str,
     override_id: str | None = None,
+    coordination_lock: str | Path | None = None,
 ) -> dict[str, Any]:
     created = _parse_timestamp(created_at, "createdAt")
     expires = _parse_date(expires_date, "expiresDate")
@@ -599,14 +840,12 @@ def append_override(
     }
     _require_id(event["overrideId"], "override", "overrideId")
     path = Path(path)
-    with _ledger_lock(path):
-        prior = [item for _, item in load_jsonl(path)]
-        if any(item.get("overrideId") == event["overrideId"] for item in prior):
-            raise LedgerError(f"duplicate overrideId: {event['overrideId']}")
-        with path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n")
-            handle.flush()
-            os.fsync(handle.fileno())
+    with evidence_write_lock(coordination_lock):
+        with ledger_write_transaction(path) as transaction:
+            prior = [item for _, item in load_transaction_jsonl(transaction)]
+            if any(item.get("overrideId") == event["overrideId"] for item in prior):
+                raise LedgerError(f"duplicate overrideId: {event['overrideId']}")
+            _append_jsonl_line(transaction, event)
     return event
 
 
@@ -615,6 +854,7 @@ def repair_trailing_jsonl(
     *,
     expected_line: int,
     backup_dir: str | Path,
+    coordination_lock: str | Path | None = None,
 ) -> dict[str, Any]:
     """Quarantine and remove exactly one confirmed invalid final nonblank line.
 
@@ -629,11 +869,13 @@ def repair_trailing_jsonl(
         raise LedgerError("expected_line must be a positive integer")
     if expected_line < 1:
         raise LedgerError("expected_line must be a positive integer")
-    if not path.exists():
-        raise LedgerError(f"ledger does not exist: {path}")
-
-    with _ledger_lock(path):
-        original = path.read_bytes()
+    with evidence_write_lock(coordination_lock), ledger_write_transaction(
+        path
+    ) as transaction:
+        try:
+            original = transaction.read_bytes()
+        except SafeFileError as exc:
+            raise LedgerError(str(exc)) from exc
         try:
             text = original.decode("utf-8")
         except UnicodeDecodeError as exc:
@@ -650,9 +892,9 @@ def repair_trailing_jsonl(
             if not raw.strip():
                 continue
             try:
-                value = json.loads(raw)
-            except json.JSONDecodeError as exc:
-                invalid.append((line_number, f"invalid JSON: {exc}"))
+                value = strict_json_loads(raw)
+            except (json.JSONDecodeError, ValueError):
+                invalid.append((line_number, "invalid JSON"))
                 continue
             if not isinstance(value, dict):
                 invalid.append((line_number, "record must be an object"))
@@ -673,41 +915,39 @@ def repair_trailing_jsonl(
             )
 
         digest = hashlib.sha256(original).hexdigest()
-        backup_dir.mkdir(parents=True, exist_ok=True)
         backup = backup_dir / (
             f"{path.name}.quarantine.{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}."
             f"{digest[:12]}"
         )
-        with backup.open("xb") as handle:
-            handle.write(original)
-            handle.flush()
-            os.fsync(handle.fileno())
+        try:
+            safe_create_bytes_exclusive(
+                backup,
+                original,
+                on_directory_fsync=_fsync_directory,
+            )
+        except SafeFileError as exc:
+            raise LedgerError(str(exc)) from exc
 
         repaired = "".join(
             raw for line_number, raw in enumerate(lines, 1) if line_number != invalid_line
         ).encode("utf-8")
-        temporary = path.with_name(f".{path.name}.repair-{uuid.uuid4().hex}.tmp")
         try:
-            with temporary.open("xb") as handle:
-                handle.write(repaired)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.chmod(temporary, path.stat().st_mode)
-            os.replace(temporary, path)
-            directory = os.open(path.parent, os.O_RDONLY)
-            try:
-                os.fsync(directory)
-            finally:
-                os.close(directory)
-        finally:
-            if temporary.exists():
-                temporary.unlink()
+            transaction_escrow = transaction.atomic_replace_bytes(
+                repaired,
+                expected_sha256=digest,
+                require_existing=True,
+            )
+        except SafeFileError as exc:
+            raise LedgerError(str(exc)) from exc
     return {
         "path": str(path),
         "removedLine": invalid_line,
         "reason": reason,
         "backup": str(backup),
         "originalSha256": digest,
+        "transactionEscrow": (
+            None if transaction_escrow is None else str(transaction_escrow)
+        ),
     }
 
 
@@ -843,8 +1083,32 @@ def audit(
     events_path: str | Path,
     *,
     today: date | None = None,
+    as_of: datetime | str | None = None,
 ) -> dict[str, Any]:
-    today = today or datetime.now(ZoneInfo("America/New_York")).date()
+    if as_of is not None:
+        if isinstance(as_of, datetime):
+            if as_of.tzinfo is None or as_of.utcoffset() is None:
+                raise LedgerError("as_of must include a timezone")
+            report_as_of = as_of.astimezone(timezone.utc)
+        else:
+            report_as_of = _parse_timestamp(as_of, "as_of")
+        observed_today = report_as_of.astimezone(
+            ZoneInfo("America/New_York")
+        ).date()
+        if today is not None and today != observed_today:
+            raise LedgerError("today must match as_of in America/New_York")
+        today = observed_today
+    elif today is not None:
+        # Explicit dates remain a deterministic local-test API and represent
+        # the complete New York reporting day.
+        report_as_of = datetime.combine(
+            today,
+            datetime_time.max,
+            tzinfo=ZoneInfo("America/New_York"),
+        ).astimezone(timezone.utc)
+    else:
+        report_as_of = datetime.now(timezone.utc)
+        today = report_as_of.astimezone(ZoneInfo("America/New_York")).date()
     numbered_rows = load_jsonl(log_path)
     rows = [row for _, row in numbered_rows]
     resolutions, overrides = _load_events(events_path)
@@ -971,12 +1235,49 @@ def audit(
     for prediction in representatives.values():
         outcome_predictions[prediction["outcomeId"]].append(prediction)
 
+    issued_outcomes: dict[str, tuple[dict[str, Any], str]] = {}
+    for run_id, attempt_row in attempts_by_run.items():
+        completion_row = completions_by_run.get(run_id)
+        if completion_row is None:
+            continue
+        canonical_outcome = attempt_row["sharedOutcome"]
+        outcome_id = canonical_outcome["outcomeId"]
+        if outcome_id in outcome_predictions:
+            issued_outcomes[outcome_id] = (
+                canonical_outcome,
+                completion_row["ts"],
+            )
+
     unknown_resolution_ids = sorted(set(resolutions) - set(outcome_predictions))
     if unknown_resolution_ids:
         invalid_records.extend(
             f"resolution references unknown outcomeId: {item}"
             for item in unknown_resolution_ids
         )
+
+    valid_resolutions: dict[str, dict[str, Any]] = {}
+    for outcome_id, event in resolutions.items():
+        issued = issued_outcomes.get(outcome_id)
+        if issued is None:
+            continue
+        canonical_outcome, issuance_at = issued
+        try:
+            validate_resolution_event_integrity(
+                event,
+                canonical_outcome,
+                issuance_at=issuance_at,
+                as_of=report_as_of,
+                # Events created before the binding field was introduced remain
+                # readable. Every current writer supplies the field.
+                require_outcome_fingerprint="outcomeFingerprint" in event,
+            )
+        except ResolutionIntegrityError as exc:
+            invalid_records.append(
+                f"resolution integrity failed for {outcome_id}: {exc}"
+            )
+            continue
+        valid_resolutions[outcome_id] = event
+    resolutions = valid_resolutions
 
     due_outcomes = set()
     old_overdue = set()
@@ -1099,6 +1400,9 @@ def audit(
 
     return {
         "scope": "council",
+        "transactionEscrows": transaction_escrow_inventory(
+            log_path, events_path
+        ),
         "rawPredictions": sum(len(row.get("predictions") or []) for row in rows),
         "forecastIssuances": len(predictions),
         "representativeForecasts": len(representatives),
@@ -1108,6 +1412,11 @@ def audit(
         "outcomeResolutionDates": {
             outcome_id: items[0]["resolutionDate"]
             for outcome_id, items in sorted(outcome_predictions.items())
+        },
+        "outcomeFingerprints": {
+            outcome_id: issued_outcomes[outcome_id][0]["fingerprint"]
+            for outcome_id in sorted(outcome_predictions)
+            if outcome_id in issued_outcomes
         },
         "sharedOutcomes": shared_outcomes,
         "excludedPredictions": excluded_predictions,

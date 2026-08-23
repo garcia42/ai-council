@@ -5,7 +5,7 @@ records a price-free `council-attempt`, gives every seated reviewer one byte-ide
 shared outcome, seals the returned probabilities, validates the completion record, and appends it
 through the version-controlled forecast tool. Never resolve by timestamp or prediction-list index.
 
-Forecast scores are descriptive operational calibration, not a reviewer leaderboard. Grading debt
+Forecast scores are descriptive forecast accuracy, not a reviewer leaderboard. Grading debt
 does not stop a new council from convening, but three or more outcomes over 14 days late block
 decision finalization unless the principal records a time-limited override. Manual grades require
 independent review and durable evidence. A `submitted` seat requires exactly one probability;
@@ -26,3 +26,26 @@ working-tree drift; develop later changes in a separate worktree and activate a 
 T&R store. That mode rejects live-knowledge paths, filesystem aliases, and non-legacy arguments;
 both variables are required together. It never reads or writes the council ledger and retains the
 legacy timestamp/index resolution interface only for the T&R store.
+
+### Prospective usefulness capture (implemented, not automatically activated)
+
+The runtime also contains additive V2 capture commands for exact visible prompts and answers,
+seat/version metadata, atomic findings, operator dispositions, outcome class, capture-health
+reporting, and local snapshot/restore rehearsal. V2 never reinterprets V1 forecasts, and V2
+resolutions use the separate `capture_resolved.jsonl` sidecar.
+
+Every V2 prompt discloses one canonical machine-readable forecast request with the actual target,
+resolution rule and date, materiality, actions, run, outcome, fingerprint, and cutoff. Its request
+digest is derived from that visible block. Every submitted visible JSON answer binds the request,
+its input artifact, seat, and shared probability in the structured `capture` object. Completion
+and reporting parse the retained prompt and reject substituted questions, prompts, probabilities,
+or issuance on or after the outcome resolution date. The same object contains a canonical
+`findings` list with the exact seven seat-owned fields; operator grouping and dispositions remain
+separate and cannot invent, delete, or alter a seat finding.
+
+Live `capture-activation` is disabled in this release. The command requires the installed source
+pin and a content-addressed approval manifest, then still fails on hardcoded one-in-five audit and
+off-host durability blockers and appends nothing. Local `evidence-snapshot`, `evidence-verify`, and
+`evidence-restore` results are explicitly rehearsal-only. Continue the V1 council contract above
+and use V2 only in copied or explicit non-live stores until a later reviewed release implements and
+rehearses both controls.

@@ -10,6 +10,9 @@ from datetime import date
 from pathlib import Path
 from typing import Iterable
 
+from .capture_schema import strict_json_loads
+from .forecasts import LedgerError, transaction_escrow_inventory
+
 
 class LegacyReportError(ValueError):
     pass
@@ -19,15 +22,15 @@ def _load(path: Path) -> list[dict]:
     if not path.exists():
         return []
     rows = []
-    with path.open(encoding="utf-8") as handle:
+    with path.open("rb") as handle:
         for line_number, raw in enumerate(handle, 1):
             if not raw.strip():
                 continue
             try:
-                row = json.loads(raw)
-            except json.JSONDecodeError as exc:
+                row = strict_json_loads(raw)
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
                 raise LegacyReportError(
-                    f"{path.name} line {line_number}: invalid JSON: {exc}"
+                    f"{path.name} line {line_number}: invalid JSON"
                 ) from exc
             if not isinstance(row, dict):
                 raise LegacyReportError(
@@ -109,6 +112,19 @@ def resolve(
 def report(log_path: Path, resolved_path: Path, *, show_all: bool) -> None:
     rows = _load(log_path)
     resolutions = _load(resolved_path)
+    try:
+        escrows = transaction_escrow_inventory(log_path, resolved_path)
+    except LedgerError as exc:
+        raise LegacyReportError(str(exc)) from exc
+    print(
+        "== RETAINED TRANSACTION ESCROWS "
+        f"({escrows['count']}, {escrows['aggregateBytes']} bytes) =="
+    )
+    for entry in escrows["entries"]:
+        print(
+            f"  {entry['path']} bytes={entry['bytes']} "
+            f"type={entry['entryType']} store={entry['storePath']}"
+        )
     resolution_keys = [_resolution_key(row) for row in resolutions]
     if len(resolution_keys) != len(set(resolution_keys)):
         raise LegacyReportError("legacy resolution store contains duplicate outcome identities")

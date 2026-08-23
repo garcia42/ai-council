@@ -1,4 +1,5 @@
 import io
+import hashlib
 import json
 import tempfile
 import threading
@@ -6,7 +7,7 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
-from council_tools import legacy_report
+from council_tools import legacy_report, safe_files
 
 
 class LegacyReportTest(unittest.TestCase):
@@ -56,6 +57,40 @@ class LegacyReportTest(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertIn("Brier score:     0.000", stdout.getvalue())
 
+    def test_report_enumerates_all_retained_transaction_escrows(self):
+        payload = (
+            json.dumps(
+                {
+                    "ts": "2026-08-18T00:00:00Z",
+                    "predictions": [],
+                },
+                sort_keys=True,
+            )
+            + "\n"
+        ).encode()
+        self.log.write_bytes(payload)
+        first = safe_files.atomic_replace_bytes(
+            self.log,
+            payload,
+            expected_sha256=hashlib.sha256(payload).hexdigest(),
+        )
+        second = safe_files.atomic_replace_bytes(
+            self.log,
+            payload,
+            expected_sha256=hashlib.sha256(payload).hexdigest(),
+        )
+        stdout = io.StringIO()
+
+        with redirect_stdout(stdout):
+            result = legacy_report.main(
+                ["--all"], log_path=self.log, resolved_path=self.resolved
+            )
+
+        self.assertEqual(result, 0)
+        self.assertIn("RETAINED TRANSACTION ESCROWS (2", stdout.getvalue())
+        self.assertIn(str(first), stdout.getvalue())
+        self.assertIn(str(second), stdout.getvalue())
+
     def test_malformed_legacy_json_fails_closed(self):
         self.log.write_text("not-json\n", encoding="utf-8")
         stderr = io.StringIO()
@@ -65,6 +100,23 @@ class LegacyReportTest(unittest.TestCase):
             )
         self.assertEqual(result, 1)
         self.assertIn("line 1", stderr.getvalue())
+
+    def test_duplicate_secret_shaped_key_is_strict_generic_and_nonleaking(self):
+        secret_key = "ghp_" + "l" * 40
+        self.log.write_text(
+            '{"' + secret_key + '":1,"' + secret_key + '":2}\n',
+            encoding="utf-8",
+        )
+        stderr = io.StringIO()
+
+        with redirect_stderr(stderr):
+            result = legacy_report.main(
+                ["--all"], log_path=self.log, resolved_path=self.resolved
+            )
+
+        self.assertEqual(result, 1)
+        self.assertIn("forecasts.jsonl line 1: invalid JSON", stderr.getvalue())
+        self.assertNotIn(secret_key, stderr.getvalue())
 
     def test_truncated_legacy_resolution_sidecar_fails_closed(self):
         self.log.write_text("", encoding="utf-8")

@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "council-tools"
-version = "0.1.0"
-description = "Append-only council forecast validation and descriptive Brier reporting"
+version = "0.2.0"
+description = "Evidence capture, usefulness diagnostics, and descriptive scoring for AI councils"
 readme = "README.md"
 requires-python = ">=3.11"
 

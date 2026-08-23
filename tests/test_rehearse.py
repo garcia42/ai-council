@@ -1,7 +1,9 @@
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import rehearse
 
@@ -99,9 +101,32 @@ class RehearsalTest(unittest.TestCase):
         result = rehearse.rehearse(self.root, today="2026-08-22")
         self.assertEqual(result["status"], "PASS")
         self.assertTrue(result["liveFilesUnchanged"])
+        self.assertTrue(result["liveCoordinationLockUnopened"])
         self.assertTrue(result["stagedInstallClean"])
         self.assertGreater(result["isolatedCoreTests"], 0)
-        self.assertEqual(result["runtimeContractTests"], 4)
+        self.assertEqual(result["runtimeContractTests"], 5)
+        self.assertEqual(
+            result["runtimeContractIsolation"]["executedProofTest"],
+            "test_rehearsal_audit_guard_denies_live_access_and_path_mutators",
+        )
+        isolation = result["runtimeContractIsolation"]
+        self.assertEqual(isolation["stores"], "staged-or-temp-only")
+        self.assertTrue(isolation["liveOpenDeniedBeforeSyscall"])
+        self.assertTrue(isolation["liveLinkDeniedBeforeSyscall"])
+        self.assertEqual(
+            isolation["representativeMutationProofs"],
+            {
+                "chmod": True,
+                "rename": True,
+                "replace": True,
+                "remove": True,
+                "unlink": True,
+                "symlink": True,
+            },
+        )
+        self.assertTrue(isolation["metadataComparisonDefenseInDepth"])
+        self.assertIn("not arbitrary native syscalls", isolation["enforcementScope"])
+        self.assertIn("descriptor inherited before the hook", isolation["enforcementScope"])
         self.assertEqual(result["legacyCompatibility"]["realRowsParsed"], 1)
         self.assertEqual(result["legacyCompatibility"]["realResolutionsParsed"], 1)
         self.assertTrue(result["legacyCompatibility"]["copiedResolutionAppended"])
@@ -110,6 +135,16 @@ class RehearsalTest(unittest.TestCase):
         )
         self.assertTrue(result["failurePath"]["malformedProbabilityRejectedWithoutAppend"])
         self.assertTrue(result["failurePath"]["unavailableSeatSealedWithoutProbability"])
+        self.assertTrue(result["captureV2"]["copiedRuntimeLifecycleComplete"])
+        self.assertTrue(result["captureV2"]["forecastRequestAndPromptBound"])
+        self.assertTrue(result["captureV2"]["canonicalForecastRequestParsed"])
+        self.assertTrue(result["captureV2"]["reportTimeForecastRequestVerified"])
+        self.assertTrue(result["captureV2"]["structuredEmptyFindingsVerified"])
+        self.assertEqual(result["captureV2"]["completeInitiations"], 1)
+        self.assertEqual(result["captureV2"]["artifactIntegrityFailures"], 0)
+        self.assertEqual(result["captureV2"]["blindCompletedRuns"], 1)
+        self.assertEqual(result["captureV2"]["blindNonCouncilRecords"], 4)
+        self.assertFalse(result["captureV2"]["liveActivated"])
         self.assertTrue(result["runtimeSourcePin"]["sourceDriftRejectedBeforeAppend"])
         self.assertEqual(
             (
@@ -117,6 +152,30 @@ class RehearsalTest(unittest.TestCase):
             ).read_bytes(),
             original_reporter,
         )
+
+    def test_live_lock_state_observation_does_not_open_its_contents(self):
+        sentinel = self.root / "live-evidence.lock"
+        sentinel.write_bytes(b"must-not-be-opened")
+        with mock.patch.object(
+            rehearse, "_digest", side_effect=AssertionError("lock content opened")
+        ):
+            before = rehearse._path_state(sentinel, hash_content=False)
+            after = rehearse._path_state(sentinel, hash_content=False)
+        self.assertEqual(before, after)
+        self.assertNotIn("sha256", before)
+        self.assertIn("nlink", before)
+        self.assertIn("ctimeNs", before)
+
+    def test_path_state_detects_hardlink_inode_metadata_change(self):
+        source = self.root / "staged-ledger.jsonl"
+        alias = self.root / "staged-ledger-alias.jsonl"
+        source.write_text("{}\n", encoding="utf-8")
+        before = rehearse._path_state(source)
+        os.link(source, alias)
+        after = rehearse._path_state(source)
+        self.assertEqual(after["nlink"], before["nlink"] + 1)
+        self.assertNotEqual(before, after)
+        self.assertIn("ctimeNs", after)
 
 
 if __name__ == "__main__":

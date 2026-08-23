@@ -8,6 +8,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import pwd
 import re
 import shutil
 import subprocess
@@ -34,7 +35,17 @@ LEGACY_ENV_KEYS = (
     "PANEL_LOG",
     "PANEL_RESOLVED",
     "COUNCIL_TOOLS_DENY_OPEN_PATHS",
+    "COUNCIL_RUNTIME_CONTRACT_DENY_PATHS",
 )
+ACCOUNT_HOME = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
+LIVE_COUNCIL_LOG = ACCOUNT_HOME / ".claude/knowledge/futures-panel-log.jsonl"
+LIVE_COUNCIL_EVENTS = (
+    ACCOUNT_HOME / ".claude/knowledge/council-eval/predictions_resolved.jsonl"
+)
+LIVE_CAPTURE_EVENTS = (
+    ACCOUNT_HOME / ".claude/knowledge/council-eval/capture_resolved.jsonl"
+)
+LIVE_COORDINATION_LOCK = ACCOUNT_HOME / ".local/state/council-tools/evidence.lock"
 
 
 class RehearsalError(RuntimeError):
@@ -43,6 +54,28 @@ class RehearsalError(RuntimeError):
 
 def _digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _path_state(path: Path, *, hash_content: bool = True) -> dict:
+    """Capture enough state to detect creation, replacement, chmod, or mutation."""
+
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return {"exists": False}
+    state = {
+        "exists": True,
+        "mode": info.st_mode,
+        "inode": info.st_ino,
+        "device": info.st_dev,
+        "size": info.st_size,
+        "nlink": info.st_nlink,
+        "ctimeNs": info.st_ctime_ns,
+        "mtimeNs": info.st_mtime_ns,
+    }
+    if hash_content and path.is_file():
+        state["sha256"] = _digest(path)
+    return state
 
 
 def _load_module(path: Path, name: str):
@@ -104,6 +137,18 @@ def rehearse(source_root: Path, *, today: str) -> dict:
         raise RehearsalError("real T&R legacy log and resolution sidecar are required")
     source_files.extend((legacy_log, legacy_events))
     before_hashes = {str(path): _digest(path) for path in source_files}
+    live_guard_paths = (
+        LIVE_COUNCIL_LOG,
+        LIVE_COUNCIL_EVENTS,
+        LIVE_CAPTURE_EVENTS,
+        LIVE_COORDINATION_LOCK,
+    )
+    before_live_state = {
+        str(path): _path_state(
+            path, hash_content=path != LIVE_COORDINATION_LOCK
+        )
+        for path in live_guard_paths
+    }
 
     core_env = _clean_council_env()
     core_env["PYTHONPATH"] = f"{REPO / 'src'}:{REPO}"
@@ -114,6 +159,12 @@ def rehearse(source_root: Path, *, today: str) -> dict:
             "unittest",
             "tests.test_forecasts",
             "tests.test_cli",
+            "tests.test_artifacts",
+            "tests.test_capture_schema",
+            "tests.test_findings",
+            "tests.test_data_health",
+            "tests.test_evidence_backup",
+            "tests.test_capture_integration",
             "tests.test_install",
             "tests.test_legacy_report",
             "-v",
@@ -133,7 +184,9 @@ def rehearse(source_root: Path, *, today: str) -> dict:
         raise RehearsalError("could not derive isolated core test count")
     core_test_count = int(core_count_match.group(1))
 
-    with tempfile.TemporaryDirectory(prefix="council-tools-rehearsal-") as temporary:
+    with tempfile.TemporaryDirectory(
+        prefix="council-tools-rehearsal-", dir="/var/tmp"
+    ) as temporary:
         stage_root = Path(temporary)
         staged_source = stage_root / "council-tools-source"
         shutil.copytree(
@@ -165,6 +218,13 @@ def rehearse(source_root: Path, *, today: str) -> dict:
 
         runtime_env = _clean_council_env()
         runtime_env["COUNCIL_RUNTIME_ROOT"] = str(stage_root)
+        # The contract suite must use only its staged/temp stores. Its CPython
+        # audit hook rejects opens and the enumerated path-mutator events before
+        # their filesystem call; the post-run metadata comparison remains a
+        # separate defense for effects outside that explicitly tested scope.
+        denied_runtime_paths = os.pathsep.join(str(path) for path in live_guard_paths)
+        runtime_env["COUNCIL_RUNTIME_CONTRACT_DENY_PATHS"] = denied_runtime_paths
+        runtime_env["COUNCIL_TOOLS_DENY_OPEN_PATHS"] = denied_runtime_paths
         runtime_tests = subprocess.run(
             [
                 sys.executable,
@@ -194,9 +254,23 @@ def rehearse(source_root: Path, *, today: str) -> dict:
         if runtime_count_match is None:
             raise RehearsalError("could not derive staged runtime test count")
         runtime_test_count = int(runtime_count_match.group(1))
+        runtime_test_output = runtime_tests.stdout + runtime_tests.stderr
+        isolation_proof = re.search(
+            r"test_rehearsal_audit_guard_denies_live_access_and_path_mutators.*"
+            r"\.\.\. ok",
+            runtime_test_output,
+        )
+        if isolation_proof is None:
+            raise RehearsalError(
+                "runtime contract live access/path-mutator denial proof did not execute"
+            )
 
         reporter = stage_root / ".claude/knowledge/council-eval/predictions_report.py"
         council_env = _clean_council_env()
+        council_env["COUNCIL_TOOLS_DENY_OPEN_PATHS"] = os.pathsep.join(
+            str(path) for path in live_guard_paths
+        )
+        rehearsal_lock = stage_root / "evidence.lock"
         failure_log = stage_root / ".claude/knowledge/council-eval/failure-path.jsonl"
         failure_events = stage_root / ".claude/knowledge/council-eval/failure-events.jsonl"
         attempt_spec = stage_root / "failure-attempt.json"
@@ -230,6 +304,8 @@ def rehearse(source_root: Path, *, today: str) -> dict:
                 str(attempt_spec),
                 "--ts",
                 "2026-08-22T12:00:00Z",
+                "--coordination-lock",
+                str(rehearsal_lock),
             ],
             text=True,
             capture_output=True,
@@ -285,6 +361,8 @@ def rehearse(source_root: Path, *, today: str) -> dict:
                 "--ts",
                 "2026-08-22T12:05:00Z",
                 "--check-only",
+                "--coordination-lock",
+                str(rehearsal_lock),
             ],
             text=True,
             capture_output=True,
@@ -322,6 +400,8 @@ def rehearse(source_root: Path, *, today: str) -> dict:
                 "--ts",
                 "2026-08-22T12:06:00Z",
                 "--check-only",
+                "--coordination-lock",
+                str(rehearsal_lock),
             ],
             text=True,
             capture_output=True,
@@ -339,6 +419,8 @@ def rehearse(source_root: Path, *, today: str) -> dict:
                 str(unavailable_spec),
                 "--ts",
                 "2026-08-22T12:06:00Z",
+                "--coordination-lock",
+                str(rehearsal_lock),
             ],
             text=True,
             capture_output=True,
@@ -380,6 +462,452 @@ def rehearse(source_root: Path, *, today: str) -> dict:
         ):
             raise RehearsalError(f"failure-path accounting mismatch: {failure_payload}")
 
+        # Exercise the additive V2 lifecycle through the installed, source-pinned
+        # reporter.  Every path is staged; this never activates or appends live V2.
+        v2_log = stage_root / ".claude/knowledge/council-eval/v2-rehearsal.jsonl"
+        v2_events = stage_root / ".claude/knowledge/council-eval/v2-resolved.jsonl"
+        v2_artifacts = stage_root / "private-v2-artifacts"
+        v2_lock = rehearsal_lock
+        runtime_commit = subprocess.run(
+            ["git", "-C", str(staged_source), "rev-parse", "HEAD"],
+            text=True,
+            capture_output=True,
+            check=True,
+        ).stdout.strip()
+
+        activation_spec = stage_root / "v2-activation.json"
+        activation_spec.write_text(
+            json.dumps(
+                {
+                    "cohortName": "copied-runtime-v2-rehearsal",
+                    "captureVersion": "capture-v2.0.0",
+                    "runtimeSourceCommit": runtime_commit,
+                    "artifactRootPolicy": "private-content-addressed-v1",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        def v2_command(arguments):
+            result = subprocess.run(
+                [sys.executable, str(reporter), *arguments],
+                text=True,
+                capture_output=True,
+                env=council_env,
+                check=False,
+            )
+            if result.returncode != 0:
+                raise RehearsalError(
+                    f"V2 copied-runtime command failed: {arguments[0]}: "
+                    + result.stdout
+                    + result.stderr
+                )
+            return result
+
+        activated = v2_command(
+            [
+                "capture-activate",
+                "--log",
+                str(v2_log),
+                "--spec",
+                str(activation_spec),
+                "--coordination-lock",
+                str(v2_lock),
+            ]
+        )
+        activation_id = json.loads(activated.stdout)["activationId"]
+        initiated = v2_command(
+            [
+                "capture-initiate",
+                "--log",
+                str(v2_log),
+                "--activation-id",
+                activation_id,
+                "--idempotency-key",
+                "copied-runtime-one",
+                "--coordination-lock",
+                str(v2_lock),
+            ]
+        )
+        initiation = json.loads(initiated.stdout)
+
+        baseline_file = stage_root / "v2-baseline.json"
+        baseline_file.write_text(
+            json.dumps(
+                {
+                    "schemaVersion": 3,
+                    "knownConsiderations": [
+                        {
+                            "considerationId": "KC-01",
+                            "claim": "A copied-runtime rehearsal is not live activation.",
+                        }
+                    ],
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            encoding="utf-8",
+        )
+
+        def capture_v2_artifact(path):
+            result = v2_command(
+                [
+                    "capture-artifact",
+                    "--file",
+                    str(path),
+                    "--artifact-root",
+                    str(v2_artifacts),
+                    "--run-id",
+                    initiation["runId"],
+                    "--log",
+                    str(v2_log),
+                    "--operator",
+                    "copied-runtime-rehearsal",
+                    "--evidence-ref",
+                    "incident:copied-runtime-rehearsal",
+                    "--coordination-lock",
+                    str(v2_lock),
+                ]
+            )
+            return json.loads(result.stdout)
+
+        baseline_ref = capture_v2_artifact(baseline_file)
+        baseline_bytes = baseline_file.read_bytes()
+        baseline_blob = hashlib.sha1(
+            b"blob " + str(len(baseline_bytes)).encode("ascii") + b"\0" + baseline_bytes
+        ).hexdigest()
+        staged_capture_schema = _load_module(
+            staged_source / "src/council_tools/capture_schema.py",
+            "council_capture_schema_for_rehearsal",
+        )
+        v2_question = "Does copied V2 preserve its evidence lifecycle?"
+        v2_claim = "The copied V2 rehearsal remains internally valid."
+        v2_resolution_date = "2099-12-31"
+        v2_resolved_by = "Inspect the retained copied rehearsal."
+        v2_evidence_cutoff = datetime.now(ZoneInfo("UTC")).isoformat()
+        v2_materiality = "Failure blocks live activation."
+        v2_action_if_true = "Retain the implementation evidence."
+        v2_action_if_false = "Repair before activation."
+        provisional_decision_link = (
+            f"commit={runtime_commit};blob={baseline_blob};"
+            f"sha256={baseline_ref['sha256']};"
+            f"inputManifestSha256={'0' * 64}"
+        )
+        v2_outcome_id = staged_capture_schema.outcome_id_v2(
+            initiation["runId"], v2_claim
+        )
+        v2_outcome_fingerprint = staged_capture_schema.outcome_fingerprint_v2(
+            v2_claim,
+            v2_resolution_date,
+            v2_resolved_by,
+            provisional_decision_link,
+        )
+        forecast_request_args = (
+            initiation["runId"],
+            v2_outcome_id,
+            v2_outcome_fingerprint,
+            v2_evidence_cutoff,
+            v2_claim,
+            v2_resolution_date,
+            v2_resolved_by,
+            v2_materiality,
+            v2_action_if_true,
+            v2_action_if_false,
+        )
+        forecast_request_block = staged_capture_schema.forecast_request_block_v2(
+            *forecast_request_args
+        )
+        canonical_forecast_request = (
+            staged_capture_schema.canonical_forecast_request_json_v2(
+                forecast_request_block
+            )
+        )
+        forecast_request = staged_capture_schema.forecast_request_identity_v2(
+            *forecast_request_args
+        )
+        if forecast_request["forecastRequestSha256"] != hashlib.sha256(
+            canonical_forecast_request
+        ).hexdigest():
+            raise RehearsalError(
+                "copied V2 forecast request identity does not bind canonical bytes"
+            )
+        forecast_request_binding = (
+            staged_capture_schema.forecast_request_binding_v2(
+                *forecast_request_args
+            )
+        )
+        prompt_file = stage_root / "v2-blind-prompt.txt"
+        prompt_file.write_text(
+            "\n".join(
+                (
+                    "seatId=blind",
+                    f"commit={runtime_commit}",
+                    f"blob={baseline_blob}",
+                    f"sha256={baseline_ref['sha256']}",
+                    forecast_request_binding,
+                    f"question={v2_question}",
+                    "",
+                )
+            ),
+            encoding="utf-8",
+        )
+        if staged_capture_schema.parse_forecast_request_binding_v2(
+            prompt_file.read_bytes()
+        ) != forecast_request_block:
+            raise RehearsalError(
+                "copied V2 visible prompt does not contain its exact canonical request"
+            )
+        prompt_ref = capture_v2_artifact(prompt_file)
+        output_file = stage_root / "v2-blind-output.json"
+        output_file.write_text(
+            json.dumps(
+                {
+                    "answer": "The copied lifecycle is internally consistent.",
+                    "capture": {
+                        "kind": "no-findings",
+                        "findings": [],
+                        "seatId": "blind",
+                        "sharedProbability": 50,
+                        **forecast_request,
+                        "inputArtifactSha256": prompt_ref["sha256"],
+                    },
+                },
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+        output_ref = capture_v2_artifact(output_file)
+        input_refs = {"blind": prompt_ref}
+        input_manifest = hashlib.sha256(
+            json.dumps(input_refs, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        v2_decision_link = (
+            f"commit={runtime_commit};blob={baseline_blob};"
+            f"sha256={baseline_ref['sha256']};"
+            f"inputManifestSha256={input_manifest}"
+        )
+        if (
+            staged_capture_schema.outcome_fingerprint_v2(
+                v2_claim,
+                v2_resolution_date,
+                v2_resolved_by,
+                v2_decision_link,
+            )
+            != v2_outcome_fingerprint
+        ):
+            raise RehearsalError(
+                "copied V2 outcome fingerprint changed after prompt-manifest binding"
+            )
+
+        attempt_v2_spec = stage_root / "v2-attempt.json"
+        attempt_v2_spec.write_text(
+            json.dumps(
+                {
+                    "initiationId": initiation["initiationId"],
+                    "decisionFamilyId": "family-copied-runtime-v2",
+                    "question": v2_question,
+                    "decisionBeforeArtifact": {**baseline_ref, "gitBlob": baseline_blob},
+                    "outcomeClass": "intervention-sensitive",
+                    "outcomeClassRationale": "The implementation under review controls this result.",
+                    "evidenceCutoffAt": v2_evidence_cutoff,
+                    "seatPlan": [
+                        {
+                            "seatId": "blind",
+                            "role": "control",
+                            "agentVersion": "copied-runtime-v1",
+                            "agentDefinitionDigest": hashlib.sha256(
+                                b"copied-runtime-blind"
+                            ).hexdigest(),
+                        }
+                    ],
+                    "sharedOutcome": {
+                        "claim": v2_claim,
+                        "resolutionDate": v2_resolution_date,
+                        "resolvedBy": v2_resolved_by,
+                        "decisionLink": v2_decision_link,
+                        "materiality": v2_materiality,
+                        "actionIfTrue": v2_action_if_true,
+                        "actionIfFalse": v2_action_if_false,
+                        "relatedOutcomeIds": [],
+                    },
+                    "seatInputArtifacts": input_refs,
+                }
+            ),
+            encoding="utf-8",
+        )
+        v2_command(
+            [
+                "capture-attempt",
+                "--log",
+                str(v2_log),
+                "--artifact-root",
+                str(v2_artifacts),
+                "--spec",
+                str(attempt_v2_spec),
+                "--decision-before-file",
+                str(baseline_file),
+                "--visible-input",
+                f"blind={prompt_file}",
+                "--coordination-lock",
+                str(v2_lock),
+            ]
+        )
+        seats_finished_spec = stage_root / "v2-seats-finished.json"
+        seats_finished_spec.write_text(
+            json.dumps(
+                {"runId": initiation["runId"], "seatStates": {"blind": "submitted"}}
+            ),
+            encoding="utf-8",
+        )
+        v2_command(
+            [
+                "capture-seats-finished",
+                "--log",
+                str(v2_log),
+                "--spec",
+                str(seats_finished_spec),
+                "--coordination-lock",
+                str(v2_lock),
+            ]
+        )
+        completion_v2_spec = stage_root / "v2-completion.json"
+        completion_v2_spec.write_text(
+            json.dumps(
+                {
+                    "runId": initiation["runId"],
+                    "seatResults": [
+                        {
+                            "seatId": "blind",
+                            "role": "control",
+                            "agentVersion": "copied-runtime-v1",
+                            "agentDefinitionDigest": hashlib.sha256(
+                                b"copied-runtime-blind"
+                            ).hexdigest(),
+                            "state": "submitted",
+                            "launcherAttempts": 1,
+                            "inputArtifact": prompt_ref,
+                            "outputArtifact": output_ref,
+                            "modelId": "copied-runtime-model",
+                            "toolPolicy": "no-tools-v1",
+                            "repositoryCommit": runtime_commit,
+                        }
+                    ],
+                    "findings": [],
+                    "noFindings": [
+                        {
+                            "kind": "no-findings",
+                            "seatId": "blind",
+                            "outputArtifact": output_ref,
+                        }
+                    ],
+                    "probabilities": {"blind": 50},
+                    "blindSeat": {
+                        "role": "independent-control",
+                        "required": True,
+                        "ran": True,
+                        "changedDecision": False,
+                        "brief": f"{prompt_ref['path']}#{initiation['runId']}",
+                    },
+                    "seatInputArtifacts": input_refs,
+                }
+            ),
+            encoding="utf-8",
+        )
+        v2_command(
+            [
+                "capture-complete",
+                "--log",
+                str(v2_log),
+                "--artifact-root",
+                str(v2_artifacts),
+                "--spec",
+                str(completion_v2_spec),
+                "--decision-before-file",
+                str(baseline_file),
+                "--visible-input",
+                f"blind={prompt_file}",
+                "--visible-output",
+                f"blind={output_file}",
+                "--coordination-lock",
+                str(v2_lock),
+            ]
+        )
+        v2_report_result = v2_command(
+            [
+                "capture-report",
+                "--log",
+                str(v2_log),
+                "--events",
+                str(v2_events),
+                "--artifact-root",
+                str(v2_artifacts),
+                "--as-of",
+                "2099-01-01T00:00:00Z",
+                "--json",
+            ]
+        )
+        v2_report = json.loads(v2_report_result.stdout)
+        if (
+            v2_report["cohort"]["eligibleInitiationCount"] != 1
+            or v2_report["cohort"]["completeInitiationCount"] != 1
+            or v2_report["artifacts"]["artifactIntegrityFailureCount"] != 0
+            or v2_report["ledger"]["invalidV2RecordCount"] != 0
+        ):
+            raise RehearsalError(f"V2 copied-runtime report mismatch: {v2_report}")
+
+        # Prove that reporting re-parses the retained visible request rather than
+        # trusting append-time checks.  The probe changes a valid, fingerprint-
+        # neutral outcome field in a copied ledger while leaving the retained
+        # prompt untouched; report-time provenance must invalidate completion.
+        report_binding_probe_log = stage_root / "v2-report-binding-probe.jsonl"
+        report_binding_probe_rows = []
+        for line in v2_log.read_text(encoding="utf-8").splitlines():
+            row = json.loads(line)
+            if row.get("kind") in {"council-attempt-v2", "council-v2"}:
+                row["sharedOutcome"]["materiality"] = (
+                    "A changed target must be rejected at report time."
+                )
+            report_binding_probe_rows.append(
+                json.dumps(row, sort_keys=True, separators=(",", ":"))
+            )
+        report_binding_probe_log.write_text(
+            "\n".join(report_binding_probe_rows) + "\n",
+            encoding="utf-8",
+        )
+        report_binding_probe_result = v2_command(
+            [
+                "capture-report",
+                "--log",
+                str(report_binding_probe_log),
+                "--events",
+                str(v2_events),
+                "--artifact-root",
+                str(v2_artifacts),
+                "--as-of",
+                "2099-01-01T00:00:00Z",
+                "--json",
+            ]
+        )
+        report_binding_probe = json.loads(report_binding_probe_result.stdout)
+        report_binding_errors = [
+            str(item.get("error", ""))
+            for item in report_binding_probe["ledger"]["invalidV2Records"]
+        ]
+        if (
+            report_binding_probe["ledger"]["invalidV2RecordCount"] != 1
+            or report_binding_probe["cohort"]["completeInitiationCount"] != 0
+            or not any(
+                "report-time forecast provenance failure" in error
+                and "forecast request block differs from the sealed shared target"
+                in error
+                for error in report_binding_errors
+            )
+        ):
+            raise RehearsalError(
+                "V2 copied-runtime report did not reject a retained prompt/target "
+                f"mismatch: {report_binding_probe}"
+            )
+
         report_command = [
             sys.executable,
             str(reporter),
@@ -408,6 +936,13 @@ def rehearse(source_root: Path, *, today: str) -> dict:
         staged_blind = _load_module(
             stage_root / BLIND_RELATIVE, "council_blind_after_rehearsal"
         )
+        v2_tally = staged_blind.tally(staged_blind.load_rows(str(v2_log)))
+        if (
+            v2_tally["completedRuns"] != 1
+            or v2_tally["nonCouncilRecords"] != 4
+            or v2_tally["errors"]
+        ):
+            raise RehearsalError(f"V2 blind-seat classification mismatch: {v2_tally}")
         staged_tally = staged_blind.tally(
             staged_blind.load_rows(str(stage_root / LEDGER_RELATIVE))
         )
@@ -445,6 +980,8 @@ def rehearse(source_root: Path, *, today: str) -> dict:
                 str(attempt_spec),
                 "--ts",
                 "2026-08-22T12:00:00Z",
+                "--coordination-lock",
+                str(rehearsal_lock),
             ],
             text=True,
             capture_output=True,
@@ -492,7 +1029,11 @@ def rehearse(source_root: Path, *, today: str) -> dict:
             "PANEL_LOG": str(staged_legacy_log),
             "PANEL_RESOLVED": str(staged_legacy_events),
             "COUNCIL_TOOLS_DENY_OPEN_PATHS": os.pathsep.join(
-                (str(source_root / LEDGER_RELATIVE), str(source_root / EVENTS_RELATIVE))
+                (
+                    str(source_root / LEDGER_RELATIVE),
+                    str(source_root / EVENTS_RELATIVE),
+                    *(str(path) for path in live_guard_paths),
+                )
             ),
         }
         legacy_before = subprocess.run(
@@ -549,15 +1090,63 @@ def rehearse(source_root: Path, *, today: str) -> dict:
         after_hashes = {str(path): _digest(path) for path in source_files}
         if before_hashes != after_hashes:
             raise RehearsalError("source runtime files changed during rehearsal")
+        after_live_state = {
+            str(path): _path_state(
+                path, hash_content=path != LIVE_COORDINATION_LOCK
+            )
+            for path in live_guard_paths
+        }
+        if before_live_state != after_live_state:
+            raise RehearsalError("live council paths changed during rehearsal")
 
         return {
             "status": "PASS",
             "sourceRoot": str(source_root),
             "liveFilesUnchanged": True,
+            "liveCoordinationLockUnopened": True,
             "stagedInstallClean": True,
             "stagedBackupManifest": str(backup.relative_to(stage_root) / "MANIFEST.tsv"),
             "isolatedCoreTests": core_test_count,
             "runtimeContractTests": runtime_test_count,
+            "runtimeContractIsolation": {
+                "stores": "staged-or-temp-only",
+                "liveOpenDeniedBeforeSyscall": True,
+                "liveLinkDeniedBeforeSyscall": True,
+                "executedProofTest": (
+                    "test_rehearsal_audit_guard_denies_live_access_and_path_mutators"
+                ),
+                "representativeMutationProofs": {
+                    "chmod": True,
+                    "rename": True,
+                    "replace": True,
+                    "remove": True,
+                    "unlink": True,
+                    "symlink": True,
+                },
+                "deniedCpythonAuditEvents": [
+                    "open",
+                    "os.chmod",
+                    "os.chown",
+                    "os.utime",
+                    "os.truncate",
+                    "os.link",
+                    "os.symlink",
+                    "os.rename",
+                    "os.remove",
+                    "os.mkdir",
+                    "os.rmdir",
+                ],
+                "eventAliases": {
+                    "os.replace": "os.rename",
+                    "os.unlink": "os.remove",
+                },
+                "metadataComparisonDefenseInDepth": True,
+                "enforcementScope": (
+                    "CPython audit events in the runtime-contract subprocess; "
+                    "not arbitrary native syscalls outside CPython auditing or "
+                    "access through a directory descriptor inherited before the hook"
+                ),
+            },
             "legacyCompatibility": {
                 "realRowsParsed": len(legacy_rows),
                 "realResolutionsParsed": len(legacy_resolutions),
@@ -569,6 +1158,20 @@ def rehearse(source_root: Path, *, today: str) -> dict:
                 "unavailableSeatSealedWithoutProbability": True,
                 "completedRows": failure_payload["completeForecastRows"],
                 "forecastIssuances": failure_payload["forecastIssuances"],
+            },
+            "captureV2": {
+                "copiedRuntimeLifecycleComplete": True,
+                "forecastRequestAndPromptBound": True,
+                "canonicalForecastRequestParsed": True,
+                "reportTimeForecastRequestVerified": True,
+                "structuredEmptyFindingsVerified": True,
+                "completeInitiations": v2_report["cohort"]["completeInitiationCount"],
+                "artifactIntegrityFailures": v2_report["artifacts"][
+                    "artifactIntegrityFailureCount"
+                ],
+                "blindCompletedRuns": v2_tally["completedRuns"],
+                "blindNonCouncilRecords": v2_tally["nonCouncilRecords"],
+                "liveActivated": False,
             },
             "runtimeSourcePin": {
                 "commit": subprocess.run(
