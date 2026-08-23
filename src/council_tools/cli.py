@@ -87,6 +87,7 @@ def _print_human(result: dict) -> None:
     )
     print(
         "due={eligibleDueOutcomes} resolved={resolvedOutcomes} void={voidOutcomes} "
+        "void_rate={voidRateOfEligibleOutcomes} "
         "unresolved={unresolvedDueOutcomes} old_overdue={oldOverdueOutcomes} "
         "debt={gradingDebtState} score={scoreStatus}".format(**result)
     )
@@ -95,7 +96,7 @@ def _print_human(result: dict) -> None:
         print(
             f"seat={item['seat']} n={item['n']} brier={brier} "
             f"constant_50={item['constantFiftyBrier']} "
-            f"climatology={item['climatologyBrier']} "
+            f"in_sample_base_rate={item['inSampleBaseRateBrier']} "
             f"due={item['dueOutcomes']} unresolved={item['unresolvedDueOutcomes']} "
             f"status={item['scoreStatus']}"
         )
@@ -153,10 +154,17 @@ def command_attempt(args: argparse.Namespace) -> int:
     _require_write_authority(args.log)
     with Path(args.spec).open(encoding="utf-8") as handle:
         spec = json.load(handle)
+    if not isinstance(spec, dict):
+        raise LedgerError("attempt spec must be an object")
+    if not isinstance(spec.get("expectedSeats"), list):
+        raise LedgerError("attempt spec expectedSeats must be a list")
     ts = args.ts or _now()
     outcome = spec.get("sharedOutcome")
     if not isinstance(outcome, dict):
         raise LedgerError("attempt spec requires sharedOutcome object")
+    related_outcome_ids = outcome.get("relatedOutcomeIds") or []
+    if not isinstance(related_outcome_ids, list):
+        raise LedgerError("sharedOutcome.relatedOutcomeIds must be a list")
     row = make_attempt(
         question=spec.get("question"),
         expected_seats=spec.get("expectedSeats"),
@@ -169,6 +177,7 @@ def command_attempt(args: argparse.Namespace) -> int:
         action_if_false=outcome.get("actionIfFalse"),
         evidence_cutoff_at=outcome.get("evidenceCutoffAt") or ts,
         ts=ts,
+        related_outcome_ids=related_outcome_ids,
     )
     append_ledger_row(args.log, row)
     print(json.dumps({"runId": row["runId"], "outcomeId": row["sharedOutcome"]["outcomeId"]}))
@@ -179,6 +188,12 @@ def command_complete(args: argparse.Namespace) -> int:
     _require_write_authority(args.log)
     with Path(args.spec).open(encoding="utf-8") as handle:
         spec = json.load(handle)
+    if not isinstance(spec, dict):
+        raise LedgerError("completion spec must be an object")
+    for field in ("councilFields", "seatStates", "probabilities"):
+        value = spec.get(field)
+        if not isinstance(value, dict):
+            raise LedgerError(f"completion spec {field} must be an object")
     rows = [item for _, item in load_jsonl(args.log)]
     run_id = spec.get("runId")
     matches = [
@@ -190,9 +205,9 @@ def command_complete(args: argparse.Namespace) -> int:
         raise LedgerError(f"completion spec must match exactly one attempt: {run_id}")
     row = make_completion(
         attempt=matches[0],
-        council_fields=spec.get("councilFields") or {},
-        seat_states=spec.get("seatStates") or {},
-        probabilities=spec.get("probabilities") or {},
+        council_fields=spec["councilFields"],
+        seat_states=spec["seatStates"],
+        probabilities=spec["probabilities"],
         ts=args.ts or _now(),
     )
     if args.check_only:

@@ -225,7 +225,7 @@ class ForecastLedgerTest(unittest.TestCase):
         self.assertAlmostEqual(scores["code"]["brier"], 0.49)
         self.assertAlmostEqual(scores["theory"]["brier"], 0.25)
         self.assertEqual(scores["code"]["constantFiftyBrier"], 0.25)
-        self.assertEqual(scores["code"]["climatologyBrier"], 0.0)
+        self.assertEqual(scores["code"]["inSampleBaseRateBrier"], 0.0)
 
     def test_selective_resolution_marks_scores_incomplete(self):
         first = attempt()
@@ -323,7 +323,29 @@ class ForecastLedgerTest(unittest.TestCase):
         )
         result = audit(self.log, self.events, today=date(2026, 10, 1))
         self.assertEqual(result["voidOutcomes"], 1)
+        self.assertEqual(result["voidRateOfEligibleOutcomes"], 1.0)
         self.assertEqual(sum(item["n"] for item in result["seatScores"]), 0)
+
+    def test_early_void_rate_uses_void_eligible_denominator(self):
+        a = attempt(resolution_date="2026-12-31")
+        append_ledger_row(self.log, a)
+        append_ledger_row(self.log, completion(a))
+        append_resolution(
+            self.events,
+            outcome_id=a["sharedOutcome"]["outcomeId"],
+            resolution_date=a["sharedOutcome"]["resolutionDate"],
+            came_true=None,
+            evidence="decision cancelled before deadline",
+            resolver="operator",
+            reviewer="independent-reviewer",
+            resolved_at="2026-09-01T12:00:00Z",
+            method="manual-reviewed",
+            void_reason="cancelled-decision",
+        )
+        result = audit(self.log, self.events, today=date(2026, 9, 1))
+        self.assertEqual(result["eligibleDueOutcomes"], 0)
+        self.assertEqual(result["voidOutcomes"], 1)
+        self.assertEqual(result["voidRateOfEligibleOutcomes"], 1.0)
 
     def test_resolution_correction_must_supersede_latest(self):
         a = attempt()
@@ -379,11 +401,11 @@ class ForecastLedgerTest(unittest.TestCase):
         first = attempt()
         second = attempt()
         append_ledger_row(self.log, first)
-        with self.assertRaisesRegex(LedgerError, "open outcome fingerprint"):
+        with self.assertRaisesRegex(LedgerError, "outcome fingerprint"):
             append_ledger_row(self.log, second)
-        second["sharedOutcome"]["relatedOutcomeIds"] = [
-            first["sharedOutcome"]["outcomeId"]
-        ]
+        second = attempt(
+            related_outcome_ids=[first["sharedOutcome"]["outcomeId"]]
+        )
         append_ledger_row(self.log, second)
 
     def test_three_old_overdue_outcomes_block_finalization_but_not_collection(self):
@@ -416,7 +438,7 @@ class ForecastLedgerTest(unittest.TestCase):
             self.events,
             reason="Resolution evidence is unavailable until the scheduled audit",
             operator="principal",
-            created_at="2026-10-01T00:00:00Z",
+            created_at="2026-10-01T23:00:00-04:00",
             expires_date="2026-10-02",
         )
         result = audit(self.log, self.events, today=date(2026, 10, 1))

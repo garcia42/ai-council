@@ -19,7 +19,10 @@ python3 install.py check --root /home/trader
 
 `rehearse.py` copies the four integration targets and live ledger to a temporary root. It installs
 only there, runs the runtime contract tests and reporter, compares the blind-seat decision tally,
-and verifies that source hashes did not change.
+and verifies that source hashes did not change. It also runs the isolated core suite between hashes
+of the live ledger, optional resolution sidecar, and all four integration targets. Every write-path
+test receives an explicit temporary ledger; the staged T&R compatibility test receives explicit
+temporary `PANEL_LOG` and `PANEL_RESOLVED` paths.
 
 After council approval, install with a complete backup:
 

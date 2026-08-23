@@ -39,7 +39,7 @@ def _digest(path: Path) -> str:
 def _source_digest(source_repo: Path) -> str:
     digest = hashlib.sha256()
     source = source_repo / "src/council_tools"
-    files = sorted(source.glob("*.py"))
+    files = sorted(source.rglob("*.py"))
     if not files:
         raise InstallError(f"council-tools source files are missing: {source}")
     for path in files:

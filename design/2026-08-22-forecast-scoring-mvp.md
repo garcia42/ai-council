@@ -38,6 +38,7 @@ forecast discipline and descriptive calibration. It does not rank reviewer intel
    state that normal seat operation includes unequal information access and correlated models.
 10. The attempt row contains no seat prices. A completion record seals the full required set;
     retries and unavailable seats are explicit and cannot silently replace an earlier issuance.
+    Exact-outcome retries link the prior `outcomeId` through the attempt CLI.
 11. Every outcome names its decision link, materiality, and the action implied by true and false.
 12. Reports expose resolution completeness and label scores incomplete when due outcomes remain
     selectively unresolved.

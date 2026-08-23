@@ -132,7 +132,10 @@ def make_attempt(
     ts: str,
     run_id: str | None = None,
     outcome_id: str | None = None,
+    related_outcome_ids: Iterable[str] | None = None,
 ) -> dict[str, Any]:
+    if not isinstance(expected_seats, (list, tuple)):
+        raise LedgerError("expectedSeats must be a list")
     seats = [normalize_seat(seat) for seat in expected_seats]
     outcome = {
         "outcomeId": outcome_id or new_id("outcome"),
@@ -144,6 +147,7 @@ def make_attempt(
         "actionIfTrue": action_if_true,
         "actionIfFalse": action_if_false,
         "evidenceCutoffAt": evidence_cutoff_at,
+        "relatedOutcomeIds": list(related_outcome_ids or []),
     }
     outcome["fingerprint"] = outcome_fingerprint(
         claim, resolution_date, resolved_by, decision_link
@@ -214,6 +218,12 @@ def make_completion(
 ) -> dict[str, Any]:
     """Seal one complete set of seat submissions for an existing attempt."""
     validate_attempt(attempt)
+    if not isinstance(council_fields, dict):
+        raise LedgerError("councilFields must be an object")
+    if not isinstance(seat_states, dict):
+        raise LedgerError("seatStates must be an object")
+    if not isinstance(probabilities, dict):
+        raise LedgerError("probabilities must be an object")
     expected = attempt["expectedSeats"]
     normalized_states = {normalize_seat(seat): state for seat, state in seat_states.items()}
     if set(normalized_states) != set(expected):
@@ -435,7 +445,7 @@ def validate_ledger_row(row: dict[str, Any], prior_rows: Iterable[dict[str, Any]
                 continue
             if other.get("outcomeId") not in outcome.get("relatedOutcomeIds", []):
                 raise LedgerError(
-                    "open outcome fingerprint already exists; link it in relatedOutcomeIds"
+                    "outcome fingerprint already exists; link it in relatedOutcomeIds"
                 )
     elif kind == "council":
         validate_completion(row, prior_rows)
@@ -576,7 +586,7 @@ def append_override(
 ) -> dict[str, Any]:
     created = _parse_timestamp(created_at, "createdAt")
     expires = _parse_date(expires_date, "expiresDate")
-    if expires < created.date():
+    if expires < created.astimezone(ZoneInfo("America/New_York")).date():
         raise LedgerError("override expiresDate precedes createdAt")
     event = {
         "schemaVersion": SCHEMA_VERSION,
@@ -990,7 +1000,10 @@ def audit(
     unresolved_due = due_outcomes - resolved_outcomes - void_outcomes
 
     active_override = any(
-        _parse_timestamp(item["createdAt"], "createdAt").date() <= today
+        _parse_timestamp(item["createdAt"], "createdAt")
+        .astimezone(ZoneInfo("America/New_York"))
+        .date()
+        <= today
         <= _parse_date(item["expiresDate"], "expiresDate")
         for item in overrides
     )
@@ -1040,7 +1053,7 @@ def audit(
                 "n": len(scores),
                 "brier": mean_brier,
                 "constantFiftyBrier": 0.25 if scores else None,
-                "climatologyBrier": (
+                "inSampleBaseRateBrier": (
                     event_rate * (1.0 - event_rate)
                     if event_rate is not None
                     else None
@@ -1111,8 +1124,10 @@ def audit(
         "eligibleDueOutcomes": len(due_outcomes),
         "resolvedOutcomes": len(resolved_outcomes),
         "voidOutcomes": len(void_outcomes),
-        "voidRateOfDueOutcomes": (
-            len(void_outcomes) / len(due_outcomes) if due_outcomes else None
+        "voidRateOfEligibleOutcomes": (
+            len(void_outcomes) / len(due_outcomes | void_outcomes)
+            if due_outcomes or void_outcomes
+            else None
         ),
         "unresolvedDueOutcomes": len(unresolved_due),
         "oldOverdueOutcomes": len(old_overdue),

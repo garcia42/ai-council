@@ -8,6 +8,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -64,7 +65,37 @@ def rehearse(source_root: Path, *, today: str) -> dict:
         *(source_root / relative for relative in target_relatives),
         source_root / LEDGER_RELATIVE,
     ]
+    live_events = source_root / EVENTS_RELATIVE
+    if live_events.is_file():
+        source_files.append(live_events)
     before_hashes = {str(path): _digest(path) for path in source_files}
+
+    core_env = dict(os.environ)
+    core_env["PYTHONPATH"] = f"{REPO / 'src'}:{REPO}"
+    core_tests = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "unittest",
+            "tests.test_forecasts",
+            "tests.test_cli",
+            "tests.test_install",
+            "-v",
+        ],
+        cwd=REPO,
+        text=True,
+        capture_output=True,
+        env=core_env,
+        check=False,
+    )
+    if core_tests.returncode != 0:
+        raise RehearsalError(
+            "isolated core suite failed:\n" + core_tests.stdout + core_tests.stderr
+        )
+    core_count_match = re.search(r"Ran (\d+) tests", core_tests.stdout + core_tests.stderr)
+    if core_count_match is None:
+        raise RehearsalError("could not derive isolated core test count")
+    core_test_count = int(core_count_match.group(1))
 
     with tempfile.TemporaryDirectory(prefix="council-tools-rehearsal-") as temporary:
         stage_root = Path(temporary)
@@ -76,7 +107,6 @@ def rehearse(source_root: Path, *, today: str) -> dict:
         )
         for relative in [*target_relatives, LEDGER_RELATIVE]:
             _copy(source_root, stage_root, relative)
-        live_events = source_root / EVENTS_RELATIVE
         if live_events.is_file():
             _copy(source_root, stage_root, EVENTS_RELATIVE)
 
@@ -122,6 +152,12 @@ def rehearse(source_root: Path, *, today: str) -> dict:
                 + runtime_tests.stdout
                 + runtime_tests.stderr
             )
+        runtime_count_match = re.search(
+            r"Ran (\d+) tests", runtime_tests.stdout + runtime_tests.stderr
+        )
+        if runtime_count_match is None:
+            raise RehearsalError("could not derive staged runtime test count")
+        runtime_test_count = int(runtime_count_match.group(1))
 
         reporter = stage_root / ".claude/knowledge/council-eval/predictions_report.py"
         failure_log = stage_root / ".claude/knowledge/council-eval/failure-path.jsonl"
@@ -391,7 +427,8 @@ def rehearse(source_root: Path, *, today: str) -> dict:
             "liveFilesUnchanged": True,
             "stagedInstallClean": True,
             "stagedBackupManifest": str(backup.relative_to(stage_root) / "MANIFEST.tsv"),
-            "runtimeContractTests": 3,
+            "isolatedCoreTests": core_test_count,
+            "runtimeContractTests": runtime_test_count,
             "failurePath": {
                 "malformedProbabilityRejectedWithoutAppend": True,
                 "unavailableSeatSealedWithoutProbability": True,

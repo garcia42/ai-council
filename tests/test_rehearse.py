@@ -62,6 +62,7 @@ class RehearsalTest(unittest.TestCase):
         self.assertEqual(result["status"], "PASS")
         self.assertTrue(result["liveFilesUnchanged"])
         self.assertTrue(result["stagedInstallClean"])
+        self.assertGreater(result["isolatedCoreTests"], 0)
         self.assertEqual(result["runtimeContractTests"], 3)
         self.assertTrue(result["failurePath"]["malformedProbabilityRejectedWithoutAppend"])
         self.assertTrue(result["failurePath"]["unavailableSeatSealedWithoutProbability"])

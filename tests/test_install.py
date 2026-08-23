@@ -1,4 +1,5 @@
 import os
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -102,6 +103,24 @@ class InstallerTest(unittest.TestCase):
     def test_install_refuses_backup_inside_source_repository(self):
         with self.assertRaisesRegex(install.InstallError, "outside"):
             install.install(self.root, install.REPO / "runtime/unsafe-backup")
+
+    def test_clean_source_gate_rejects_dirty_commit_before_backup(self):
+        source = self.root / "source-copy"
+        shutil.copytree(
+            install.REPO,
+            source,
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+        )
+        readme = source / "README.md"
+        readme.write_text(readme.read_text(encoding="utf-8") + "\ndirty\n", encoding="utf-8")
+        with self.assertRaisesRegex(install.InstallError, "requires a clean"):
+            install.install(
+                self.root,
+                self.backups,
+                source_repo=source,
+                require_clean_source=True,
+            )
+        self.assertFalse(self.backups.exists())
 
 
 if __name__ == "__main__":

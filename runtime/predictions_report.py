@@ -16,7 +16,7 @@ EXPECTED_SOURCE_SHA256 = "@@COUNCIL_TOOLS_SOURCE_SHA256@@"
 def _source_digest(source_root: Path) -> str:
     digest = hashlib.sha256()
     source = source_root / "src/council_tools"
-    files = sorted(source.glob("*.py"))
+    files = sorted(source.rglob("*.py"))
     if not files:
         raise RuntimeError(f"council-tools source files are missing: {source}")
     for path in files:

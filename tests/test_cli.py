@@ -208,6 +208,68 @@ class ForecastCliTest(unittest.TestCase):
         self.assertEqual(payload["completeForecastRows"], 1)
         self.assertEqual(payload["forecastIssuances"], 4)
 
+    def test_attempt_retry_accepts_explicit_related_outcome_id(self):
+        spec = self.root / "attempt.json"
+        payload = {
+            "question": "Retry this council?",
+            "expectedSeats": ["code"],
+            "sharedOutcome": {
+                "claim": "A material retry outcome occurs",
+                "resolutionDate": "2026-09-30",
+                "resolvedBy": "Inspect the retry evidence",
+                "decisionLink": "Retry decision",
+                "materiality": "The retry changes the decision",
+                "actionIfTrue": "Proceed",
+                "actionIfFalse": "Hold",
+                "evidenceCutoffAt": "2026-08-22T12:00:00Z",
+            },
+        }
+        spec.write_text(json.dumps(payload), encoding="utf-8")
+        first = self.run_cli(
+            "attempt", "--log", str(self.log), "--spec", str(spec),
+            "--ts", "2026-08-22T12:00:00Z",
+        )
+        self.assertEqual(first.returncode, 0, first.stderr)
+        payload["sharedOutcome"]["relatedOutcomeIds"] = [
+            json.loads(first.stdout)["outcomeId"]
+        ]
+        spec.write_text(json.dumps(payload), encoding="utf-8")
+        second = self.run_cli(
+            "attempt", "--log", str(self.log), "--spec", str(spec),
+            "--ts", "2026-08-22T12:01:00Z",
+        )
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(len(self.log.read_text(encoding="utf-8").splitlines()), 2)
+
+    def test_malformed_spec_shapes_fail_without_traceback(self):
+        attempt_spec = self.root / "bad-attempt.json"
+        attempt_spec.write_text(json.dumps({"question": "missing seats"}), encoding="utf-8")
+        attempt_result = self.run_cli(
+            "attempt", "--log", str(self.log), "--spec", str(attempt_spec)
+        )
+        self.assertEqual(attempt_result.returncode, 1)
+        self.assertIn("expectedSeats must be a list", attempt_result.stderr)
+        self.assertNotIn("Traceback", attempt_result.stderr)
+
+        completion_spec = self.root / "bad-completion.json"
+        completion_spec.write_text(
+            json.dumps(
+                {
+                    "runId": new_id("run"),
+                    "councilFields": {},
+                    "seatStates": [],
+                    "probabilities": {},
+                }
+            ),
+            encoding="utf-8",
+        )
+        completion_result = self.run_cli(
+            "complete", "--log", str(self.log), "--spec", str(completion_spec)
+        )
+        self.assertEqual(completion_result.returncode, 1)
+        self.assertIn("seatStates must be an object", completion_result.stderr)
+        self.assertNotIn("Traceback", completion_result.stderr)
+
     def test_debt_block_exits_three_but_record_check_still_runs(self):
         for index in range(3):
             row = make_attempt(

@@ -70,7 +70,9 @@ After all seat calls have returned, write one completion spec containing:
 - one integer probability for every and only every submitted seat.
 
 No partial seat probability is appended before sealing. A retry is a new council attempt and never
-silently replaces an earlier issuance.
+silently replaces an earlier issuance. If it reuses the exact shared-outcome fingerprint, put the
+prior `outcomeId` in `sharedOutcome.relatedOutcomeIds` in the new attempt spec; the CLI retains and
+validates that relationship.
 
 Validate the completion spec without writing, then append it:
 
@@ -101,8 +103,9 @@ Manual resolutions require a different `--reviewer`. Voids require an enumerated
 visible in the report. Every void uses `manual-reviewed` with an independent reviewer. Non-void
 resolutions cannot be recorded until the full `resolutionDate` has ended in America/New_York.
 Corrections use `--supersedes`; the original resolution is never rewritten. Reports include a
-constant-50-percent Brier reference, the observed-event-rate climatology Brier, and void rate; all
-remain descriptive and outcomes may be seat-controlled and non-independent.
+constant-50-percent Brier reference, an `inSampleBaseRateBrier` hindsight bound, and void rate over
+due-or-void outcomes. The in-sample base-rate value is not an achievable ex-ante climatology. All
+scores remain descriptive and outcomes may be seat-controlled and non-independent.
 
 ### Corrupt trailing write recovery
 
