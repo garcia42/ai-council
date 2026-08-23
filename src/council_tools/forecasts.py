@@ -1,0 +1,1127 @@
+"""Strict, append-only council forecast validation and descriptive scoring."""
+
+from __future__ import annotations
+
+import fcntl
+import hashlib
+import json
+import os
+import re
+import time
+import uuid
+from collections import defaultdict
+from contextlib import contextmanager
+from datetime import date, datetime, timezone
+from pathlib import Path
+from typing import Any, Iterable
+from zoneinfo import ZoneInfo
+
+
+SCHEMA_VERSION = 1
+CANONICAL_SEATS = ("code", "theory", "ops", "blind")
+SEAT_ALIASES = {
+    "code": "code",
+    "pysystemtrade-expert": "code",
+    "theory": "theory",
+    "qoppac-blog-expert": "theory",
+    "ops": "ops",
+    "et-futures-journal-expert": "ops",
+    "blind": "blind",
+}
+SEAT_STATES = {"submitted", "abstained", "unavailable"}
+VOID_REASONS = {
+    "cancelled-decision",
+    "claim-defective",
+    "data-lost",
+    "outcome-ambiguous",
+    "resolution-impossible",
+}
+RESOLUTION_METHODS = {"deterministic", "manual-reviewed"}
+ID_PREFIXES = {"run", "outcome", "prediction", "resolution", "override"}
+ID_RE = re.compile(
+    r"^(run|outcome|prediction|resolution|override)-[0-9a-f]{32}$"
+)
+LOCK_TIMEOUT_SECONDS = 10.0
+
+
+class LedgerError(ValueError):
+    """The forecast ledger or a proposed record violates the contract."""
+
+
+def new_id(prefix: str) -> str:
+    if prefix not in ID_PREFIXES:
+        raise LedgerError(f"unknown id prefix: {prefix}")
+    return f"{prefix}-{uuid.uuid4().hex}"
+
+
+def _require_text(value: Any, field: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise LedgerError(f"{field} must be non-empty text")
+    return value.strip()
+
+
+def _require_id(value: Any, prefix: str, field: str | None = None) -> str:
+    label = field or prefix
+    value = _require_text(value, label)
+    if not ID_RE.fullmatch(value) or not value.startswith(f"{prefix}-"):
+        raise LedgerError(f"{label} must be a {prefix} UUID id")
+    return value
+
+
+def _parse_timestamp(value: Any, field: str) -> datetime:
+    value = _require_text(value, field)
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise LedgerError(f"{field} must be an ISO-8601 timestamp") from exc
+    if parsed.tzinfo is None:
+        raise LedgerError(f"{field} must include a timezone")
+    return parsed.astimezone(timezone.utc)
+
+
+def _parse_date(value: Any, field: str) -> date:
+    value = _require_text(value, field)
+    try:
+        return date.fromisoformat(value)
+    except ValueError as exc:
+        raise LedgerError(f"{field} must be YYYY-MM-DD") from exc
+
+
+def normalize_seat(value: Any) -> str:
+    raw = _require_text(value, "seat")
+    try:
+        return SEAT_ALIASES[raw]
+    except KeyError as exc:
+        raise LedgerError(f"unknown seat: {raw}") from exc
+
+
+def outcome_fingerprint(
+    claim: str, resolution_date: str, resolved_by: str, decision_link: str
+) -> str:
+    pieces = (
+        _require_text(claim, "claim"),
+        _require_text(resolution_date, "resolutionDate"),
+        _require_text(resolved_by, "resolvedBy"),
+        _require_text(decision_link, "decisionLink"),
+    )
+    canonical = "\x1f".join(" ".join(item.split()).casefold() for item in pieces)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _legacy_id(prefix: str, *pieces: Any) -> str:
+    # Compatibility identity for pre-contract rows only. These IDs deliberately depend on
+    # the normalized legacy content: changing a claim, timestamp, resolution rule, or list
+    # position changes the ID and therefore its resolution linkage. New writes must use UUIDs.
+    canonical = json.dumps(pieces, sort_keys=True, separators=(",", ":"), default=str)
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:32]
+    return f"{prefix}-{digest}"
+
+
+def make_attempt(
+    *,
+    question: str,
+    expected_seats: Iterable[str],
+    claim: str,
+    resolution_date: str,
+    resolved_by: str,
+    decision_link: str,
+    materiality: str,
+    action_if_true: str,
+    action_if_false: str,
+    evidence_cutoff_at: str,
+    ts: str,
+    run_id: str | None = None,
+    outcome_id: str | None = None,
+) -> dict[str, Any]:
+    seats = [normalize_seat(seat) for seat in expected_seats]
+    outcome = {
+        "outcomeId": outcome_id or new_id("outcome"),
+        "claim": claim,
+        "resolutionDate": resolution_date,
+        "resolvedBy": resolved_by,
+        "decisionLink": decision_link,
+        "materiality": materiality,
+        "actionIfTrue": action_if_true,
+        "actionIfFalse": action_if_false,
+        "evidenceCutoffAt": evidence_cutoff_at,
+    }
+    outcome["fingerprint"] = outcome_fingerprint(
+        claim, resolution_date, resolved_by, decision_link
+    )
+    row = {
+        "schemaVersion": SCHEMA_VERSION,
+        "kind": "council-attempt",
+        "runId": run_id or new_id("run"),
+        "ts": ts,
+        "question": question,
+        "expectedSeats": seats,
+        "sharedOutcome": outcome,
+    }
+    validate_attempt(row)
+    return row
+
+
+def validate_attempt(row: dict[str, Any]) -> None:
+    if row.get("schemaVersion") != SCHEMA_VERSION:
+        raise LedgerError("council-attempt schemaVersion must be 1")
+    if row.get("kind") != "council-attempt":
+        raise LedgerError("attempt kind must be council-attempt")
+    _require_id(row.get("runId"), "run", "runId")
+    issued = _parse_timestamp(row.get("ts"), "ts")
+    _require_text(row.get("question"), "question")
+    seats = row.get("expectedSeats")
+    if not isinstance(seats, list) or not seats:
+        raise LedgerError("expectedSeats must be a non-empty list")
+    normalized = [normalize_seat(seat) for seat in seats]
+    if normalized != seats:
+        raise LedgerError("expectedSeats must use canonical seat names")
+    if len(set(seats)) != len(seats):
+        raise LedgerError("expectedSeats contains duplicates")
+
+    outcome = row.get("sharedOutcome")
+    if not isinstance(outcome, dict):
+        raise LedgerError("sharedOutcome must be an object")
+    _require_id(outcome.get("outcomeId"), "outcome", "outcomeId")
+    claim = _require_text(outcome.get("claim"), "claim")
+    deadline = _parse_date(outcome.get("resolutionDate"), "resolutionDate")
+    resolved_by = _require_text(outcome.get("resolvedBy"), "resolvedBy")
+    decision_link = _require_text(outcome.get("decisionLink"), "decisionLink")
+    _require_text(outcome.get("materiality"), "materiality")
+    _require_text(outcome.get("actionIfTrue"), "actionIfTrue")
+    _require_text(outcome.get("actionIfFalse"), "actionIfFalse")
+    cutoff = _parse_timestamp(outcome.get("evidenceCutoffAt"), "evidenceCutoffAt")
+    if cutoff > issued:
+        raise LedgerError("evidenceCutoffAt cannot be after the attempt timestamp")
+    if issued.date() >= deadline:
+        raise LedgerError("attempt timestamp must precede resolutionDate")
+    expected = outcome_fingerprint(claim, str(deadline), resolved_by, decision_link)
+    if outcome.get("fingerprint") != expected:
+        raise LedgerError("sharedOutcome fingerprint does not match its content")
+    related = outcome.get("relatedOutcomeIds", [])
+    if not isinstance(related, list):
+        raise LedgerError("relatedOutcomeIds must be a list")
+    for item in related:
+        _require_id(item, "outcome", "relatedOutcomeIds item")
+
+
+def make_completion(
+    *,
+    attempt: dict[str, Any],
+    council_fields: dict[str, Any],
+    seat_states: dict[str, str],
+    probabilities: dict[str, int],
+    ts: str,
+) -> dict[str, Any]:
+    """Seal one complete set of seat submissions for an existing attempt."""
+    validate_attempt(attempt)
+    expected = attempt["expectedSeats"]
+    normalized_states = {normalize_seat(seat): state for seat, state in seat_states.items()}
+    if set(normalized_states) != set(expected):
+        raise LedgerError("seatStates must exactly match attempt expectedSeats")
+    normalized_probabilities = {
+        normalize_seat(seat): probability for seat, probability in probabilities.items()
+    }
+    submitted = {
+        seat for seat, state in normalized_states.items() if state == "submitted"
+    }
+    if set(normalized_probabilities) != submitted:
+        raise LedgerError("probabilities must exactly match submitted seats")
+    outcome = attempt["sharedOutcome"]
+    predictions = [
+        {
+            "predictionId": new_id("prediction"),
+            "outcomeId": outcome["outcomeId"],
+            "seat": seat,
+            "type": "shared",
+            "claim": outcome["claim"],
+            "probability": normalized_probabilities[seat],
+            "issuedAt": ts,
+            "resolutionDate": outcome["resolutionDate"],
+            "resolvedBy": outcome["resolvedBy"],
+        }
+        for seat in expected
+        if seat in submitted
+    ]
+    protected = {
+        "schemaVersion",
+        "kind",
+        "runId",
+        "ts",
+        "question",
+        "forecastState",
+        "predictions",
+    }
+    overlap = protected.intersection(council_fields)
+    if overlap:
+        raise LedgerError(f"councilFields contains protected keys: {sorted(overlap)}")
+    row = {
+        "schemaVersion": SCHEMA_VERSION,
+        "kind": "council",
+        "runId": attempt["runId"],
+        "ts": ts,
+        "question": attempt["question"],
+        **council_fields,
+        "forecastState": {"sealed": True, "seats": normalized_states},
+        "predictions": predictions,
+    }
+    return row
+
+
+def _attempts(rows: Iterable[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    result = {}
+    for row in rows:
+        if row.get("kind") != "council-attempt":
+            continue
+        run_id = row.get("runId")
+        if run_id in result:
+            raise LedgerError(f"duplicate council-attempt runId: {run_id}")
+        validate_attempt(row)
+        result[run_id] = row
+    return result
+
+
+def validate_completion(row: dict[str, Any], prior_rows: Iterable[dict[str, Any]]) -> None:
+    if row.get("schemaVersion") != SCHEMA_VERSION:
+        raise LedgerError("new council completion schemaVersion must be 1")
+    if row.get("kind") != "council":
+        raise LedgerError("completion kind must be council")
+    run_id = _require_id(row.get("runId"), "run", "runId")
+    prior_rows = list(prior_rows)
+    attempts = _attempts(prior_rows)
+    if run_id not in attempts:
+        raise LedgerError(f"council completion has no matching attempt: {run_id}")
+    if any(r.get("kind") == "council" and r.get("runId") == run_id for r in prior_rows):
+        raise LedgerError(f"duplicate council completion for runId: {run_id}")
+    attempt = attempts[run_id]
+    completed_at = _parse_timestamp(row.get("ts"), "ts")
+    attempted_at = _parse_timestamp(attempt.get("ts"), "attempt ts")
+    if completed_at < attempted_at:
+        raise LedgerError("completion timestamp precedes attempt")
+    if row.get("question") != attempt.get("question"):
+        raise LedgerError("completion question differs from attempt question")
+
+    state = row.get("forecastState")
+    if not isinstance(state, dict) or state.get("sealed") is not True:
+        raise LedgerError("forecastState.sealed must be true")
+    seat_states = state.get("seats")
+    if not isinstance(seat_states, dict):
+        raise LedgerError("forecastState.seats must be an object")
+    expected_seats = attempt["expectedSeats"]
+    if set(seat_states) != set(expected_seats):
+        raise LedgerError("forecastState seats must exactly match expectedSeats")
+    for seat, value in seat_states.items():
+        normalize_seat(seat)
+        if value not in SEAT_STATES:
+            raise LedgerError(f"invalid forecast seat state for {seat}: {value}")
+
+    predictions = row.get("predictions")
+    if not isinstance(predictions, list):
+        raise LedgerError("predictions must be a list")
+    ids: set[str] = set()
+    seats_seen: set[str] = set()
+    outcome = attempt["sharedOutcome"]
+    for prediction in predictions:
+        if not isinstance(prediction, dict):
+            raise LedgerError("prediction must be an object")
+        prediction_id = _require_id(
+            prediction.get("predictionId"), "prediction", "predictionId"
+        )
+        if prediction_id in ids:
+            raise LedgerError(f"duplicate predictionId: {prediction_id}")
+        ids.add(prediction_id)
+        seat = normalize_seat(prediction.get("seat"))
+        if seat in seats_seen:
+            raise LedgerError(f"multiple shared predictions for seat: {seat}")
+        seats_seen.add(seat)
+        if seat_states.get(seat) != "submitted":
+            raise LedgerError(f"prediction exists for non-submitted seat: {seat}")
+        if prediction.get("type") != "shared":
+            raise LedgerError("MVP council predictions must have type=shared")
+        if prediction.get("outcomeId") != outcome["outcomeId"]:
+            raise LedgerError("prediction outcomeId differs from attempt")
+        if prediction.get("claim") != outcome["claim"]:
+            raise LedgerError("shared prediction claim differs from attempt")
+        if prediction.get("resolutionDate") != outcome["resolutionDate"]:
+            raise LedgerError("shared prediction resolutionDate differs from attempt")
+        if prediction.get("resolvedBy") != outcome["resolvedBy"]:
+            raise LedgerError("shared prediction resolvedBy differs from attempt")
+        probability = prediction.get("probability")
+        if isinstance(probability, bool) or not isinstance(probability, int):
+            raise LedgerError("probability must be an integer")
+        if not 0 <= probability <= 100:
+            raise LedgerError("probability must be between 0 and 100")
+        issued_at = _parse_timestamp(prediction.get("issuedAt"), "issuedAt")
+        cutoff = _parse_timestamp(outcome.get("evidenceCutoffAt"), "evidenceCutoffAt")
+        deadline = _parse_date(outcome.get("resolutionDate"), "resolutionDate")
+        if issued_at < cutoff:
+            raise LedgerError("prediction issuedAt precedes evidence cutoff")
+        if issued_at > completed_at:
+            raise LedgerError("prediction issuedAt follows completion timestamp")
+        if issued_at.date() >= deadline:
+            raise LedgerError("prediction issuedAt must precede resolutionDate")
+
+    submitted = {seat for seat, value in seat_states.items() if value == "submitted"}
+    if submitted != seats_seen:
+        missing = sorted(submitted - seats_seen)
+        extra = sorted(seats_seen - submitted)
+        raise LedgerError(
+            f"submitted seat/prediction mismatch; missing={missing} extra={extra}"
+        )
+
+
+def load_jsonl(path: str | Path) -> list[tuple[int, dict[str, Any]]]:
+    path = Path(path)
+    if not path.exists():
+        return []
+    rows = []
+    with path.open(encoding="utf-8") as handle:
+        for line_number, raw in enumerate(handle, 1):
+            if not raw.strip():
+                continue
+            try:
+                value = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise LedgerError(f"{path.name} line {line_number}: invalid JSON: {exc}") from exc
+            if not isinstance(value, dict):
+                raise LedgerError(f"{path.name} line {line_number}: record must be an object")
+            rows.append((line_number, value))
+    return rows
+
+
+@contextmanager
+def _ledger_lock(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_name(f"{path.name}.lock")
+    with lock_path.open("a+", encoding="utf-8") as lock:
+        deadline = time.monotonic() + LOCK_TIMEOUT_SECONDS
+        while True:
+            try:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError as exc:
+                if time.monotonic() >= deadline:
+                    raise LedgerError(
+                        f"timed out after {LOCK_TIMEOUT_SECONDS:g}s waiting for "
+                        f"ledger lock: {lock_path}"
+                    ) from exc
+                time.sleep(0.05)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def validate_ledger_row(row: dict[str, Any], prior_rows: Iterable[dict[str, Any]]) -> None:
+    prior_rows = list(prior_rows)
+    kind = row.get("kind")
+    if kind == "council-attempt":
+        validate_attempt(row)
+        run_id = row["runId"]
+        if any(item.get("runId") == run_id for item in prior_rows):
+            raise LedgerError(f"duplicate runId: {run_id}")
+        outcome = row["sharedOutcome"]
+        outcome_id = outcome["outcomeId"]
+        if any(
+            item.get("kind") == "council-attempt"
+            and item.get("sharedOutcome", {}).get("outcomeId") == outcome_id
+            for item in prior_rows
+        ):
+            raise LedgerError(f"duplicate outcomeId: {outcome_id}")
+        for item in prior_rows:
+            if item.get("kind") != "council-attempt":
+                continue
+            other = item.get("sharedOutcome", {})
+            if other.get("fingerprint") != outcome.get("fingerprint"):
+                continue
+            if other.get("outcomeId") not in outcome.get("relatedOutcomeIds", []):
+                raise LedgerError(
+                    "open outcome fingerprint already exists; link it in relatedOutcomeIds"
+                )
+    elif kind == "council":
+        validate_completion(row, prior_rows)
+        existing_prediction_ids = {
+            prediction.get("predictionId")
+            for item in prior_rows
+            for prediction in (item.get("predictions") or [])
+            if isinstance(prediction, dict)
+        }
+        for prediction in row["predictions"]:
+            if prediction["predictionId"] in existing_prediction_ids:
+                raise LedgerError(
+                    f"duplicate predictionId: {prediction['predictionId']}"
+                )
+    else:
+        raise LedgerError(f"record command does not accept kind: {kind}")
+
+
+def append_ledger_row(path: str | Path, row: dict[str, Any]) -> None:
+    path = Path(path)
+    with _ledger_lock(path):
+        prior = [row_value for _, row_value in load_jsonl(path)]
+        validate_ledger_row(row, prior)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+
+
+def _validate_resolution_event(
+    event: dict[str, Any], prior_events: Iterable[dict[str, Any]]
+) -> None:
+    if event.get("schemaVersion") != SCHEMA_VERSION:
+        raise LedgerError("resolution schemaVersion must be 1")
+    if event.get("kind") != "outcome-resolution":
+        raise LedgerError("resolution kind must be outcome-resolution")
+    _require_id(event.get("resolutionId"), "resolution", "resolutionId")
+    outcome_id = _require_id(event.get("outcomeId"), "outcome", "outcomeId")
+    resolved_at = _parse_timestamp(event.get("resolvedAt"), "resolvedAt")
+    resolution_date = _parse_date(event.get("resolutionDate"), "resolutionDate")
+    _require_text(event.get("evidence"), "evidence")
+    resolver = _require_text(event.get("resolver"), "resolver")
+    method = event.get("method")
+    if method not in RESOLUTION_METHODS:
+        raise LedgerError(f"method must be one of {sorted(RESOLUTION_METHODS)}")
+    reviewer = event.get("reviewer")
+    if method == "manual-reviewed":
+        reviewer = _require_text(reviewer, "reviewer")
+        if reviewer == resolver:
+            raise LedgerError("manual resolution reviewer must differ from resolver")
+    elif reviewer not in (None, ""):
+        raise LedgerError("deterministic resolution must not name a reviewer")
+
+    status = event.get("status")
+    if status == "resolved":
+        if not isinstance(event.get("cameTrue"), bool):
+            raise LedgerError("resolved outcome requires Boolean cameTrue")
+        if event.get("voidReason") not in (None, ""):
+            raise LedgerError("resolved outcome cannot have voidReason")
+        if resolved_at.astimezone(ZoneInfo("America/New_York")).date() <= resolution_date:
+            raise LedgerError(
+                "non-void resolution must be recorded after resolutionDate in America/New_York"
+            )
+    elif status == "void":
+        if event.get("cameTrue") is not None:
+            raise LedgerError("void outcome requires cameTrue=null")
+        if event.get("voidReason") not in VOID_REASONS:
+            raise LedgerError(f"voidReason must be one of {sorted(VOID_REASONS)}")
+        if method != "manual-reviewed":
+            raise LedgerError("void outcome requires manual-reviewed method")
+    else:
+        raise LedgerError("resolution status must be resolved or void")
+
+    prior_events = [item for item in prior_events if item.get("kind") == "outcome-resolution"]
+    if any(item.get("resolutionId") == event["resolutionId"] for item in prior_events):
+        raise LedgerError(f"duplicate resolutionId: {event['resolutionId']}")
+    previous = [item for item in prior_events if item.get("outcomeId") == outcome_id]
+    supersedes = event.get("supersedesResolutionId")
+    if previous:
+        latest = previous[-1]
+        if supersedes != latest.get("resolutionId"):
+            raise LedgerError("resolution correction must supersede the latest resolution")
+    elif supersedes not in (None, ""):
+        raise LedgerError("first resolution cannot supersede another resolution")
+
+
+def append_resolution(
+    path: str | Path,
+    *,
+    outcome_id: str,
+    resolution_date: str,
+    came_true: bool | None,
+    evidence: str,
+    resolver: str,
+    resolved_at: str,
+    method: str,
+    reviewer: str | None = None,
+    void_reason: str | None = None,
+    supersedes_resolution_id: str | None = None,
+    resolution_id: str | None = None,
+) -> dict[str, Any]:
+    status = "void" if void_reason is not None else "resolved"
+    event = {
+        "schemaVersion": SCHEMA_VERSION,
+        "kind": "outcome-resolution",
+        "resolutionId": resolution_id or new_id("resolution"),
+        "outcomeId": outcome_id,
+        "resolutionDate": resolution_date,
+        "status": status,
+        "cameTrue": came_true,
+        "voidReason": void_reason,
+        "evidence": evidence,
+        "resolver": resolver,
+        "reviewer": reviewer,
+        "method": method,
+        "resolvedAt": resolved_at,
+        "supersedesResolutionId": supersedes_resolution_id,
+    }
+    path = Path(path)
+    with _ledger_lock(path):
+        prior = [item for _, item in load_jsonl(path)]
+        _validate_resolution_event(event, prior)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+    return event
+
+
+def append_override(
+    path: str | Path,
+    *,
+    reason: str,
+    operator: str,
+    created_at: str,
+    expires_date: str,
+    override_id: str | None = None,
+) -> dict[str, Any]:
+    created = _parse_timestamp(created_at, "createdAt")
+    expires = _parse_date(expires_date, "expiresDate")
+    if expires < created.date():
+        raise LedgerError("override expiresDate precedes createdAt")
+    event = {
+        "schemaVersion": SCHEMA_VERSION,
+        "kind": "grading-debt-override",
+        "overrideId": override_id or new_id("override"),
+        "reason": _require_text(reason, "reason"),
+        "operator": _require_text(operator, "operator"),
+        "createdAt": created_at,
+        "expiresDate": expires_date,
+    }
+    _require_id(event["overrideId"], "override", "overrideId")
+    path = Path(path)
+    with _ledger_lock(path):
+        prior = [item for _, item in load_jsonl(path)]
+        if any(item.get("overrideId") == event["overrideId"] for item in prior):
+            raise LedgerError(f"duplicate overrideId: {event['overrideId']}")
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+    return event
+
+
+def repair_trailing_jsonl(
+    path: str | Path,
+    *,
+    expected_line: int,
+    backup_dir: str | Path,
+) -> dict[str, Any]:
+    """Quarantine and remove exactly one confirmed invalid final nonblank line.
+
+    The function refuses missing files, valid files, earlier corruption, line-number drift,
+    and multiple corrupt lines. It uses the ledger's append lock so an operator cannot repair
+    a snapshot while another process is appending to it.
+    """
+
+    path = Path(path)
+    backup_dir = Path(backup_dir)
+    if isinstance(expected_line, bool) or not isinstance(expected_line, int):
+        raise LedgerError("expected_line must be a positive integer")
+    if expected_line < 1:
+        raise LedgerError("expected_line must be a positive integer")
+    if not path.exists():
+        raise LedgerError(f"ledger does not exist: {path}")
+
+    with _ledger_lock(path):
+        original = path.read_bytes()
+        try:
+            text = original.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise LedgerError("ledger is not valid UTF-8; automatic repair refused") from exc
+
+        lines = text.splitlines(keepends=True)
+        invalid: list[tuple[int, str]] = []
+        nonblank_lines = [
+            line_number
+            for line_number, raw in enumerate(lines, 1)
+            if raw.strip()
+        ]
+        for line_number, raw in enumerate(lines, 1):
+            if not raw.strip():
+                continue
+            try:
+                value = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                invalid.append((line_number, f"invalid JSON: {exc}"))
+                continue
+            if not isinstance(value, dict):
+                invalid.append((line_number, "record must be an object"))
+
+        if not invalid:
+            raise LedgerError("ledger has no invalid line to repair")
+        if len(invalid) != 1:
+            raise LedgerError("ledger has multiple invalid lines; automatic repair refused")
+        invalid_line, reason = invalid[0]
+        if not nonblank_lines or invalid_line != nonblank_lines[-1]:
+            raise LedgerError(
+                f"invalid line {invalid_line} is not the final nonblank line; repair refused"
+            )
+        if invalid_line != expected_line:
+            raise LedgerError(
+                f"confirmed line {expected_line} does not match invalid final line "
+                f"{invalid_line}"
+            )
+
+        digest = hashlib.sha256(original).hexdigest()
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        backup = backup_dir / (
+            f"{path.name}.quarantine.{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}."
+            f"{digest[:12]}"
+        )
+        with backup.open("xb") as handle:
+            handle.write(original)
+            handle.flush()
+            os.fsync(handle.fileno())
+
+        repaired = "".join(
+            raw for line_number, raw in enumerate(lines, 1) if line_number != invalid_line
+        ).encode("utf-8")
+        temporary = path.with_name(f".{path.name}.repair-{uuid.uuid4().hex}.tmp")
+        try:
+            with temporary.open("xb") as handle:
+                handle.write(repaired)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(temporary, path.stat().st_mode)
+            os.replace(temporary, path)
+            directory = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        finally:
+            if temporary.exists():
+                temporary.unlink()
+    return {
+        "path": str(path),
+        "removedLine": invalid_line,
+        "reason": reason,
+        "backup": str(backup),
+        "originalSha256": digest,
+    }
+
+
+def brier_score(probability: int, came_true: bool) -> float:
+    if isinstance(probability, bool) or not isinstance(probability, int):
+        raise LedgerError("probability must be an integer")
+    if not 0 <= probability <= 100:
+        raise LedgerError("probability must be between 0 and 100")
+    if not isinstance(came_true, bool):
+        raise LedgerError("came_true must be Boolean")
+    p = probability / 100.0
+    outcome = 1.0 if came_true else 0.0
+    return (p - outcome) ** 2
+
+
+def _legacy_prediction(
+    row: dict[str, Any], prediction: dict[str, Any], index: int
+) -> dict[str, Any]:
+    seat = normalize_seat(prediction.get("seat"))
+    claim = _require_text(prediction.get("claim"), "claim")
+    resolution_date = str(_parse_date(prediction.get("resolutionDate"), "resolutionDate"))
+    resolved_by = _require_text(prediction.get("resolvedBy"), "resolvedBy")
+    probability = prediction.get("probability")
+    if isinstance(probability, bool) or not isinstance(probability, int):
+        raise LedgerError("probability must be an integer")
+    if not 0 <= probability <= 100:
+        raise LedgerError("probability must be between 0 and 100")
+    outcome_id = _legacy_id("outcome", claim, resolution_date, resolved_by)
+    prediction_id = _legacy_id(
+        "prediction", row.get("ts"), row.get("question"), seat, claim, index
+    )
+    issued_at = row.get("ts") or "1970-01-01T00:00:00Z"
+    _parse_timestamp(issued_at, "legacy prediction row ts")
+    return {
+        "predictionId": prediction_id,
+        "outcomeId": outcome_id,
+        "runId": row.get("runId") or _legacy_id(
+            "run", row.get("ts"), row.get("question"), row.get("kind")
+        ),
+        "seat": seat,
+        "type": prediction.get("type") or "legacy",
+        "claim": claim,
+        "probability": probability,
+        "issuedAt": issued_at,
+        "resolutionDate": resolution_date,
+        "resolvedBy": resolved_by,
+        "sourceKind": row.get("kind"),
+        "legacy": True,
+    }
+
+
+def _validate_excluded_prediction(prediction: dict[str, Any]) -> None:
+    """Validate metadata without imposing the council's seat vocabulary."""
+    _require_text(prediction.get("seat"), "seat")
+    _require_text(prediction.get("claim"), "claim")
+    _parse_date(prediction.get("resolutionDate"), "resolutionDate")
+    _require_text(prediction.get("resolvedBy"), "resolvedBy")
+    probability = prediction.get("probability")
+    if isinstance(probability, bool) or not isinstance(probability, int):
+        raise LedgerError("probability must be an integer")
+    if not 0 <= probability <= 100:
+        raise LedgerError("probability must be between 0 and 100")
+
+
+def _excluded_prediction(
+    row: dict[str, Any], prediction: dict[str, Any], index: int
+) -> dict[str, Any]:
+    _validate_excluded_prediction(prediction)
+    seat = _require_text(prediction.get("seat"), "seat")
+    claim = prediction["claim"].strip()
+    resolution_date = str(_parse_date(prediction["resolutionDate"], "resolutionDate"))
+    resolved_by = prediction["resolvedBy"].strip()
+    return {
+        "predictionId": prediction.get("predictionId")
+        or _legacy_id(
+            "prediction", row.get("ts"), row.get("kind"), seat, claim, index
+        ),
+        "outcomeId": prediction.get("outcomeId")
+        or _legacy_id("outcome", claim, resolution_date, resolved_by),
+        "seat": seat,
+        "claim": claim,
+        "probability": prediction["probability"],
+        "resolutionDate": resolution_date,
+        "resolvedBy": resolved_by,
+        "sourceKind": row.get("kind"),
+    }
+
+
+def _strict_prediction(row: dict[str, Any], prediction: dict[str, Any]) -> dict[str, Any]:
+    return {
+        **prediction,
+        "runId": row["runId"],
+        "seat": normalize_seat(prediction.get("seat")),
+        "sourceKind": "council",
+        "legacy": False,
+    }
+
+
+def _load_events(
+    path: str | Path,
+) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
+    resolutions: dict[str, dict[str, Any]] = {}
+    overrides = []
+    prior = []
+    for _, event in load_jsonl(path):
+        kind = event.get("kind")
+        if kind == "outcome-resolution":
+            _validate_resolution_event(event, prior)
+            resolutions[event["outcomeId"]] = event
+        elif kind == "grading-debt-override":
+            _require_id(event.get("overrideId"), "override", "overrideId")
+            _require_text(event.get("reason"), "reason")
+            _require_text(event.get("operator"), "operator")
+            _parse_timestamp(event.get("createdAt"), "createdAt")
+            _parse_date(event.get("expiresDate"), "expiresDate")
+            overrides.append(event)
+        else:
+            raise LedgerError(f"unknown forecast event kind: {kind}")
+        prior.append(event)
+    return resolutions, overrides
+
+
+def _legacy_expected_seats(row: dict[str, Any]) -> set[str]:
+    expected = {"code", "theory", "ops"}
+    blind = row.get("blindSeat")
+    if isinstance(blind, dict) and blind.get("ran") is True:
+        expected.add("blind")
+    return expected
+
+
+def audit(
+    log_path: str | Path,
+    events_path: str | Path,
+    *,
+    today: date | None = None,
+) -> dict[str, Any]:
+    today = today or datetime.now(ZoneInfo("America/New_York")).date()
+    numbered_rows = load_jsonl(log_path)
+    rows = [row for _, row in numbered_rows]
+    resolutions, overrides = _load_events(events_path)
+
+    attempts_by_run: dict[str, dict[str, Any]] = {}
+    completions_by_run: dict[str, dict[str, Any]] = {}
+    predictions: list[dict[str, Any]] = []
+    excluded_valid: list[dict[str, Any]] = []
+    invalid_records: list[str] = []
+    legacy_ineligible: list[dict[str, Any]] = []
+    excluded_predictions = 0
+    missing_forecast_seats = []
+    council_rows = 0
+    council_rows_with_predictions = 0
+    complete_forecast_rows = 0
+    seat_emission_states = {
+        seat: {state: 0 for state in sorted(SEAT_STATES)}
+        for seat in CANONICAL_SEATS
+    }
+
+    prior_rows: list[dict[str, Any]] = []
+    for line_number, row in numbered_rows:
+        kind = row.get("kind")
+        if kind == "council-attempt":
+            validate_ledger_row(row, prior_rows)
+            attempts_by_run[row["runId"]] = row
+        elif kind == "council":
+            council_rows += 1
+            raw_predictions = row.get("predictions") or []
+            if raw_predictions:
+                council_rows_with_predictions += 1
+            contract_row = (
+                row.get("schemaVersion") == SCHEMA_VERSION and row.get("runId")
+            )
+            if contract_row:
+                validate_completion(row, prior_rows)
+                completions_by_run[row["runId"]] = row
+                expected = set(attempts_by_run[row["runId"]]["expectedSeats"])
+                states = row["forecastState"]["seats"]
+                prediction_required = {
+                    seat for seat, state in states.items() if state == "submitted"
+                }
+                for seat, state in states.items():
+                    seat_emission_states[seat][state] += 1
+            else:
+                expected = _legacy_expected_seats(row)
+                prediction_required = expected
+            seen = set()
+            for index, raw_prediction in enumerate(raw_predictions):
+                try:
+                    prediction = (
+                        _strict_prediction(row, raw_prediction)
+                        if row.get("schemaVersion") == SCHEMA_VERSION and row.get("runId")
+                        else _legacy_prediction(row, raw_prediction, index)
+                    )
+                    seen.add(prediction["seat"])
+                    predictions.append(prediction)
+                except LedgerError as exc:
+                    legacy_ineligible.append(
+                        {
+                            "line": line_number,
+                            "index": index,
+                            "kind": kind,
+                            "reason": str(exc),
+                        }
+                    )
+            missing = sorted(prediction_required - seen)
+            if missing:
+                missing_forecast_seats.append(
+                    {
+                        "line": line_number,
+                        "runId": row.get("runId"),
+                        "missingSeats": missing,
+                    }
+                )
+            if contract_row and not missing:
+                complete_forecast_rows += 1
+            elif expected and seen == expected:
+                complete_forecast_rows += 1
+        else:
+            raw_predictions = row.get("predictions") or []
+            excluded_predictions += len(raw_predictions)
+            for index, raw_prediction in enumerate(raw_predictions):
+                try:
+                    excluded_valid.append(
+                        _excluded_prediction(row, raw_prediction, index)
+                    )
+                except LedgerError as exc:
+                    legacy_ineligible.append(
+                        {
+                            "line": line_number,
+                            "index": index,
+                            "kind": kind,
+                            "reason": str(exc),
+                        }
+                    )
+        prior_rows.append(row)
+
+    prediction_ids = set()
+    for prediction in predictions:
+        prediction_id = prediction["predictionId"]
+        if prediction_id in prediction_ids:
+            invalid_records.append(f"duplicate predictionId: {prediction_id}")
+        prediction_ids.add(prediction_id)
+
+    # The earliest issuance is the headline forecast for a seat/outcome. Later entries remain
+    # in issuance counts and are visible as repeats, but cannot replace the pre-evidence price.
+    representatives: dict[tuple[str, str], dict[str, Any]] = {}
+    repeated_issuances = 0
+    for prediction in sorted(
+        predictions,
+        key=lambda item: (
+            _parse_timestamp(item["issuedAt"], "issuedAt"),
+            item["predictionId"],
+        ),
+    ):
+        key = (prediction["seat"], prediction["outcomeId"])
+        if key in representatives:
+            repeated_issuances += 1
+            continue
+        representatives[key] = prediction
+
+    outcome_predictions: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for prediction in representatives.values():
+        outcome_predictions[prediction["outcomeId"]].append(prediction)
+
+    unknown_resolution_ids = sorted(set(resolutions) - set(outcome_predictions))
+    if unknown_resolution_ids:
+        invalid_records.extend(
+            f"resolution references unknown outcomeId: {item}"
+            for item in unknown_resolution_ids
+        )
+
+    due_outcomes = set()
+    old_overdue = set()
+    for outcome_id, items in outcome_predictions.items():
+        deadline = _parse_date(items[0]["resolutionDate"], "resolutionDate")
+        if deadline <= today:
+            due_outcomes.add(outcome_id)
+            if outcome_id not in resolutions and (today - deadline).days > 14:
+                old_overdue.add(outcome_id)
+
+    resolved_outcomes = {
+        outcome_id
+        for outcome_id, event in resolutions.items()
+        if outcome_id in outcome_predictions and event.get("status") == "resolved"
+    }
+    void_outcomes = {
+        outcome_id
+        for outcome_id, event in resolutions.items()
+        if outcome_id in outcome_predictions and event.get("status") == "void"
+    }
+    unresolved_due = due_outcomes - resolved_outcomes - void_outcomes
+
+    active_override = any(
+        _parse_timestamp(item["createdAt"], "createdAt").date() <= today
+        <= _parse_date(item["expiresDate"], "expiresDate")
+        for item in overrides
+    )
+    if len(old_overdue) >= 3:
+        debt_state = "OVERRIDDEN" if active_override else "BLOCK_FINALIZATION"
+    elif unresolved_due:
+        debt_state = "WARN"
+    else:
+        debt_state = "CLEAN"
+
+    seat_scores = []
+    by_seat: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for prediction in representatives.values():
+        by_seat[prediction["seat"]].append(prediction)
+    for seat in CANONICAL_SEATS:
+        items = by_seat.get(seat, [])
+        resolved_items = [
+            item for item in items if item["outcomeId"] in resolved_outcomes
+        ]
+        scores = [
+            brier_score(
+                item["probability"], resolutions[item["outcomeId"]]["cameTrue"]
+            )
+            for item in resolved_items
+        ]
+        due_for_seat = {
+            item["outcomeId"]
+            for item in items
+            if _parse_date(item["resolutionDate"], "resolutionDate") <= today
+        }
+        unresolved_for_seat = due_for_seat - resolved_outcomes - void_outcomes
+        if scores:
+            mean_probability = sum(item["probability"] for item in resolved_items) / len(
+                resolved_items
+            )
+            event_rate = sum(
+                1 for item in resolved_items if resolutions[item["outcomeId"]]["cameTrue"]
+            ) / len(resolved_items)
+            mean_brier = sum(scores) / len(scores)
+        else:
+            mean_probability = None
+            event_rate = None
+            mean_brier = None
+        seat_scores.append(
+            {
+                "seat": seat,
+                "n": len(scores),
+                "brier": mean_brier,
+                "constantFiftyBrier": 0.25 if scores else None,
+                "climatologyBrier": (
+                    event_rate * (1.0 - event_rate)
+                    if event_rate is not None
+                    else None
+                ),
+                "meanProbability": mean_probability,
+                "eventRate": event_rate,
+                "dueOutcomes": len(due_for_seat),
+                "unresolvedDueOutcomes": len(unresolved_for_seat),
+                "scoreStatus": "INCOMPLETE" if unresolved_for_seat else "DESCRIPTIVE",
+            }
+        )
+
+    score_status = (
+        "INCOMPLETE"
+        if unresolved_due
+        else "DESCRIPTIVE"
+        if resolved_outcomes
+        else "NO_RESOLVED_OUTCOMES"
+    )
+    shared_outcomes = sum(
+        1
+        for items in outcome_predictions.values()
+        if len({item["seat"] for item in items if item.get("type") == "shared"}) >= 2
+    )
+    orphan_attempts = sorted(set(attempts_by_run) - set(completions_by_run))
+    all_states = {
+        "future": 0,
+        "due": 0,
+        "resolved": 0,
+        "void": 0,
+        "legacyIneligible": len(legacy_ineligible),
+    }
+    for prediction in [*predictions, *excluded_valid]:
+        event = resolutions.get(prediction["outcomeId"])
+        if event and event.get("status") == "resolved":
+            all_states["resolved"] += 1
+        elif event and event.get("status") == "void":
+            all_states["void"] += 1
+        elif _parse_date(prediction["resolutionDate"], "resolutionDate") <= today:
+            all_states["due"] += 1
+        else:
+            all_states["future"] += 1
+
+    return {
+        "scope": "council",
+        "rawPredictions": sum(len(row.get("predictions") or []) for row in rows),
+        "forecastIssuances": len(predictions),
+        "representativeForecasts": len(representatives),
+        "repeatedIssuances": repeated_issuances,
+        "uniqueOutcomes": len(outcome_predictions),
+        "knownOutcomeIds": sorted(outcome_predictions),
+        "outcomeResolutionDates": {
+            outcome_id: items[0]["resolutionDate"]
+            for outcome_id, items in sorted(outcome_predictions.items())
+        },
+        "sharedOutcomes": shared_outcomes,
+        "excludedPredictions": excluded_predictions,
+        "excludedValidPredictions": len(excluded_valid),
+        "allPredictionStates": all_states,
+        "legacyIneligiblePredictions": legacy_ineligible,
+        "attempts": len(attempts_by_run),
+        "orphanAttempts": orphan_attempts,
+        "councilRows": council_rows,
+        "councilRowsWithPredictions": council_rows_with_predictions,
+        "completeForecastRows": complete_forecast_rows,
+        "missingForecastSeats": missing_forecast_seats,
+        "seatEmissionStates": seat_emission_states,
+        "eligibleDueOutcomes": len(due_outcomes),
+        "resolvedOutcomes": len(resolved_outcomes),
+        "voidOutcomes": len(void_outcomes),
+        "voidRateOfDueOutcomes": (
+            len(void_outcomes) / len(due_outcomes) if due_outcomes else None
+        ),
+        "unresolvedDueOutcomes": len(unresolved_due),
+        "oldOverdueOutcomes": len(old_overdue),
+        "gradingDebtState": debt_state,
+        "scoreStatus": score_status,
+        "seatScores": seat_scores,
+        "invalidRecords": invalid_records,
+        "label": (
+            "DESCRIPTIVE ONLY - normal seat operation has unequal information access; "
+            "outcomes may be seat-controlled and are non-independent"
+        ),
+    }
