@@ -148,10 +148,13 @@ All evidence writers take the same evidence coordination lock. `evidence-snapsho
 corresponding shared lock so a local snapshot is wholly before or after an append. This is still a
 local-filesystem rehearsal, not an off-host backup claim.
 
-The live `capture-activate` command is disabled in this release. Even through the installed
-source-pinned wrapper with a verified approval manifest, it fails on hardcoded one-in-five audit and
-off-host durability blockers and appends nothing. A later reviewed release may remove those
-blockers only after implementing and rehearsing the controls.
+The live `capture-activate` command is evidence-gated and is never implied by installation. Through
+the installed source-pinned wrapper it accepts only a version-2 content-addressed approval manifest
+whose frozen audit and durability policies and source-bound rehearsal certificates all revalidate
+while the evidence lock and pinned ledger transaction are held. Missing, stale, mismatched, or
+unrehearsed evidence appends nothing. A selected decision family's first complete run produces a
+blinded one-in-five audit case and a separately retained alias map; retries inherit the prospective
+assignment, and audit rows never enter lifecycle or Brier denominators.
 Before activation, exercise `capture-artifact`, `capture-initiate`, `capture-attempt`,
 `capture-seats-finished`, `capture-complete`, `capture-report`, and the evidence snapshot commands
 only against copied or explicit non-live paths. No capture command accepts an operator-supplied

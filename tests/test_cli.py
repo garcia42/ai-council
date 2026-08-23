@@ -76,21 +76,6 @@ class ForecastCliTest(unittest.TestCase):
             check=False,
         )
 
-    def activation_manifest(self, commit):
-        controls = sorted(cli._ACTIVATION_CONTROL_KEYS)
-        return {
-            "schemaVersion": 1,
-            "runtimeSourceCommit": commit,
-            "approvals": {control: "APPROVED" for control in controls},
-            "evidence": {
-                control: {
-                    "status": "VERIFIED",
-                    "evidenceRef": f"evidence:{control}",
-                }
-                for control in controls
-            },
-        }
-
     def test_report_json_uses_injected_paths_and_clock(self):
         result = self.run_cli(
             "report",
@@ -611,6 +596,7 @@ class ForecastCliTest(unittest.TestCase):
                     "cohortName": "parent-swap-test",
                     "captureVersion": "capture-v2.0.0",
                     "runtimeSourceCommit": "a" * 40,
+                    "runtimeSourceSha256": "b" * 64,
                     "artifactRootPolicy": "private-content-addressed-v1",
                 }
             ),
@@ -667,6 +653,7 @@ class ForecastCliTest(unittest.TestCase):
                     "cohortName": "plain-parent-swap-test",
                     "captureVersion": "capture-v2.0.0",
                     "runtimeSourceCommit": "a" * 40,
+                    "runtimeSourceSha256": "b" * 64,
                     "artifactRootPolicy": "private-content-addressed-v1",
                 }
             ),
@@ -1162,6 +1149,7 @@ class ForecastCliTest(unittest.TestCase):
                 "cohortName": "raw-secret-report",
                 "captureVersion": "capture-v2.0.0",
                 "runtimeSourceCommit": "a" * 40,
+                "runtimeSourceSha256": "b" * 64,
                 "artifactRootPolicy": "private-content-addressed-v1",
             },
             clock=lambda: "2026-08-23T10:00:00Z",
@@ -1208,6 +1196,7 @@ class ForecastCliTest(unittest.TestCase):
                 "cohortName": "raw-secret-sidecar-report",
                 "captureVersion": "capture-v2.0.0",
                 "runtimeSourceCommit": "a" * 40,
+                "runtimeSourceSha256": "b" * 64,
                 "artifactRootPolicy": "private-content-addressed-v1",
             },
             clock=lambda: "2026-08-23T10:00:00Z",
@@ -1251,6 +1240,7 @@ class ForecastCliTest(unittest.TestCase):
                 "cohortName": "escaped-secret-sidecar-report",
                 "captureVersion": "capture-v2.0.0",
                 "runtimeSourceCommit": "a" * 40,
+                "runtimeSourceSha256": "b" * 64,
                 "artifactRootPolicy": "private-content-addressed-v1",
             },
             clock=lambda: "2026-08-23T10:00:00Z",
@@ -1315,6 +1305,7 @@ class ForecastCliTest(unittest.TestCase):
                 "cohortName": "typed-enum-report",
                 "captureVersion": "capture-v2.0.0",
                 "runtimeSourceCommit": "a" * 40,
+                "runtimeSourceSha256": "b" * 64,
                 "artifactRootPolicy": "private-content-addressed-v1",
             },
             clock=lambda: "2026-08-23T10:00:00Z",
@@ -1391,6 +1382,7 @@ class ForecastCliTest(unittest.TestCase):
                     "cohortName": "first-ten-cli",
                     "captureVersion": "capture-v2.0.0",
                     "runtimeSourceCommit": "a" * 40,
+                    "runtimeSourceSha256": "b" * 64,
                     "artifactRootPolicy": "private-content-addressed-v1",
                 }
             ),
@@ -1596,6 +1588,7 @@ class ForecastCliTest(unittest.TestCase):
                     "cohortName": "secret-incident-test",
                     "captureVersion": "capture-v2.0.0",
                     "runtimeSourceCommit": "a" * 40,
+                    "runtimeSourceSha256": "b" * 64,
                     "artifactRootPolicy": "private-content-addressed-v1",
                 }
             ),
@@ -1662,6 +1655,7 @@ class ForecastCliTest(unittest.TestCase):
                     "cohortName": "secret-seat-test",
                     "captureVersion": "capture-v2.0.0",
                     "runtimeSourceCommit": "a" * 40,
+                    "runtimeSourceSha256": "b" * 64,
                     "artifactRootPolicy": "private-content-addressed-v1",
                 }
             ),
@@ -1790,11 +1784,10 @@ class ForecastCliTest(unittest.TestCase):
 
     def test_live_activation_requires_in_process_wrapper_binding_and_remains_blocked(self):
         commit = "b" * 40
+        source_sha256 = "c" * 64
         artifact_root = self.root / "artifacts"
         manifest_file = self.root / "approval.json"
-        manifest_bytes = json.dumps(
-            self.activation_manifest(commit), sort_keys=True
-        ).encode("utf-8")
+        manifest_bytes = b'{"schemaVersion":1}'
         manifest_file.write_bytes(manifest_bytes)
         manifest_ref = ArtifactStore(artifact_root).capture(manifest_bytes)
         activation_spec = self.root / "activation.json"
@@ -1804,6 +1797,7 @@ class ForecastCliTest(unittest.TestCase):
                     "cohortName": "governed-live-test",
                     "captureVersion": "capture-v2.0.0",
                     "runtimeSourceCommit": commit,
+                    "runtimeSourceSha256": source_sha256,
                     "artifactRootPolicy": "private-content-addressed-v1",
                     "approvalManifest": manifest_ref,
                 }
@@ -1826,6 +1820,7 @@ class ForecastCliTest(unittest.TestCase):
         self.assertFalse(self.log.exists())
 
         args._runtime_source_commit = "c" * 40
+        args._runtime_source_sha256 = source_sha256
         args._runtime_source_root = Path(cli.__file__).parents[2]
         with (
             mock.patch.object(cli, "_is_live_write_path", return_value=True),
@@ -1841,8 +1836,8 @@ class ForecastCliTest(unittest.TestCase):
             mock.patch.object(cli, "_require_write_authority"),
         ):
             with self.assertRaisesRegex(
-                cli.LedgerError,
-                "prospective-audit-not-implemented.*durability-evidence-not-supplied",
+                ValueError,
+                "capture activation evidence blocked",
             ):
                 cli.command_capture_activate(args)
         self.assertFalse(self.log.exists())
@@ -1856,6 +1851,7 @@ class ForecastCliTest(unittest.TestCase):
                     "cohortName": "environment-forgery-test",
                     "captureVersion": "capture-v2.0.0",
                     "runtimeSourceCommit": commit,
+                    "runtimeSourceSha256": "f" * 64,
                     "artifactRootPolicy": "private-content-addressed-v1",
                 }
             ),
@@ -1880,69 +1876,52 @@ class ForecastCliTest(unittest.TestCase):
                 cli.command_capture_activate(args)
         self.assertFalse(self.log.exists())
 
-    def test_activation_manifest_is_strict_complete_and_exact_bytes(self):
-        commit = "d" * 40
-        valid = self.activation_manifest(commit)
-        cli._validate_activation_approval_manifest(
-            json.dumps(valid).encode(), runtime_source_commit=commit
+    def test_activation_readiness_is_read_only_and_returns_gate_status(self):
+        manifest = self.root / "manifest.json"
+        manifest.write_bytes(b'{"schemaVersion":2}')
+        args = SimpleNamespace(
+            manifest_file=str(manifest),
+            artifact_root=str(self.root / "artifacts"),
+            runtime_source_commit="a" * 40,
+            runtime_source_sha256="b" * 64,
+            at="2026-08-23T12:00:00Z",
+            _runtime_source_commit=None,
+            _runtime_source_sha256=None,
         )
-
-        denied = self.activation_manifest(commit)
-        denied["approvals"]["cleanRestore"] = "DENIED"
-        with self.assertRaisesRegex(cli.LedgerError, "exactly APPROVED"):
-            cli._validate_activation_approval_manifest(
-                json.dumps(denied).encode(), runtime_source_commit=commit
-            )
-
-        incomplete = self.activation_manifest(commit)
-        incomplete["evidence"]["cleanRestore"]["evidenceRef"] = ""
-        with self.assertRaisesRegex(cli.LedgerError, "cleanRestore"):
-            cli._validate_activation_approval_manifest(
-                json.dumps(incomplete).encode(), runtime_source_commit=commit
-            )
-
-        unverified = self.activation_manifest(commit)
-        unverified["evidence"]["cleanRestore"]["status"] = "PENDING"
-        with self.assertRaisesRegex(cli.LedgerError, "exactly VERIFIED"):
-            cli._validate_activation_approval_manifest(
-                json.dumps(unverified).encode(), runtime_source_commit=commit
-            )
-
-        sentinel = self.activation_manifest(commit)
-        sentinel["evidence"]["cleanRestore"]["evidenceRef"] = "not supplied"
-        with self.assertRaisesRegex(cli.LedgerError, "negative sentinel"):
-            cli._validate_activation_approval_manifest(
-                json.dumps(sentinel).encode(), runtime_source_commit=commit
-            )
-
-        duplicate = (
-            '{"schemaVersion":1,"schemaVersion":1,"runtimeSourceCommit":"'
-            + commit
-            + '","approvals":{},"evidence":{}}'
-        )
-        with self.assertRaisesRegex(
-            cli.LedgerError, "activation approval manifest is not valid strict JSON"
+        ready = {"appendReady": True, "blockers": []}
+        with (
+            mock.patch.object(cli, "ArtifactStore") as store,
+            mock.patch.object(
+                cli, "evaluate_activation_evidence", return_value=ready
+            ) as evaluate,
+            mock.patch("sys.stdout"),
         ):
-            cli._validate_activation_approval_manifest(
-                duplicate.encode(), runtime_source_commit=commit
-            )
+            self.assertEqual(cli.command_activation_readiness(args), 0)
+        evaluate.assert_called_once_with(
+            manifest.read_bytes(),
+            reader=store.return_value,
+            expected_runtime_commit="a" * 40,
+            expected_source_sha256="b" * 64,
+            activation_time="2026-08-23T12:00:00Z",
+            as_of="2026-08-23T12:00:00Z",
+        )
 
-        artifact_root = self.root / "artifacts"
-        manifest_file = self.root / "approval.json"
-        original = json.dumps(valid, sort_keys=True).encode()
-        ref = ArtifactStore(artifact_root).capture(original)
-        manifest_file.write_bytes(original + b"\n")
-        with self.assertRaisesRegex(cli.LedgerError, "does not match"):
-            cli._verify_activation_manifest(
-                {"runtimeSourceCommit": commit, "approvalManifest": ref},
-                manifest_file=str(manifest_file),
-                artifact_root=str(artifact_root),
-            )
+        with (
+            mock.patch.object(cli, "ArtifactStore"),
+            mock.patch.object(
+                cli,
+                "evaluate_activation_evidence",
+                return_value={"appendReady": False, "blockers": ["stale"]},
+            ),
+            mock.patch("sys.stdout"),
+        ):
+            self.assertEqual(cli.command_activation_readiness(args), 1)
 
     def test_installed_wrapper_passes_authenticated_runtime_binding_in_process(self):
         wrapper = (Path(__file__).parents[1] / "runtime/predictions_report.py").read_text()
         self.assertNotIn("COUNCIL_RUNTIME_EXPECTED_COMMIT", wrapper)
         self.assertIn("runtime_source_commit=EXPECTED_COMMIT", wrapper)
+        self.assertIn("runtime_source_sha256=EXPECTED_SOURCE_SHA256", wrapper)
         self.assertIn("runtime_source_root=SOURCE_ROOT", wrapper)
         self.assertIn("pwd.getpwuid(os.getuid()).pw_dir", wrapper)
         self.assertNotIn("Path.home()", wrapper)

@@ -15,7 +15,7 @@ import os
 import pwd
 from collections.abc import Callable, Iterable, Mapping
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +26,10 @@ from .artifacts import (
     secret_detectors,
     validate_artifact_ref,
     verify_git_blob_oid,
+)
+from .activation_evidence import (
+    evaluate_activation_evidence,
+    parse_activation_manifest_v2,
 )
 from .capture_schema import (
     CaptureSchemaError,
@@ -40,6 +44,7 @@ from .capture_schema import (
     make_capture_invalidation,
     make_council_attempt_v2,
     make_council_seats_finished,
+    make_finding_audit_case_v2,
     prepare_council_v2,
     raw_payload_secret_detectors,
     parse_forecast_request_binding_v2,
@@ -57,6 +62,16 @@ from .findings import (
     FindingError,
     summarize_findings,
     validate_visible_output_findings,
+)
+from .finding_audit import (
+    FindingAuditError,
+    assign_decision_family,
+    audit_case_sha256,
+    audit_protocol_sha256,
+    build_blinded_audit_case,
+    validate_alias_map,
+    validate_audit_case_packet,
+    validate_audit_protocol,
 )
 from .forecasts import (
     LOCK_TIMEOUT_SECONDS,
@@ -123,6 +138,29 @@ class CaptureSecretDetectedError(CaptureRuntimeError):
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _clock_utc(clock: Clock, field: str) -> datetime:
+    value = clock()
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            raise CaptureRuntimeError(f"{field} clock must be timezone-aware")
+        return value.astimezone(timezone.utc)
+    if not isinstance(value, str):
+        raise CaptureRuntimeError(f"{field} clock must return a timestamp")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise CaptureRuntimeError(f"{field} clock returned an invalid timestamp") from exc
+    if parsed.tzinfo is None:
+        raise CaptureRuntimeError(f"{field} clock must be timezone-aware")
+    return parsed.astimezone(timezone.utc)
+
+
+def _timestamp(value: datetime) -> str:
+    return value.astimezone(timezone.utc).isoformat(timespec="microseconds").replace(
+        "+00:00", "Z"
+    )
 
 
 def _os_account_live_write_roots() -> tuple[Path, ...]:
@@ -600,6 +638,95 @@ def append_capture_activation(
     )
 
 
+def append_evidence_bound_capture_activation(
+    path: str | Path,
+    payload: Mapping[str, Any],
+    *,
+    manifest_data: bytes,
+    artifact_store: ArtifactStore,
+    expected_runtime_commit: str,
+    expected_source_sha256: str,
+    clock: Clock = utc_now,
+    coordination_lock: str | Path | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Append only through a fully dereferenced, source-bound evidence gateway.
+
+    This is the sole gateway permitted to append a live activation.  Evidence
+    is re-evaluated after both the coordination lock and pinned ledger
+    transaction are held, immediately before the activation row is staged.
+    """
+
+    target = Path(path)
+    with evidence_write_lock(coordination_lock), _capture_transaction(target) as transaction:
+        _raw, prior = _validated_rows(transaction)
+        append_at = _clock_utc(clock, "capture activation")
+        try:
+            _preflight_raw_payload(payload)
+            if payload.get("runtimeSourceCommit") != expected_runtime_commit:
+                raise CaptureRuntimeError(
+                    "activation spec runtime commit differs from installed source"
+                )
+            if payload.get("runtimeSourceSha256") != expected_source_sha256:
+                raise CaptureRuntimeError(
+                    "activation spec source digest differs from installed source"
+                )
+            approval_ref = payload.get("approvalManifest")
+            if not isinstance(approval_ref, Mapping):
+                raise CaptureRuntimeError(
+                    "evidence-bound activation requires approvalManifest"
+                )
+            retained_manifest = artifact_store.read_verified(approval_ref)
+            if retained_manifest != manifest_data:
+                raise CaptureRuntimeError(
+                    "activation manifest file differs from retained artifact"
+                )
+            evidence = evaluate_activation_evidence(
+                retained_manifest,
+                reader=artifact_store,
+                expected_runtime_commit=expected_runtime_commit,
+                expected_source_sha256=expected_source_sha256,
+                activation_time=append_at,
+                as_of=append_at,
+            )
+            if evidence.get("appendReady") is not True:
+                blockers = evidence.get("blockers")
+                stable = (
+                    ",".join(str(item) for item in blockers)
+                    if isinstance(blockers, list) and blockers
+                    else "activation-evidence-invalid"
+                )
+                raise CaptureRuntimeError(
+                    "capture activation evidence blocked: " + stable
+                )
+            manifest = parse_activation_manifest_v2(retained_manifest)
+            policy = strict_json_loads(
+                artifact_store.read_verified(manifest["policyRef"])
+            )
+            if not isinstance(policy, Mapping):
+                raise CaptureRuntimeError("activation evidence policy is invalid")
+            protocol_ref = policy.get("auditProtocolRef")
+            if not isinstance(protocol_ref, Mapping):
+                raise CaptureRuntimeError("activation evidence lacks audit protocol")
+            protocol = validate_audit_protocol(
+                strict_json_loads(artifact_store.read_verified(protocol_ref))
+            )
+            if audit_protocol_sha256(protocol) != evidence.get(
+                "auditProtocolSha256"
+            ):
+                raise CaptureRuntimeError("activation audit protocol binding mismatch")
+            augmented = {**dict(payload), "auditProtocol": protocol}
+            row = make_capture_activation(
+                augmented,
+                prior_rows=prior,
+                clock=lambda: append_at,
+                id_factory=lambda prefix: str(manifest["activationId"]),
+            )
+            _append_locked(transaction, row)
+        except FindingAuditError as exc:
+            raise CaptureRuntimeError("activation audit protocol is invalid") from exc
+    return row, evidence
+
+
 def append_capture_initiation(
     path: str | Path,
     payload: Mapping[str, Any],
@@ -722,6 +849,7 @@ def _prompt_bindings(
 ) -> tuple[bytes, ...]:
     return (
         f"commit={activation['runtimeSourceCommit']}".encode("utf-8"),
+        f"source-sha256={activation['runtimeSourceSha256']}".encode("utf-8"),
         f"blob={decision_ref['gitBlob']}".encode("utf-8"),
         f"sha256={decision_ref['sha256']}".encode("utf-8"),
     )
@@ -809,7 +937,41 @@ def append_council_attempt_v2(
                 raise CaptureRuntimeError(
                     "sharedOutcome.decisionLink must bind inputManifestSha256"
                 )
-            row = make_council_attempt_v2(payload, prior_rows=prior, clock=clock)
+            attempt_payload = dict(payload)
+            protocol = activation.get("auditProtocol")
+            if isinstance(protocol, Mapping):
+                assigned_at = _clock_utc(clock, "audit assignment")
+                launched_at = _clock_utc(clock, "council attempt")
+                if launched_at <= assigned_at:
+                    launched_at = assigned_at + timedelta(microseconds=1)
+                prior_assignments = [
+                    item["auditAssignment"]
+                    for item in prior
+                    if item.get("kind") == "council-attempt-v2"
+                    and isinstance(item.get("auditAssignment"), Mapping)
+                ]
+                family_id = str(payload.get("decisionFamilyId", ""))
+                first_observation = not any(
+                    item.get("activationId") == activation["activationId"]
+                    and item.get("decisionFamilyId") == family_id
+                    for item in prior_assignments
+                )
+                attempt_payload["auditAssignment"] = assign_decision_family(
+                    protocol,
+                    activation_id=str(activation["activationId"]),
+                    decision_family_id=family_id,
+                    run_id=str(initiation["runId"]),
+                    assigned_at=_timestamp(assigned_at),
+                    attempt_started_at=_timestamp(launched_at),
+                    existing_assignments=prior_assignments,
+                    first_observation=first_observation,
+                )
+                attempt_clock: Clock = lambda: launched_at
+            else:
+                attempt_clock = clock
+            row = make_council_attempt_v2(
+                attempt_payload, prior_rows=prior, clock=attempt_clock
+            )
             if row["runId"] != initiation["runId"]:
                 raise CaptureRuntimeError(
                     "constructed attempt changed the initiated run identity"
@@ -836,6 +998,8 @@ def append_council_attempt_v2(
                     clock=clock,
                 )
             raise
+        except FindingAuditError as exc:
+            raise CaptureRuntimeError("finding audit assignment failed safely") from exc
     return row
 
 
@@ -1090,6 +1254,118 @@ def append_council_v2(
             # check above completes before the system clock is sampled here.
             row = finalize_council_v2(prepared, prior_rows=prior, clock=clock)
             _append_locked(transaction, row)
+            assignment = attempt.get("auditAssignment")
+            protocol = activation.get("auditProtocol")
+            prior_family_case = any(
+                item.get("kind") == "finding-audit-case-v2"
+                and item.get("activationId") == row["activationId"]
+                and item.get("decisionFamilyId") == row["decisionFamilyId"]
+                for item in prior
+            )
+            if (
+                isinstance(protocol, Mapping)
+                and isinstance(assignment, Mapping)
+                and assignment.get("selected") is True
+                and submitted_results
+                and not prior_family_case
+            ):
+                captured_at = _clock_utc(clock, "finding audit case")
+                source_finding_keys = (
+                    "findingId",
+                    "seatId",
+                    "category",
+                    "claim",
+                    "severity",
+                    "proposedAction",
+                    "evidenceSummary",
+                )
+                subjects = []
+                for plan in prepared["seatPlan"]:
+                    seat = plan["seatId"]
+                    result = submitted_results.get(seat)
+                    if result is None:
+                        continue
+                    output_bytes = visible_outputs[seat]
+                    try:
+                        output_text = output_bytes.decode("utf-8")
+                        decoded_output = strict_json_loads(output_bytes)
+                    except (UnicodeDecodeError, CaptureSchemaError, ValueError) as exc:
+                        raise _RetainedArtifactParseError(_OUTPUT_PARSE_FAILURE) from exc
+                    answer = (
+                        decoded_output.get("answer")
+                        if isinstance(decoded_output, Mapping)
+                        else None
+                    )
+                    if not isinstance(answer, str) or not answer.strip():
+                        raise CaptureRuntimeError(
+                            f"visible output for {seat} requires substantive answer text"
+                        )
+                    identity_markers = (
+                        str(seat),
+                        str(result["role"]),
+                        str(result["modelId"]),
+                        str(result["agentVersion"]),
+                    )
+                    lowered_answer = answer.casefold()
+                    subjects.append(
+                        {
+                            "seatId": seat,
+                            "role": result["role"],
+                            "modelId": result["modelId"],
+                            "agentVersion": result["agentVersion"],
+                            "sourceOutputText": output_text,
+                            "sourceOutputSha256": result["outputArtifact"]["sha256"],
+                            "visibleAnswer": answer,
+                            "selfIdentificationRisk": any(
+                                marker.casefold() in lowered_answer
+                                for marker in identity_markers
+                                if marker
+                            ),
+                            "capturedFindings": [
+                                {key: finding[key] for key in source_finding_keys}
+                                for finding in prepared["findings"]
+                                if finding["seatId"] == seat
+                            ],
+                        }
+                    )
+                packet, alias_map = build_blinded_audit_case(
+                    protocol,
+                    assignment=assignment,
+                    case_run_id=row["runId"],
+                    captured_at=_timestamp(captured_at),
+                    subjects=subjects,
+                    first_capture_complete=True,
+                )
+                packet_bytes = json.dumps(
+                    packet,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                ).encode("utf-8")
+                alias_map_bytes = json.dumps(
+                    alias_map,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                ).encode("utf-8")
+                case_ref = artifact_store.capture(packet_bytes)
+                alias_ref = artifact_store.capture(alias_map_bytes)
+                case_row = make_finding_audit_case_v2(
+                    {
+                        "runId": row["runId"],
+                        "protocolSha256": audit_protocol_sha256(protocol),
+                        "auditCaseSha256": audit_case_sha256(
+                            packet, protocol=protocol
+                        ),
+                        "caseArtifact": case_ref,
+                        "aliasMapArtifact": alias_ref,
+                    },
+                    prior_rows=[*prior, row],
+                    clock=lambda: captured_at,
+                )
+                _append_locked(transaction, case_row)
         except CaptureSecretDetectedError as exc:
             run_id = _initiated_run_id_for_payload(prior, payload)
             if run_id is not None:
@@ -1103,6 +1379,8 @@ def append_council_v2(
             raise
         except CaptureSchemaError as exc:
             raise CaptureRuntimeError(str(exc)) from exc
+        except FindingAuditError as exc:
+            raise CaptureRuntimeError("finding audit case creation failed safely") from exc
     return row, summary
 
 
@@ -1392,6 +1670,64 @@ def _annotate_report_provenance(
     return added, finding_summaries
 
 
+def _annotate_finding_audit_provenance(
+    rows: list[dict[str, Any]],
+    invalid: list[dict[str, Any]],
+    *,
+    artifact_store: ArtifactStore,
+) -> int:
+    activations = {
+        row.get("activationId"): row
+        for row in rows
+        if row.get("kind") == "capture-activation"
+        and "_captureSchemaError" not in row
+    }
+    added = 0
+    for line_number, row in enumerate(rows, 1):
+        if row.get("kind") != "finding-audit-case-v2" or "_captureSchemaError" in row:
+            continue
+        try:
+            activation = activations[row["activationId"]]
+            protocol = activation["auditProtocol"]
+            packet_data = artifact_store.read_verified(row["caseArtifact"])
+            alias_data = artifact_store.read_verified(row["aliasMapArtifact"])
+            packet = strict_json_loads(packet_data)
+            alias_map = strict_json_loads(alias_data)
+            normalized_packet = validate_audit_case_packet(
+                packet, protocol=protocol
+            )
+            validate_alias_map(
+                alias_map, packet=normalized_packet, protocol=protocol
+            )
+            if audit_case_sha256(normalized_packet, protocol=protocol) != row[
+                "auditCaseSha256"
+            ]:
+                raise CaptureRuntimeError("finding audit case digest mismatch")
+            if normalized_packet["caseRunId"] != row["runId"]:
+                raise CaptureRuntimeError("finding audit case run binding mismatch")
+        except (
+            ArtifactError,
+            CaptureRuntimeError,
+            CaptureSchemaError,
+            FindingAuditError,
+            KeyError,
+            TypeError,
+            ValueError,
+        ) as exc:
+            error = "report-time finding audit provenance failure"
+            row["_captureSchemaError"] = error
+            invalid.append(
+                {
+                    "lineNumber": line_number,
+                    "kind": "finding-audit-case-v2",
+                    "runId": str(row.get("runId", "")),
+                    "error": error,
+                }
+            )
+            added += 1
+    return added
+
+
 def capture_report(
     log_path: str | Path,
     events_path: str | Path,
@@ -1405,6 +1741,45 @@ def capture_report(
     _provenance_invalid_count, finding_summaries = _annotate_report_provenance(
         raw, invalid, artifact_store=artifact_store
     )
+    _annotate_finding_audit_provenance(
+        raw, invalid, artifact_store=artifact_store
+    )
+    activation_evidence = None
+    activation_rows = [
+        row
+        for row in raw
+        if row.get("kind") == "capture-activation"
+        and "_captureSchemaError" not in row
+    ]
+    if len(activation_rows) == 1 and isinstance(
+        activation_rows[0].get("approvalManifest"), Mapping
+    ):
+        activation = activation_rows[0]
+        try:
+            manifest_data = artifact_store.read_verified(
+                activation["approvalManifest"]
+            )
+            activation_evidence = evaluate_activation_evidence(
+                manifest_data,
+                reader=artifact_store,
+                expected_runtime_commit=activation["runtimeSourceCommit"],
+                expected_source_sha256=activation["runtimeSourceSha256"],
+                activation_time=activation["activatedAt"],
+                as_of=as_of,
+            )
+        except (ArtifactError, KeyError, TypeError, ValueError):
+            activation_evidence = {
+                "appendReady": False,
+                "blockers": ["activation-evidence-unreadable"],
+                "activationVerdict": {
+                    "ready": False,
+                    "blockers": ["activation-evidence-unreadable"],
+                },
+                "currentHealth": {
+                    "healthy": False,
+                    "blockers": ["activation-evidence-unreadable"],
+                },
+            }
     valid_v2 = [
         row
         for row in raw
@@ -1482,6 +1857,7 @@ def capture_report(
         resolution_events=events,
         artifact_integrity=artifact_store.verify,
         finding_summaries=finding_summaries,
+        activation_evidence=activation_evidence,
     )
     report["transactionEscrows"] = transaction_escrow_inventory(
         log_path, events_path

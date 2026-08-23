@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import math
 import os
@@ -16,8 +15,10 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from .artifacts import ArtifactStore, SecretDetectedError, secret_detectors
+from .activation_evidence import evaluate_activation_evidence
 from .capture_runtime import (
     append_capture_activation,
+    append_evidence_bound_capture_activation,
     append_capture_initiation,
     append_capture_invalidation,
     append_capture_resolution,
@@ -77,42 +78,6 @@ LIVE_WRITE_ROOTS = (
     LIVE_RUNTIME_SOURCE_ROOT,
 )
 DEFAULT_AUTHORITY_HOST = "manny"
-
-_ACTIVATION_CONTROL_KEYS = frozenset(
-    {
-        "offHostCustody",
-        "encryptionAccess",
-        "retention",
-        "rpoRto",
-        "remoteReadback",
-        "cleanRestore",
-        "timedRehearsal",
-        "independentAuditProtocol",
-    }
-)
-_ACTIVATION_BLOCKERS = (
-    "prospective-audit-not-implemented",
-    "durability-evidence-not-supplied",
-)
-_NEGATIVE_EVIDENCE_REFS = frozenset(
-    {
-        "n/a",
-        "na",
-        "denied",
-        "failed",
-        "false",
-        "missing",
-        "none",
-        "not applicable",
-        "not supplied",
-        "pending",
-        "tbd",
-        "todo",
-        "unknown",
-        "unverified",
-    }
-)
-
 
 def _path_candidates(raw_path: str | Path) -> tuple[Path, Path]:
     """Return lexical and symlink-resolved identities for an authorization check."""
@@ -239,97 +204,6 @@ def _load_spec(path: str, label: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise LedgerError(f"{label} must be an object")
     return value
-
-
-def _require_exact_keys(
-    value: Any, expected: set[str] | frozenset[str], label: str
-) -> dict[str, Any]:
-    if not isinstance(value, dict) or set(value) != set(expected):
-        raise LedgerError(f"{label} must contain exactly {sorted(expected)}")
-    return value
-
-
-def _validate_activation_approval_manifest(
-    data: bytes, *, runtime_source_commit: str
-) -> dict[str, Any]:
-    """Validate the exact, content-addressed operator approval contract."""
-
-    detectors = secret_detectors(data)
-    if detectors:
-        raise LedgerError(
-            "activation approval manifest rejected by secret preflight: "
-            + ",".join(detectors)
-        )
-    try:
-        decoded_manifest = strict_json_loads(data)
-    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
-        raise LedgerError(
-            "activation approval manifest is not valid strict JSON"
-        ) from exc
-    manifest = _require_exact_keys(
-        decoded_manifest,
-        {"schemaVersion", "runtimeSourceCommit", "approvals", "evidence"},
-        "activation approval manifest",
-    )
-    if manifest["schemaVersion"] != 1:
-        raise LedgerError("activation approval manifest schemaVersion must be 1")
-    if manifest["runtimeSourceCommit"] != runtime_source_commit:
-        raise LedgerError(
-            "activation approval manifest runtimeSourceCommit does not match activation"
-        )
-    approvals = _require_exact_keys(
-        manifest["approvals"], _ACTIVATION_CONTROL_KEYS, "activation approvals"
-    )
-    evidence = _require_exact_keys(
-        manifest["evidence"], _ACTIVATION_CONTROL_KEYS, "activation evidence"
-    )
-    for control in sorted(_ACTIVATION_CONTROL_KEYS):
-        if approvals[control] != "APPROVED":
-            raise LedgerError(
-                f"activation approval for {control} must be exactly APPROVED"
-            )
-        evidence_item = _require_exact_keys(
-            evidence[control],
-            {"status", "evidenceRef"},
-            f"activation evidence for {control}",
-        )
-        if evidence_item["status"] != "VERIFIED":
-            raise LedgerError(
-                f"activation evidence status for {control} must be exactly VERIFIED"
-            )
-        evidence_ref = evidence_item["evidenceRef"]
-        if not isinstance(evidence_ref, str) or not evidence_ref.strip():
-            raise LedgerError(
-                f"activation evidenceRef for {control} must be non-empty text"
-            )
-        normalized_ref = " ".join(
-            evidence_ref.strip().lower().replace("_", " ").replace("-", " ").split()
-        )
-        if normalized_ref in _NEGATIVE_EVIDENCE_REFS:
-            raise LedgerError(
-                f"activation evidenceRef for {control} is a negative sentinel"
-            )
-    return manifest
-
-
-def _verify_activation_manifest(
-    spec: dict[str, Any], *, manifest_file: str, artifact_root: str
-) -> None:
-    ref = spec.get("approvalManifest")
-    if not isinstance(ref, dict):
-        raise LedgerError("live capture activation requires approvalManifest in its spec")
-    data = Path(manifest_file).read_bytes()
-    normalized = ArtifactStore(artifact_root).verify(ref)
-    if (
-        len(data) != normalized["bytes"]
-        or hashlib.sha256(data).hexdigest() != normalized["sha256"]
-    ):
-        raise LedgerError(
-            "approval manifest file does not match the content-addressed artifact"
-        )
-    _validate_activation_approval_manifest(
-        data, runtime_source_commit=spec.get("runtimeSourceCommit")
-    )
 
 
 def _named_file_bytes(values: list[str], label: str) -> dict[str, bytes]:
@@ -692,8 +566,9 @@ def command_capture_activate(args: argparse.Namespace) -> int:
     live = _is_live_write_path(args.log)
     if live:
         installed_commit = getattr(args, "_runtime_source_commit", None)
+        installed_source_sha256 = getattr(args, "_runtime_source_sha256", None)
         installed_root = getattr(args, "_runtime_source_root", None)
-        if not installed_commit or not installed_root:
+        if not installed_commit or not installed_source_sha256 or not installed_root:
             raise LedgerError(
                 "live capture activation must run through the installed source-pinned wrapper"
             )
@@ -710,38 +585,47 @@ def command_capture_activate(args: argparse.Namespace) -> int:
             raise LedgerError(
                 "capture activation runtimeSourceCommit does not match installed runtime pin"
             )
+        if spec.get("runtimeSourceSha256") != installed_source_sha256:
+            raise LedgerError(
+                "capture activation runtimeSourceSha256 does not match installed runtime pin"
+            )
         if not args.approval_manifest_file or not args.artifact_root:
             raise LedgerError(
                 "live capture activation requires --approval-manifest-file and --artifact-root"
             )
-        _verify_activation_manifest(
-            spec,
-            manifest_file=args.approval_manifest_file,
-            artifact_root=args.artifact_root,
-        )
-        raise LedgerError(
-            "live capture activation is blocked: " + ", ".join(_ACTIVATION_BLOCKERS)
-        )
+        expected_commit = installed_commit
+        expected_source_sha256 = installed_source_sha256
     elif args.approval_manifest_file or args.artifact_root:
         if not args.approval_manifest_file or not args.artifact_root:
             raise LedgerError(
                 "manifest verification requires both --approval-manifest-file and --artifact-root"
             )
-        _verify_activation_manifest(
-            spec,
-            manifest_file=args.approval_manifest_file,
-            artifact_root=args.artifact_root,
-        )
+        expected_commit = spec.get("runtimeSourceCommit")
+        expected_source_sha256 = spec.get("runtimeSourceSha256")
     escrows_before = _transaction_escrow_paths(args.log)
-    row = append_capture_activation(
-        args.log,
-        spec,
-        coordination_lock=args.coordination_lock,
-    )
+    if args.approval_manifest_file and args.artifact_root:
+        manifest_data = Path(args.approval_manifest_file).read_bytes()
+        row, evidence = append_evidence_bound_capture_activation(
+            args.log,
+            spec,
+            manifest_data=manifest_data,
+            artifact_store=ArtifactStore(args.artifact_root),
+            expected_runtime_commit=expected_commit,
+            expected_source_sha256=expected_source_sha256,
+            coordination_lock=args.coordination_lock,
+        )
+    else:
+        row = append_capture_activation(
+            args.log,
+            spec,
+            coordination_lock=args.coordination_lock,
+        )
+        evidence = None
     print(
         json.dumps(
             {
                 "activationId": row["activationId"],
+                "activationEvidence": evidence,
                 "transactionEscrows": _new_transaction_escrows(
                     escrows_before, args.log
                 ),
@@ -750,6 +634,32 @@ def command_capture_activate(args: argparse.Namespace) -> int:
         )
     )
     return 0
+
+
+def command_activation_readiness(args: argparse.Namespace) -> int:
+    expected_commit = (
+        args.runtime_source_commit
+        or getattr(args, "_runtime_source_commit", None)
+    )
+    expected_source_sha256 = (
+        args.runtime_source_sha256
+        or getattr(args, "_runtime_source_sha256", None)
+    )
+    if not expected_commit or not expected_source_sha256:
+        raise LedgerError(
+            "activation readiness requires authenticated or explicit runtime source bindings"
+        )
+    evaluated_at = args.at or _now()
+    result = evaluate_activation_evidence(
+        Path(args.manifest_file).read_bytes(),
+        reader=ArtifactStore(args.artifact_root),
+        expected_runtime_commit=expected_commit,
+        expected_source_sha256=expected_source_sha256,
+        activation_time=evaluated_at,
+        as_of=evaluated_at,
+    )
+    print(json.dumps(result, sort_keys=True))
+    return 0 if result.get("appendReady") is True else 1
 
 
 def command_capture_initiate(args: argparse.Namespace) -> int:
@@ -1122,6 +1032,14 @@ def build_parser() -> argparse.ArgumentParser:
     coordinated(activate, anchor_field="log", context_fields=("log",))
     activate.set_defaults(func=command_capture_activate)
 
+    readiness = sub.add_parser("activation-readiness")
+    readiness.add_argument("--manifest-file", required=True)
+    readiness.add_argument("--artifact-root", required=True)
+    readiness.add_argument("--runtime-source-commit")
+    readiness.add_argument("--runtime-source-sha256")
+    readiness.add_argument("--at")
+    readiness.set_defaults(func=command_activation_readiness)
+
     initiate = sub.add_parser("capture-initiate")
     initiate.add_argument("--log", default=DEFAULT_LOG)
     initiate.add_argument("--activation-id", required=True)
@@ -1217,11 +1135,13 @@ def build_parser() -> argparse.ArgumentParser:
 def main(
     *,
     runtime_source_commit: str | None = None,
+    runtime_source_sha256: str | None = None,
     runtime_source_root: str | Path | None = None,
 ) -> int:
     parser = build_parser()
     args = parser.parse_args()
     args._runtime_source_commit = runtime_source_commit
+    args._runtime_source_sha256 = runtime_source_sha256
     args._runtime_source_root = runtime_source_root
     try:
         _resolve_coordination_lock(args)

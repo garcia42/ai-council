@@ -15,8 +15,10 @@ import os
 import stat
 import uuid
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, Iterable, Iterator, Mapping
+from types import MappingProxyType
+from typing import Any, Iterable, Iterator, Mapping, Sequence
 
 from .safe_files import (
     DirectoryIdentity,
@@ -81,6 +83,43 @@ class SnapshotWriteError(EvidenceBackupError):
 
 class RestoreError(EvidenceBackupError):
     """A clean restore target could not be created and verified."""
+
+
+@dataclass(frozen=True)
+class VerifiedSnapshotMember:
+    """One immutable member read from descriptor-custodied snapshot state."""
+
+    relative_path: str
+    kind: str
+    mode: int
+    content: bytes = b""
+
+    @property
+    def size(self) -> int:
+        return len(self.content)
+
+    @property
+    def sha256(self) -> str:
+        return hashlib.sha256(self.content).hexdigest()
+
+
+@dataclass(frozen=True)
+class VerifiedSnapshotExport:
+    """A complete local snapshot materialized while descriptors stayed pinned."""
+
+    verification: Mapping[str, Any]
+    members: Sequence[VerifiedSnapshotMember]
+
+
+@dataclass
+class _PinnedExportMember:
+    relative_path: str
+    name: str
+    parent_fd: int
+    descriptor: int
+    item: os.stat_result
+    kind: str
+    children: tuple[str, ...]
 
 
 def _error(
@@ -1354,6 +1393,283 @@ def verify_evidence_snapshot(
     root = _path(snapshot_root, "snapshot_root", error_type=SnapshotIntegrityError)
     manifest, digest = _load_verified_snapshot(root)
     return _verification_result(manifest, digest)
+
+
+def _pin_snapshot_export_members(
+    directory_fd: int,
+    *,
+    prefix: str = "",
+    _members: list[_PinnedExportMember] | None = None,
+) -> list[_PinnedExportMember]:
+    owns_inventory = _members is None
+    members = [] if _members is None else _members
+    try:
+        names = tuple(sorted(os.listdir(directory_fd), key=os.fsencode))
+        for name in names:
+            if name in {".", ".."} or os.sep in name or "\x00" in name:
+                raise SnapshotIntegrityError("path-traversal", "snapshot-export")
+            item = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            if stat.S_ISREG(item.st_mode):
+                if item.st_nlink != 1:
+                    raise SnapshotIntegrityError(
+                        "hard-link-alias", "snapshot-export", name
+                    )
+                kind = "file"
+                flags = os.O_RDONLY | os.O_CLOEXEC | _NOFOLLOW
+            elif stat.S_ISDIR(item.st_mode):
+                kind = "directory"
+                flags = _DIRECTORY_FLAGS
+            elif stat.S_ISLNK(item.st_mode):
+                raise SnapshotIntegrityError("symlink-alias", "snapshot-export", name)
+            else:
+                raise SnapshotIntegrityError("special-file", "snapshot-export", name)
+            descriptor = os.open(name, flags, dir_fd=directory_fd)
+            retained = False
+            try:
+                opened = os.fstat(descriptor)
+                named_after = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                if not _same_stat(item, opened) or not _same_stat(opened, named_after):
+                    raise SnapshotIntegrityError(
+                        "snapshot-changed", "snapshot-export", name
+                    )
+                relative = name if not prefix else f"{prefix}/{name}"
+                child_names = (
+                    tuple(sorted(os.listdir(descriptor), key=os.fsencode))
+                    if kind == "directory"
+                    else ()
+                )
+                members.append(
+                    _PinnedExportMember(
+                        relative_path=relative,
+                        name=name,
+                        parent_fd=directory_fd,
+                        descriptor=descriptor,
+                        item=opened,
+                        kind=kind,
+                        children=child_names,
+                    )
+                )
+                retained = True
+                if kind == "directory":
+                    _pin_snapshot_export_members(
+                        descriptor,
+                        prefix=relative,
+                        _members=members,
+                    )
+                    if (
+                        tuple(sorted(os.listdir(descriptor), key=os.fsencode))
+                        != child_names
+                        or not _same_stat(opened, os.fstat(descriptor))
+                    ):
+                        raise SnapshotIntegrityError(
+                            "snapshot-changed", "snapshot-export", relative
+                        )
+            finally:
+                if not retained:
+                    os.close(descriptor)
+        if tuple(sorted(os.listdir(directory_fd), key=os.fsencode)) != names:
+            raise SnapshotIntegrityError(
+                "snapshot-changed", "snapshot-export", prefix or "snapshot root"
+            )
+        return members
+    except BaseException:
+        if owns_inventory:
+            for member in reversed(members):
+                os.close(member.descriptor)
+        raise
+
+
+def _read_pinned_export_file(member: _PinnedExportMember) -> bytes:
+    os.lseek(member.descriptor, 0, os.SEEK_SET)
+    chunks: list[bytes] = []
+    while True:
+        chunk = os.read(member.descriptor, _READ_CHUNK)
+        if not chunk:
+            break
+        chunks.append(chunk)
+    os.lseek(member.descriptor, 0, os.SEEK_SET)
+    content = b"".join(chunks)
+    if (
+        not _same_stat(member.item, os.fstat(member.descriptor))
+        or len(content) != member.item.st_size
+    ):
+        raise SnapshotIntegrityError(
+            "snapshot-changed", "snapshot-export", member.relative_path
+        )
+    return content
+
+
+def _materialize_pinned_snapshot_export(
+    members: Sequence[_PinnedExportMember],
+) -> tuple[VerifiedSnapshotMember, ...]:
+    exported = []
+    for member in members:
+        content = b"" if member.kind == "directory" else _read_pinned_export_file(member)
+        exported.append(
+            VerifiedSnapshotMember(
+                relative_path=member.relative_path,
+                kind=member.kind,
+                mode=stat.S_IMODE(member.item.st_mode),
+                content=content,
+            )
+        )
+    return tuple(sorted(exported, key=lambda item: item.relative_path))
+
+
+def _revalidate_pinned_snapshot_export(
+    parent: PinnedParent,
+    root_fd: int,
+    root_item: os.stat_result,
+    root_names: tuple[str, ...],
+    members: Sequence[_PinnedExportMember],
+    exported: Sequence[VerifiedSnapshotMember],
+) -> None:
+    try:
+        revalidate_pinned_parent(parent)
+    except SafeFileError as exc:
+        raise SnapshotIntegrityError(
+            "snapshot-changed", "snapshot-export", "snapshot parent"
+        ) from exc
+    named_root = os.stat(
+        parent.name,
+        dir_fd=parent.descriptor,
+        follow_symlinks=False,
+    )
+    if (
+        not _same_stat(root_item, os.fstat(root_fd))
+        or not _same_stat(root_item, named_root)
+        or tuple(sorted(os.listdir(root_fd), key=os.fsencode)) != root_names
+    ):
+        raise SnapshotIntegrityError(
+            "snapshot-changed", "snapshot-export", "snapshot root"
+        )
+    exported_by_path = {item.relative_path: item for item in exported}
+    if len(exported_by_path) != len(members):
+        raise SnapshotIntegrityError(
+            "snapshot-changed", "snapshot-export", "member inventory"
+        )
+    for member in members:
+        named = os.stat(
+            member.name,
+            dir_fd=member.parent_fd,
+            follow_symlinks=False,
+        )
+        if (
+            not _same_stat(member.item, os.fstat(member.descriptor))
+            or not _same_stat(member.item, named)
+        ):
+            raise SnapshotIntegrityError(
+                "snapshot-changed", "snapshot-export", member.relative_path
+            )
+        if member.kind == "directory":
+            if (
+                tuple(sorted(os.listdir(member.descriptor), key=os.fsencode))
+                != member.children
+            ):
+                raise SnapshotIntegrityError(
+                    "snapshot-changed", "snapshot-export", member.relative_path
+                )
+        else:
+            expected = exported_by_path.get(member.relative_path)
+            if expected is None or _read_pinned_export_file(member) != expected.content:
+                raise SnapshotIntegrityError(
+                    "snapshot-changed", "snapshot-export", member.relative_path
+                )
+
+
+def export_verified_evidence_snapshot(
+    snapshot_root: str | os.PathLike[str],
+) -> VerifiedSnapshotExport:
+    """Materialize an authenticated snapshot without releasing descriptor custody.
+
+    Every byte is read from a descriptor pinned before verification.  The
+    snapshot root, all member names, member metadata, directory membership,
+    and file bytes are revalidated after the existing manifest verifier and
+    immediately before the immutable result is returned.
+    """
+
+    root = _path(snapshot_root, "snapshot_root", error_type=SnapshotIntegrityError)
+    members: list[_PinnedExportMember] = []
+    try:
+        with pinned_parent(root, create_parents=False) as parent:
+            try:
+                root_item = os.stat(
+                    parent.name,
+                    dir_fd=parent.descriptor,
+                    follow_symlinks=False,
+                )
+                if not stat.S_ISDIR(root_item.st_mode):
+                    raise SnapshotIntegrityError(
+                        "wrong-source-type", "snapshot-export", "snapshot root"
+                    )
+                root_fd = os.open(
+                    parent.name,
+                    _DIRECTORY_FLAGS,
+                    dir_fd=parent.descriptor,
+                )
+            except FileNotFoundError:
+                raise SnapshotIntegrityError(
+                    "path-missing", "snapshot-export", "snapshot root"
+                ) from None
+            try:
+                opened_root = os.fstat(root_fd)
+                named_after = os.stat(
+                    parent.name,
+                    dir_fd=parent.descriptor,
+                    follow_symlinks=False,
+                )
+                if not _same_stat(root_item, opened_root) or not _same_stat(
+                    opened_root, named_after
+                ):
+                    raise SnapshotIntegrityError(
+                        "snapshot-changed", "snapshot-export", "snapshot root"
+                    )
+                root_item = opened_root
+                root_names = tuple(sorted(os.listdir(root_fd), key=os.fsencode))
+                members = _pin_snapshot_export_members(root_fd)
+                manifest, digest = _load_verified_snapshot_fd(root_fd)
+                exported = _materialize_pinned_snapshot_export(members)
+                _revalidate_pinned_snapshot_export(
+                    parent,
+                    root_fd,
+                    root_item,
+                    root_names,
+                    members,
+                    exported,
+                )
+                final_manifest, final_digest = _load_verified_snapshot_fd(root_fd)
+                if final_manifest != manifest or final_digest != digest:
+                    raise SnapshotIntegrityError(
+                        "snapshot-changed", "snapshot-export", "manifest"
+                    )
+                _revalidate_pinned_snapshot_export(
+                    parent,
+                    root_fd,
+                    root_item,
+                    root_names,
+                    members,
+                    exported,
+                )
+                return VerifiedSnapshotExport(
+                    verification=MappingProxyType(
+                        _verification_result(manifest, digest)
+                    ),
+                    members=exported,
+                )
+            finally:
+                for member in reversed(members):
+                    os.close(member.descriptor)
+                os.close(root_fd)
+    except SnapshotIntegrityError:
+        raise
+    except SafeFileError as exc:
+        raise SnapshotIntegrityError(
+            "unsafe-path-component", "snapshot-export"
+        ) from exc
+    except OSError as exc:
+        raise SnapshotIntegrityError(
+            "snapshot-changed", "snapshot-export", exc.__class__.__name__
+        ) from None
 
 
 def _stat_at(parent_fd: int, name: str) -> os.stat_result | None:

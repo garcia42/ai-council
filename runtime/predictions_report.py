@@ -137,6 +137,7 @@ if __name__ == "__main__":
     raise SystemExit(
         main(
             runtime_source_commit=EXPECTED_COMMIT,
+            runtime_source_sha256=EXPECTED_SOURCE_SHA256,
             runtime_source_root=SOURCE_ROOT,
         )
     )

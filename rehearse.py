@@ -164,6 +164,9 @@ def rehearse(source_root: Path, *, today: str) -> dict:
             "tests.test_findings",
             "tests.test_data_health",
             "tests.test_evidence_backup",
+            "tests.test_finding_audit",
+            "tests.test_offhost_durability",
+            "tests.test_activation_evidence",
             "tests.test_capture_integration",
             "tests.test_install",
             "tests.test_legacy_report",
@@ -474,6 +477,7 @@ def rehearse(source_root: Path, *, today: str) -> dict:
             capture_output=True,
             check=True,
         ).stdout.strip()
+        runtime_source_sha256 = install._source_digest(staged_source)
 
         activation_spec = stage_root / "v2-activation.json"
         activation_spec.write_text(
@@ -482,6 +486,7 @@ def rehearse(source_root: Path, *, today: str) -> dict:
                     "cohortName": "copied-runtime-v2-rehearsal",
                     "captureVersion": "capture-v2.0.0",
                     "runtimeSourceCommit": runtime_commit,
+                    "runtimeSourceSha256": runtime_source_sha256,
                     "artifactRootPolicy": "private-content-addressed-v1",
                 }
             ),
@@ -642,6 +647,7 @@ def rehearse(source_root: Path, *, today: str) -> dict:
                 (
                     "seatId=blind",
                     f"commit={runtime_commit}",
+                    f"source-sha256={runtime_source_sha256}",
                     f"blob={baseline_blob}",
                     f"sha256={baseline_ref['sha256']}",
                     forecast_request_binding,

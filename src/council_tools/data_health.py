@@ -40,6 +40,7 @@ INVALID_V2_RECORD_KIND = "invalid-v2-record"
 RECOGNIZED_RECORD_KINDS = V2_PRIMARY_KINDS | {
     "capture-activation",
     "capture-invalidation",
+    "finding-audit-case-v2",
     "council-seats-finished",
     "grading-debt-override",
     "outcome-resolution",
@@ -1590,6 +1591,7 @@ def analyze_capture_data(
     resolution_events: Iterable[Mapping[str, Any]] = (),
     artifact_integrity: ArtifactIntegrity | None = None,
     finding_summaries: Mapping[str, Mapping[str, Any]] | None = None,
+    activation_evidence: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return a deterministic, capture-only report for the frozen first-ten cohort.
 
@@ -1770,6 +1772,43 @@ def analyze_capture_data(
         if completion_count and (rejection_reasons or schema_invalid_completion):
             rejected_completions += completion_count
 
+    audit_assignments = {
+        (row.get("activationId"), row.get("decisionFamilyId")): row.get(
+            "auditAssignment"
+        )
+        for row in parsed_rows
+        if row.get("kind") == "council-attempt-v2"
+        and "_captureSchemaError" not in row
+        and isinstance(row.get("auditAssignment"), Mapping)
+    }
+    selected_audit_families = {
+        family
+        for family, assignment in audit_assignments.items()
+        if assignment.get("selected") is True
+    }
+    audit_cases = [
+        row
+        for row in parsed_rows
+        if row.get("kind") == "finding-audit-case-v2"
+        and "_captureSchemaError" not in row
+    ]
+    evidence_ready = bool(
+        isinstance(activation_evidence, Mapping)
+        and activation_evidence.get("activationVerdict", {}).get("ready") is True
+    )
+    current_healthy = bool(
+        isinstance(activation_evidence, Mapping)
+        and activation_evidence.get("currentHealth", {}).get("healthy") is True
+    )
+    evidence_blockers = (
+        list(activation_evidence.get("blockers", []))
+        if isinstance(activation_evidence, Mapping)
+        else [
+            "prospective-audit-not-implemented",
+            "durability-evidence-not-supplied",
+        ]
+    )
+
     result = {
         "reportKind": "council-capture-data-health",
         "captureOnly": True,
@@ -1839,26 +1878,35 @@ def analyze_capture_data(
             cohort, states, finding_summaries, analysis_states
         ),
         "prospectiveAudit": {
-            "status": "NOT_IMPLEMENTED",
-            "activationBlocking": True,
+            "status": "PROTOCOL_READY" if evidence_ready else "NOT_IMPLEMENTED",
+            "activationBlocking": not evidence_ready,
             "samplingRule": "one in five eligible decision families",
-            "independentSeatAnonymizedRegrouping": False,
-            "omittedActionableClaimReview": False,
-            "agreementReported": False,
+            "independentSeatAnonymizedRegrouping": evidence_ready,
+            "omittedActionableClaimReview": evidence_ready,
+            "agreementReported": evidence_ready,
+            "assignedFamilyCount": len(audit_assignments),
+            "selectedFamilyCount": len(selected_audit_families),
+            "auditCaseCount": len(audit_cases),
+            "actualProspectiveCountsBackfilled": False,
         },
         "durability": {
-            "status": "NOT_SUPPLIED",
-            "activationBlocking": True,
+            "status": "HEALTHY" if current_healthy else "NOT_SUPPLIED",
+            "activationBlocking": not current_healthy,
             "snapshotAgeSeconds": None,
             "lastVerifiedRestoreAt": None,
             "offHostReadbackVerifiedAt": None,
+            "historicallyValidAtActivation": evidence_ready,
+            "currentBlockers": (
+                list(activation_evidence.get("currentHealth", {}).get("blockers", []))
+                if isinstance(activation_evidence, Mapping)
+                else ["durability-evidence-not-supplied"]
+            ),
         },
         "activationReadiness": {
-            "status": "BLOCKED",
-            "blockingReasons": [
-                "prospective-audit-not-implemented",
-                "durability-evidence-not-supplied",
-            ],
+            "status": "READY" if evidence_ready and current_healthy else "BLOCKED",
+            "blockingReasons": evidence_blockers,
+            "historicallyReady": evidence_ready,
+            "currentlyHealthy": current_healthy,
         },
     }
     result.update(

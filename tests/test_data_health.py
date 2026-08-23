@@ -30,6 +30,7 @@ def activation():
         "cohortName": "first-ten",
         "captureVersion": "2",
         "runtimeSourceCommit": "abc123",
+        "runtimeSourceSha256": "a" * 64,
         "artifactRootPolicy": "private-content-addressed",
     }
 
@@ -1605,6 +1606,20 @@ class DataHealthTest(unittest.TestCase):
         self.assertEqual(first["durability"]["status"], "NOT_SUPPLIED")
         self.assertTrue(first["durability"]["activationBlocking"])
         self.assertEqual(first["activationReadiness"]["status"], "BLOCKED")
+
+    def test_verified_activation_evidence_separates_historical_and_current_health(self):
+        evidence = {
+            "appendReady": True,
+            "blockers": [],
+            "activationVerdict": {"ready": True, "blockers": []},
+            "currentHealth": {"healthy": True, "blockers": []},
+        }
+        report = self.report([activation()], activation_evidence=evidence)
+        self.assertEqual(report["prospectiveAudit"]["status"], "PROTOCOL_READY")
+        self.assertFalse(report["prospectiveAudit"]["activationBlocking"])
+        self.assertEqual(report["durability"]["status"], "HEALTHY")
+        self.assertTrue(report["durability"]["historicallyValidAtActivation"])
+        self.assertEqual(report["activationReadiness"]["status"], "READY")
 
 
 if __name__ == "__main__":

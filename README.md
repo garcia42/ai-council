@@ -18,10 +18,10 @@ problems—or are they correlated copies producing expensive reassurance?
 | V2 core lifecycle, exact custody, and finding capture | Implemented and tested |
 | V2 integrity-aware capture health and exogenous-only Brier | Implemented; not activated |
 | Bounded Codex runs, stuck detection, and durable handoffs | Implemented; repository hook plus portable plugin |
-| One-in-five independent finding audit | **Not implemented; activation blocker** |
-| Off-host durability age and verified-restore evidence | **Not supplied; activation blocker** |
+| One-in-five independent finding audit | Implemented and tested; prospective counts begin only after activation |
+| Off-host durability age and verified-restore evidence | Implemented and evidence-gated |
 | Content-manifested local snapshot and clean restore | Rehearsal-only |
-| Live V2 capture activation | **Disabled in this release by audit and durability blockers** |
+| Live V2 capture activation | Evidence-gated; not activated by install or this release |
 | Seat ranking, weighting, admission, or retirement | Deliberately not implemented |
 
 Installing this repository does not activate V2 on a live ledger. The first prospective cohort is
@@ -272,10 +272,33 @@ python -m council_tools.cli evidence-restore \
   --repository-root "$PWD"
 ```
 
-A passing local snapshot is **not** proof of off-host backup. Live V2 activation is disabled in
-this release even with a valid content-addressed approval manifest. The independent audit
-implementation and off-host durability evidence remain hardcoded blockers; activation attempts
-append nothing until a later reviewed release implements and rehearses those controls.
+A passing local snapshot is **not** proof of off-host backup. The off-host rehearsal uploads each
+verified snapshot member with create-only semantics, records its exact object generation, uploads
+the index last, reads those exact generations into a clean tree, and verifies a second clean
+restore. Its certificate is useful only while its source, policy, snapshot, restore, and freshness
+bindings still pass.
+
+Live V2 activation now uses a fail-closed evidence gate rather than unconditional blocker strings.
+The version-2 manifest must bind the installed commit and source digest to the frozen activation,
+audit, and durability policies and to valid source-bound rehearsal certificates. The verifier
+dereferences every artifact and recomputes freshness, RPO/RTO, provider posture, and restore
+integrity at the final locked append boundary. Missing, stale, mismatched, or unrehearsed evidence
+appends nothing. Check a candidate manifest without activating anything:
+
+```sh
+python -m council_tools.cli activation-readiness \
+  --manifest-file /absolute/private/activation-manifest.json \
+  --artifact-root /absolute/private/artifacts \
+  --runtime-source-commit <installed-commit> \
+  --runtime-source-sha256 <installed-source-digest>
+```
+
+The one-in-five audit assignment is deterministic and persisted before seats launch. Retries
+inherit the family assignment. A selected family's first complete run creates a blinded case and a
+separately retained alias map; these audit records never enter lifecycle or Brier denominators.
+Two independent adjudicators and the frozen agreement rules are required before audit results can
+support any later seat gate. Zero actual audit cases before live activation is expected and cannot
+be backfilled from old runs.
 
 ## What the reports may—and may not—say
 
@@ -305,6 +328,10 @@ adjudication and statistical rules.
 | `src/council_tools/findings.py` | Atomic findings, dispositions, and non-causal summaries |
 | `src/council_tools/data_health.py` | Frozen first-ten capture and outcome report |
 | `src/council_tools/evidence_backup.py` | Manifested local snapshot, verification, and clean restore |
+| `src/council_tools/finding_audit.py` | Prospective one-in-five audit assignment, blinding, and rehearsal |
+| `src/council_tools/offhost_durability.py` | Generation-pinned off-host readback and clean-restore rehearsal |
+| `src/council_tools/gcs_durability.py` | Narrow create-only Google Cloud Storage adapter |
+| `src/council_tools/activation_evidence.py` | Source-bound manifest validation and activation readiness evaluation |
 | `src/council_tools/capture_runtime.py` | Cross-module atomic integration and uniform-binding preflight |
 | `src/council_tools/cli.py` | Standalone and deployment command-line interface |
 | `runtime/` | Pinned Claude-based runtime adapter and operating contract |

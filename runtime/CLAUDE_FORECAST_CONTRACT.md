@@ -43,9 +43,16 @@ or issuance on or after the outcome resolution date. The same object contains a 
 `findings` list with the exact seven seat-owned fields; operator grouping and dispositions remain
 separate and cannot invent, delete, or alter a seat finding.
 
-Live `capture-activation` is disabled in this release. The command requires the installed source
-pin and a content-addressed approval manifest, then still fails on hardcoded one-in-five audit and
-off-host durability blockers and appends nothing. Local `evidence-snapshot`, `evidence-verify`, and
-`evidence-restore` results are explicitly rehearsal-only. Continue the V1 council contract above
-and use V2 only in copied or explicit non-live stores until a later reviewed release implements and
-rehearses both controls.
+Live `capture-activation` is evidence-gated and is never implied by installation. The command
+requires the installed commit and source digest plus a version-2, content-addressed approval
+manifest. While holding the evidence lock and pinned ledger transaction, it dereferences and
+revalidates the frozen audit and durability policies and their source-bound rehearsal certificates;
+missing, stale, mismatched, or unrehearsed evidence appends nothing. Local `evidence-snapshot`,
+`evidence-verify`, and `evidence-restore` results remain rehearsal-only and are not off-host proof.
+
+For governed V2 activations, every first decision-family attempt persists its deterministic
+one-in-five audit assignment before seats launch, and retries inherit that assignment. A selected
+family's first complete run emits a blinded finding-audit case plus a separately retained alias
+map. Audit rows do not alter lifecycle or Brier denominators. Installation and rehearsal do not
+activate V2; use copied or explicit non-live stores unless the principal separately authorizes a
+manifest that passes `activation-readiness` at the append boundary.

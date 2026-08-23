@@ -24,6 +24,7 @@ from council_tools.evidence_backup import (
     SnapshotIntegrityError,
     SnapshotPolicyError,
     create_evidence_snapshot,
+    export_verified_evidence_snapshot,
     restore_evidence_snapshot,
     verify_evidence_snapshot,
 )
@@ -140,6 +141,121 @@ class EvidenceBackupTest(unittest.TestCase):
             ),
             0o400,
         )
+
+    def test_verified_export_returns_exact_descriptor_custodied_members(self):
+        snapshot = self.base / "snapshot-export"
+        created = self.create(snapshot)
+
+        exported = export_verified_evidence_snapshot(snapshot)
+
+        self.assertEqual(dict(exported.verification), created)
+        paths = [member.relative_path for member in exported.members]
+        self.assertEqual(paths, sorted(paths))
+        self.assertEqual(len(paths), len(set(paths)))
+        by_path = {member.relative_path: member for member in exported.members}
+        self.assertEqual(by_path[MANIFEST_NAME].content, (snapshot / MANIFEST_NAME).read_bytes())
+        self.assertEqual(
+            by_path[f"{PAYLOAD_NAME}/ledger"].content,
+            self.ledger.read_bytes(),
+        )
+        self.assertEqual(
+            by_path[f"{PAYLOAD_NAME}/artifact-root/sha256/aa/answer.bin"].content,
+            b"exact visible answer",
+        )
+        self.assertEqual(by_path[PAYLOAD_NAME].kind, "directory")
+        self.assertEqual(by_path[PAYLOAD_NAME].content, b"")
+        for member in exported.members:
+            self.assertEqual(member.size, len(member.content))
+            self.assertEqual(
+                member.sha256,
+                hashlib.sha256(member.content).hexdigest(),
+            )
+
+    def test_verified_export_rejects_snapshot_root_replacement(self):
+        snapshot = self.base / "snapshot-export-root-swap"
+        self.create(snapshot)
+        displaced = self.base / "snapshot-export-root-original"
+        real_load = evidence_backup._load_verified_snapshot_fd
+        swapped = False
+
+        def verify_then_replace_root(root_fd):
+            nonlocal swapped
+            result = real_load(root_fd)
+            if not swapped:
+                snapshot.rename(displaced)
+                snapshot.mkdir(mode=0o700)
+                swapped = True
+            return result
+
+        with mock.patch.object(
+            evidence_backup,
+            "_load_verified_snapshot_fd",
+            side_effect=verify_then_replace_root,
+        ):
+            with self.assertRaises(SnapshotIntegrityError) as caught:
+                export_verified_evidence_snapshot(snapshot)
+
+        self.assertTrue(swapped)
+        self.assertEqual(caught.exception.code, "snapshot-changed")
+        self.assertEqual(list(snapshot.iterdir()), [])
+        self.assertTrue((displaced / COMPLETION_NAME).is_file())
+
+    def test_verified_export_rejects_member_name_replacement(self):
+        snapshot = self.base / "snapshot-export-member-swap"
+        self.create(snapshot)
+        target = snapshot / PAYLOAD_NAME / "ledger"
+        displaced = target.with_name("ledger.original")
+        original = target.read_bytes()
+        real_materialize = evidence_backup._materialize_pinned_snapshot_export
+
+        def materialize_then_replace(members):
+            result = real_materialize(members)
+            target.rename(displaced)
+            target.write_bytes(original)
+            os.chmod(target, 0o600)
+            return result
+
+        with mock.patch.object(
+            evidence_backup,
+            "_materialize_pinned_snapshot_export",
+            side_effect=materialize_then_replace,
+        ):
+            with self.assertRaises(SnapshotIntegrityError) as caught:
+                export_verified_evidence_snapshot(snapshot)
+
+        self.assertEqual(caught.exception.code, "snapshot-changed")
+        self.assertEqual(target.read_bytes(), original)
+        self.assertEqual(displaced.read_bytes(), original)
+        self.assertNotEqual(target.stat().st_ino, displaced.stat().st_ino)
+
+    def test_verified_export_rejects_same_inode_member_mutation(self):
+        snapshot = self.base / "snapshot-export-member-mutation"
+        self.create(snapshot)
+        target = snapshot / PAYLOAD_NAME / "ledger"
+        substitute = b'{"kind":"same-inode-substitute"}\n'
+        original_identity = (target.stat().st_dev, target.stat().st_ino)
+        real_materialize = evidence_backup._materialize_pinned_snapshot_export
+
+        def materialize_then_mutate(members):
+            result = real_materialize(members)
+            target.write_bytes(substitute)
+            os.chmod(target, 0o600)
+            self.assertEqual(
+                (target.stat().st_dev, target.stat().st_ino),
+                original_identity,
+            )
+            return result
+
+        with mock.patch.object(
+            evidence_backup,
+            "_materialize_pinned_snapshot_export",
+            side_effect=materialize_then_mutate,
+        ):
+            with self.assertRaises(SnapshotIntegrityError) as caught:
+                export_verified_evidence_snapshot(snapshot)
+
+        self.assertEqual(caught.exception.code, "snapshot-changed")
+        self.assertEqual(target.read_bytes(), substitute)
 
     def test_snapshot_fsyncs_files_and_directories_before_completion(self):
         synced_types = []

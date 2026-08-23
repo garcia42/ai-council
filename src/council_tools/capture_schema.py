@@ -18,7 +18,6 @@ from copy import deepcopy
 from datetime import date, datetime, timezone
 from typing import Any
 
-
 SCHEMA_VERSION = 2
 V1_SCHEMA_VERSION = 1
 
@@ -29,6 +28,7 @@ V2_KINDS = (
     "council-seats-finished",
     "council-v2",
     "capture-invalidation",
+    "finding-audit-case-v2",
 )
 V1_KINDS = {
     "council-attempt",
@@ -117,6 +117,31 @@ _SYSTEM_TIME_KEYS = {
     "invalidatedAt",
     "ts",
 }
+_AUDIT_PROTOCOL_KEYS = {
+    "kind",
+    "schemaVersion",
+    "protocolVersion",
+    "frozenProtocolArtifact",
+    "selection",
+    "adjudication",
+    "prospective",
+}
+_AUDIT_ASSIGNMENT_KEYS = {
+    "kind",
+    "schemaVersion",
+    "activationId",
+    "decisionFamilyId",
+    "firstRunId",
+    "protocolVersion",
+    "protocolSha256",
+    "assignedAt",
+    "selectionDigest",
+    "bucket",
+    "selected",
+    "assignmentState",
+    "provenance",
+}
+_AUDIT_SELECTION_DOMAIN = "ai-council/finding-audit-assignment/v1"
 
 
 class CaptureSchemaError(ValueError):
@@ -392,6 +417,124 @@ def _validate_artifact_ref(value: Any, field: str) -> None:
     first, second, path_digest = match.groups()
     if path_digest != digest or first != digest[:2] or second != digest[2:4]:
         raise CaptureSchemaError(f"{field}.path must agree with {field}.sha256")
+
+
+def _audit_protocol_digest(value: Any) -> str:
+    protocol = _exact_keys(
+        value, required=_AUDIT_PROTOCOL_KEYS, field="auditProtocol"
+    )
+    if protocol["kind"] != "finding-audit-protocol" or protocol["schemaVersion"] != 1:
+        raise CaptureSchemaError("auditProtocol header is invalid")
+    if protocol["protocolVersion"] != "finding-audit-v1":
+        raise CaptureSchemaError("auditProtocol version is invalid")
+    _validate_artifact_ref(
+        protocol["frozenProtocolArtifact"], "auditProtocol.frozenProtocolArtifact"
+    )
+    selection = _exact_keys(
+        protocol["selection"],
+        required={"algorithm", "domainSeparator", "modulus", "residue"},
+        field="auditProtocol.selection",
+    )
+    if selection != {
+        "algorithm": "sha256-domain-v1",
+        "domainSeparator": _AUDIT_SELECTION_DOMAIN,
+        "modulus": 5,
+        "residue": selection["residue"],
+    }:
+        raise CaptureSchemaError("auditProtocol selection rule is invalid")
+    residue = _require_nonnegative_int(
+        selection["residue"], "auditProtocol.selection.residue"
+    )
+    if residue >= 5:
+        raise CaptureSchemaError("auditProtocol selection residue is invalid")
+    adjudication = _exact_keys(
+        protocol["adjudication"],
+        required={"requiredAdjudicators", "minimumAgreement", "agreementMetrics"},
+        field="auditProtocol.adjudication",
+    )
+    if (
+        adjudication["requiredAdjudicators"] != 2
+        or adjudication["minimumAgreement"] != 0.60
+        or adjudication["agreementMetrics"]
+        != [
+            "classificationAgreement",
+            "pairwiseGroupingAgreement",
+            "omittedSpanOverlap",
+        ]
+    ):
+        raise CaptureSchemaError("auditProtocol adjudication rule is invalid")
+    prospective = _exact_keys(
+        protocol["prospective"],
+        required={
+            "backfillAllowed",
+            "assignmentMoment",
+            "retryPolicy",
+            "denominatorEffect",
+        },
+        field="auditProtocol.prospective",
+    )
+    if prospective != {
+        "backfillAllowed": False,
+        "assignmentMoment": "before-first-attempt",
+        "retryPolicy": "inherit-first-family-assignment",
+        "denominatorEffect": "none",
+    }:
+        raise CaptureSchemaError("auditProtocol prospective rule is invalid")
+    return hashlib.sha256(
+        json.dumps(
+            protocol,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _validate_audit_assignment_record(
+    value: Any, *, protocol: Mapping[str, Any]
+) -> dict[str, Any]:
+    assignment = _exact_keys(
+        value, required=_AUDIT_ASSIGNMENT_KEYS, field="auditAssignment"
+    )
+    if assignment["kind"] != "finding-audit-assignment" or assignment["schemaVersion"] != 1:
+        raise CaptureSchemaError("auditAssignment header is invalid")
+    activation_id = _require_id(
+        assignment["activationId"], "activation", "auditAssignment.activationId"
+    )
+    family_id = _require_text(
+        assignment["decisionFamilyId"], "auditAssignment.decisionFamilyId"
+    )
+    if not _FAMILY_ID.fullmatch(family_id):
+        raise CaptureSchemaError("auditAssignment decision family is invalid")
+    _require_id(assignment["firstRunId"], "run", "auditAssignment.firstRunId")
+    if assignment["protocolVersion"] != protocol["protocolVersion"]:
+        raise CaptureSchemaError("auditAssignment protocol version mismatch")
+    protocol_sha = _audit_protocol_digest(protocol)
+    if assignment["protocolSha256"] != protocol_sha:
+        raise CaptureSchemaError("auditAssignment protocol digest mismatch")
+    _parse_timestamp(assignment["assignedAt"], "auditAssignment.assignedAt")
+    selection_payload = b"\x00".join(
+        (
+            _AUDIT_SELECTION_DOMAIN.encode("ascii"),
+            protocol["protocolVersion"].encode("ascii"),
+            activation_id.encode("ascii"),
+            family_id.encode("ascii"),
+        )
+    )
+    selection_digest = hashlib.sha256(selection_payload).hexdigest()
+    bucket = int(selection_digest, 16) % 5
+    selected = bucket == protocol["selection"]["residue"]
+    if (
+        assignment["selectionDigest"] != selection_digest
+        or assignment["bucket"] != bucket
+        or assignment["selected"] is not selected
+        or assignment["assignmentState"]
+        != ("selected" if selected else "not-selected")
+        or assignment["provenance"] != "first-observation-prospective"
+    ):
+        raise CaptureSchemaError("auditAssignment selection proof is invalid")
+    return deepcopy(dict(assignment))
 
 
 def seat_input_manifest_sha256(
@@ -1093,6 +1236,7 @@ _RECORD_KEYS = {
         "cohortName",
         "captureVersion",
         "runtimeSourceCommit",
+        "runtimeSourceSha256",
         "artifactRootPolicy",
     },
     "capture-initiation": {
@@ -1150,6 +1294,18 @@ _RECORD_KEYS = {
         "predictions",
         "blindSeat",
     },
+    "finding-audit-case-v2": {
+        "schemaVersion",
+        "kind",
+        "activationId",
+        "runId",
+        "decisionFamilyId",
+        "recordedAt",
+        "protocolSha256",
+        "auditCaseSha256",
+        "caseArtifact",
+        "aliasMapArtifact",
+    },
     "capture-invalidation": {
         "schemaVersion",
         "kind",
@@ -1163,7 +1319,8 @@ _RECORD_KEYS = {
 }
 
 _RECORD_OPTIONAL_KEYS = {
-    "capture-activation": {"approvalManifest"},
+    "capture-activation": {"approvalManifest", "auditProtocol"},
+    "council-attempt-v2": {"auditAssignment"},
 }
 
 
@@ -1205,9 +1362,16 @@ def _validate_activation(row: Mapping[str, Any], prior_rows: list[Mapping[str, A
     _require_text(row["cohortName"], "cohortName")
     _require_text(row["captureVersion"], "captureVersion")
     _require_commit(row["runtimeSourceCommit"], "runtimeSourceCommit")
+    _require_digest(row["runtimeSourceSha256"], "runtimeSourceSha256")
     _require_text(row["artifactRootPolicy"], "artifactRootPolicy")
     if "approvalManifest" in row:
         _validate_artifact_ref(row["approvalManifest"], "approvalManifest")
+    if "auditProtocol" in row:
+        if "approvalManifest" not in row:
+            raise CaptureSchemaError(
+                "auditProtocol requires a content-addressed approvalManifest"
+            )
+        _audit_protocol_digest(row["auditProtocol"])
     if _rows_of_kind(prior_rows, "capture-activation"):
         raise CaptureSchemaError("capture ledger already has an activation")
 
@@ -1313,6 +1477,41 @@ def _validate_attempt(row: Mapping[str, Any], prior_rows: list[Mapping[str, Any]
     activation = _one_by(prior_rows, "capture-activation", "activationId", activation_id)
     if activation is None:
         raise CaptureSchemaError("council-attempt-v2 has no prior activation")
+    protocol = activation.get("auditProtocol")
+    assignment = row.get("auditAssignment")
+    if protocol is None:
+        if assignment is not None:
+            raise CaptureSchemaError("auditAssignment has no activated audit protocol")
+    else:
+        if assignment is None:
+            raise CaptureSchemaError("activated audit protocol requires auditAssignment")
+        normalized_assignment = _validate_audit_assignment_record(
+            assignment, protocol=protocol
+        )
+        if (
+            normalized_assignment["activationId"] != activation_id
+            or normalized_assignment["decisionFamilyId"] != family_id
+        ):
+            raise CaptureSchemaError("auditAssignment identity differs from attempt")
+        assigned = _parse_timestamp(
+            normalized_assignment["assignedAt"], "auditAssignment.assignedAt"
+        )
+        if assigned >= launched:
+            raise CaptureSchemaError("auditAssignment must precede seatsLaunchedAt")
+        prior_family_attempts = [
+            item
+            for item in _rows_of_kind(prior_rows, "council-attempt-v2")
+            if item.get("activationId") == activation_id
+            and item.get("decisionFamilyId") == family_id
+        ]
+        if prior_family_attempts:
+            inherited = prior_family_attempts[0].get("auditAssignment")
+            if inherited is None or normalized_assignment != inherited:
+                raise CaptureSchemaError(
+                    "repeated decision family must inherit its auditAssignment"
+                )
+        elif normalized_assignment["firstRunId"] != run_id:
+            raise CaptureSchemaError("first family auditAssignment must bind this run")
     bindings = (
         activation["runtimeSourceCommit"],
         row["decisionBeforeArtifact"]["gitBlob"],
@@ -1322,6 +1521,48 @@ def _validate_attempt(row: Mapping[str, Any], prior_rows: list[Mapping[str, Any]
         raise CaptureSchemaError(
             "sharedOutcome.decisionLink must contain runtime commit, baseline Git blob, and SHA-256"
         )
+
+
+def _validate_finding_audit_case(
+    row: Mapping[str, Any], prior_rows: list[Mapping[str, Any]]
+) -> None:
+    _ensure_record_header(row, "finding-audit-case-v2")
+    activation_id = _require_id(row["activationId"], "activation", "activationId")
+    run_id = _require_id(row["runId"], "run", "runId")
+    family_id = _require_text(row["decisionFamilyId"], "decisionFamilyId")
+    if not _FAMILY_ID.fullmatch(family_id):
+        raise CaptureSchemaError("decisionFamilyId must be a stable family-* id")
+    recorded = _parse_timestamp(row["recordedAt"], "recordedAt")
+    _require_digest(row["protocolSha256"], "protocolSha256")
+    _require_digest(row["auditCaseSha256"], "auditCaseSha256")
+    _validate_artifact_ref(row["caseArtifact"], "caseArtifact")
+    _validate_artifact_ref(row["aliasMapArtifact"], "aliasMapArtifact")
+    completion = _one_by(prior_rows, "council-v2", "runId", run_id)
+    if completion is None:
+        raise CaptureSchemaError("finding-audit-case-v2 has no prior completion")
+    if (
+        completion.get("activationId") != activation_id
+        or completion.get("decisionFamilyId") != family_id
+    ):
+        raise CaptureSchemaError("finding-audit-case-v2 identity differs from completion")
+    attempt = _one_by(prior_rows, "council-attempt-v2", "runId", run_id)
+    assignment = None if attempt is None else attempt.get("auditAssignment")
+    if not isinstance(assignment, Mapping) or assignment.get("selected") is not True:
+        raise CaptureSchemaError("finding-audit-case-v2 requires selected auditAssignment")
+    activation = _one_by(prior_rows, "capture-activation", "activationId", activation_id)
+    protocol = None if activation is None else activation.get("auditProtocol")
+    if protocol is None or row["protocolSha256"] != _audit_protocol_digest(protocol):
+        raise CaptureSchemaError("finding-audit-case-v2 protocol binding mismatch")
+    if recorded < _parse_timestamp(completion["finalizedAt"], "finalizedAt"):
+        raise CaptureSchemaError("finding audit case precedes council completion")
+    prior_family_cases = [
+        item
+        for item in _rows_of_kind(prior_rows, "finding-audit-case-v2")
+        if item.get("activationId") == activation_id
+        and item.get("decisionFamilyId") == family_id
+    ]
+    if prior_family_cases:
+        raise CaptureSchemaError("decision family already has a finding audit case")
 
 
 def _validate_seats_finished(
@@ -1504,6 +1745,7 @@ _VALIDATORS: dict[
     "council-seats-finished": _validate_seats_finished,
     "council-v2": _validate_completion,
     "capture-invalidation": _validate_invalidation,
+    "finding-audit-case-v2": _validate_finding_audit_case,
 }
 
 
@@ -1515,6 +1757,7 @@ def _boundary_time(row: Mapping[str, Any]) -> datetime | None:
         "council-seats-finished": "seatsFinishedAt",
         "council-v2": "finalizedAt",
         "capture-invalidation": "invalidatedAt",
+        "finding-audit-case-v2": "recordedAt",
     }
     field = field_by_kind.get(row.get("kind"))
     return _parse_timestamp(row[field], field) if field else None
@@ -1594,8 +1837,14 @@ def make_capture_activation(
 ) -> dict[str, Any]:
     payload = _require_payload_keys(
         payload,
-        required={"cohortName", "captureVersion", "runtimeSourceCommit", "artifactRootPolicy"},
-        optional={"approvalManifest"},
+        required={
+            "cohortName",
+            "captureVersion",
+            "runtimeSourceCommit",
+            "runtimeSourceSha256",
+            "artifactRootPolicy",
+        },
+        optional={"approvalManifest", "auditProtocol"},
         kind="capture-activation",
     )
     row = {
@@ -1678,7 +1927,7 @@ def make_council_attempt_v2(
             "seatPlan",
             "sharedOutcome",
         },
-        optional=None,
+        optional={"auditAssignment"},
         kind="council-attempt-v2",
     )
     prior = list(prior_rows)
@@ -1722,6 +1971,8 @@ def make_council_attempt_v2(
         "seatPlan": deepcopy(payload["seatPlan"]),
         "sharedOutcome": outcome,
     }
+    if "auditAssignment" in payload:
+        row["auditAssignment"] = deepcopy(payload["auditAssignment"])
     validate_v2_record(row, prior)
     return row
 
@@ -1862,6 +2113,46 @@ def make_council_v2(
     prior = list(prior_rows)
     prepared = prepare_council_v2(payload, prior_rows=prior)
     return finalize_council_v2(prepared, prior_rows=prior, clock=clock)
+
+
+def make_finding_audit_case_v2(
+    payload: Mapping[str, Any],
+    *,
+    prior_rows: Iterable[Mapping[str, Any]],
+    clock: Clock,
+) -> dict[str, Any]:
+    """Bind the first selected family completion to blinded audit artifacts."""
+
+    payload = _require_payload_keys(
+        payload,
+        required={
+            "runId",
+            "protocolSha256",
+            "auditCaseSha256",
+            "caseArtifact",
+            "aliasMapArtifact",
+        },
+        optional=None,
+        kind="finding-audit-case-v2",
+    )
+    prior = list(prior_rows)
+    completion = _one_by(prior, "council-v2", "runId", payload["runId"])
+    if completion is None:
+        raise CaptureSchemaError("finding-audit-case-v2 has no prior completion")
+    row = {
+        "schemaVersion": SCHEMA_VERSION,
+        "kind": "finding-audit-case-v2",
+        "activationId": completion["activationId"],
+        "runId": completion["runId"],
+        "decisionFamilyId": completion["decisionFamilyId"],
+        "recordedAt": _clock_timestamp(clock, "recordedAt"),
+        "protocolSha256": payload["protocolSha256"],
+        "auditCaseSha256": payload["auditCaseSha256"],
+        "caseArtifact": deepcopy(payload["caseArtifact"]),
+        "aliasMapArtifact": deepcopy(payload["aliasMapArtifact"]),
+    }
+    validate_v2_record(row, prior)
+    return row
 
 
 def make_capture_invalidation(

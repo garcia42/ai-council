@@ -28,6 +28,7 @@ from council_tools.capture_runtime import (
     CaptureRuntimeError,
     CaptureSecretDetectedError,
     append_capture_activation,
+    append_evidence_bound_capture_activation,
     append_capture_initiation,
     append_capture_invalidation,
     append_capture_resolution,
@@ -48,9 +49,17 @@ from council_tools.forecasts import (
     append_resolution,
     make_attempt,
 )
+from council_tools.finding_audit import (
+    audit_protocol_sha256,
+    deterministic_family_selection,
+    make_audit_protocol,
+    validate_alias_map,
+    validate_audit_case_packet,
+)
 
 
 RUNTIME_COMMIT = "a" * 40
+RUNTIME_SOURCE_SHA = "9" * 64
 AGENT_CODE = "c" * 64
 AGENT_BLIND = "d" * 64
 
@@ -91,6 +100,7 @@ class CaptureIntegrationTest(unittest.TestCase):
                 "cohortName": "first-ten-v2",
                 "captureVersion": "capture-v2.0.0",
                 "runtimeSourceCommit": RUNTIME_COMMIT,
+                "runtimeSourceSha256": RUNTIME_SOURCE_SHA,
                 "artifactRootPolicy": "private-content-addressed-v1",
             },
             clock=at("2026-08-23T10:00:00Z"),
@@ -160,7 +170,8 @@ class CaptureIntegrationTest(unittest.TestCase):
             action_if_false,
         )
         bindings = (
-            f"commit={RUNTIME_COMMIT};blob={self.baseline_blob};"
+            f"commit={RUNTIME_COMMIT};source-sha256={RUNTIME_SOURCE_SHA};"
+            f"blob={self.baseline_blob};"
             f"sha256={baseline_ref['sha256']}\n{request_binding}"
         )
         self.inputs = {
@@ -310,7 +321,8 @@ class CaptureIntegrationTest(unittest.TestCase):
             outcome["actionIfFalse"],
         )
         bindings = (
-            f"commit={RUNTIME_COMMIT};blob={self.baseline_blob};"
+            f"commit={RUNTIME_COMMIT};source-sha256={RUNTIME_SOURCE_SHA};"
+            f"blob={self.baseline_blob};"
             f"sha256={baseline_ref['sha256']}\n{request_binding}"
         )
         self.inputs = {
@@ -603,6 +615,83 @@ class CaptureIntegrationTest(unittest.TestCase):
         raw, v2 = validate_capture_ledger(self.ledger)
         self.assertEqual(len(raw), 5)
         self.assertEqual(len(v2), 5)
+
+    def test_selected_family_is_assigned_prospectively_and_emits_blinded_case(self):
+        frozen_ref = self.store.capture(b"frozen amendment 027 audit protocol")
+        protocol = make_audit_protocol(frozen_protocol_artifact=frozen_ref)
+        approval_ref = self.store.capture(b'{"fixture":"approval-binding"}')
+        governed_activation = {
+            **self.activation,
+            "approvalManifest": approval_ref,
+            "auditProtocol": protocol,
+        }
+        self.ledger.write_text(
+            "".join(
+                json.dumps(item, sort_keys=True, separators=(",", ":")) + "\n"
+                for item in (governed_activation, self.initiation)
+            ),
+            encoding="utf-8",
+        )
+        for index in range(1000):
+            family = f"family-selected-{index}"
+            if deterministic_family_selection(
+                protocol,
+                activation_id=governed_activation["activationId"],
+                decision_family_id=family,
+            )["selected"]:
+                break
+        else:
+            self.fail("could not find deterministic selected family")
+        self.attempt_payload["decisionFamilyId"] = family
+
+        attempt = self.append_attempt()
+        self.assertTrue(attempt["auditAssignment"]["selected"])
+        self.assertLess(
+            attempt["auditAssignment"]["assignedAt"], attempt["seatsLaunchedAt"]
+        )
+        append_council_seats_finished(
+            self.ledger,
+            {
+                "runId": self.initiation["runId"],
+                "seatStates": {"code": "submitted", "blind": "submitted"},
+            },
+            clock=at("2026-08-23T10:03:00Z"),
+            coordination_lock=self.lock,
+        )
+        append_council_v2(
+            self.ledger,
+            self.completion_payload(),
+            artifact_store=self.store,
+            decision_before_bytes=self.baseline_bytes,
+            seat_input_artifacts=self.input_refs,
+            visible_inputs=self.inputs,
+            visible_outputs=self.outputs,
+            clock=at("2026-08-23T10:04:00Z"),
+            coordination_lock=self.lock,
+        )
+        _raw, rows = validate_capture_ledger(
+            self.ledger, now="2026-08-23T10:05:00Z"
+        )
+        cases = [row for row in rows if row["kind"] == "finding-audit-case-v2"]
+        self.assertEqual(len(cases), 1)
+        case = cases[0]
+        packet = json.loads(self.store.read_verified(case["caseArtifact"]))
+        alias_map = json.loads(self.store.read_verified(case["aliasMapArtifact"]))
+        validate_audit_case_packet(packet, protocol=protocol)
+        validate_alias_map(alias_map, packet=packet, protocol=protocol)
+        packet_text = json.dumps(packet, sort_keys=True)
+        self.assertNotIn("model-code", packet_text)
+        self.assertNotIn('"seatId"', packet_text)
+
+        report = capture_report(
+            self.ledger,
+            self.events,
+            artifact_store=self.store,
+            as_of="2026-08-23T10:05:00Z",
+        )
+        self.assertEqual(report["prospectiveAudit"]["assignedFamilyCount"], 1)
+        self.assertEqual(report["prospectiveAudit"]["selectedFamilyCount"], 1)
+        self.assertEqual(report["prospectiveAudit"]["auditCaseCount"], 1)
 
     def test_main_ledger_resolution_without_sidecar_never_grades_v2(self):
         completion, _summary = self.finish()
@@ -2300,6 +2389,7 @@ class CaptureIntegrationTest(unittest.TestCase):
                                 "cohortName": "blocked-live",
                                 "captureVersion": "capture-v2.0.0",
                                 "runtimeSourceCommit": RUNTIME_COMMIT,
+                                "runtimeSourceSha256": RUNTIME_SOURCE_SHA,
                                 "artifactRootPolicy": "private-content-addressed-v1",
                             },
                             clock=at("2026-08-23T11:00:00Z"),
@@ -2307,6 +2397,93 @@ class CaptureIntegrationTest(unittest.TestCase):
                         )
                     self.assertFalse(target.exists())
         self.assertFalse((self.root / "must-not-open.lock").exists())
+
+    def test_evidence_bound_activation_embeds_validated_protocol_at_append_cut(self):
+        governed_ledger = self.root / "governed-activation.jsonl"
+        frozen_ref = self.store.capture(b"frozen amendment 027")
+        protocol = make_audit_protocol(frozen_protocol_artifact=frozen_ref)
+        protocol_data = json.dumps(
+            protocol, sort_keys=True, separators=(",", ":")
+        ).encode()
+        protocol_ref = self.store.capture(protocol_data)
+        policy_data = json.dumps(
+            {"auditProtocolRef": protocol_ref},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+        policy_ref = self.store.capture(policy_data)
+        manifest_data = b'{"fixture":"manifest-v2"}'
+        manifest_ref = self.store.capture(manifest_data)
+        payload = {
+            "cohortName": "governed-first-ten",
+            "captureVersion": "capture-v2.0.0",
+            "runtimeSourceCommit": RUNTIME_COMMIT,
+            "runtimeSourceSha256": RUNTIME_SOURCE_SHA,
+            "artifactRootPolicy": "private-content-addressed-v1",
+            "approvalManifest": manifest_ref,
+        }
+        evidence = {
+            "appendReady": True,
+            "blockers": [],
+            "auditProtocolSha256": audit_protocol_sha256(protocol),
+        }
+        with (
+            mock.patch.object(
+                capture_runtime,
+                "evaluate_activation_evidence",
+                return_value=evidence,
+            ) as evaluate,
+            mock.patch.object(
+                capture_runtime,
+                "parse_activation_manifest_v2",
+                return_value={
+                    "activationId": "activation-" + "1" * 32,
+                    "policyRef": policy_ref,
+                },
+            ),
+        ):
+            row, verdict = append_evidence_bound_capture_activation(
+                governed_ledger,
+                payload,
+                manifest_data=manifest_data,
+                artifact_store=self.store,
+                expected_runtime_commit=RUNTIME_COMMIT,
+                expected_source_sha256=RUNTIME_SOURCE_SHA,
+                clock=at("2026-08-23T11:00:00Z"),
+                coordination_lock=self.lock,
+            )
+        self.assertEqual(verdict, evidence)
+        self.assertEqual(row["auditProtocol"], protocol)
+        self.assertEqual(row["activationId"], "activation-" + "1" * 32)
+        self.assertEqual(evaluate.call_count, 1)
+        _raw, valid = validate_capture_ledger(
+            governed_ledger, now="2026-08-23T11:00:00Z"
+        )
+        self.assertEqual(valid, [row])
+
+        blocked_ledger = self.root / "blocked-activation.jsonl"
+        with mock.patch.object(
+            capture_runtime,
+            "evaluate_activation_evidence",
+            return_value={
+                "appendReady": False,
+                "blockers": ["durability-restore-evidence-stale"],
+            },
+        ):
+            with self.assertRaisesRegex(
+                CaptureRuntimeError, "durability-restore-evidence-stale"
+            ):
+                append_evidence_bound_capture_activation(
+                    blocked_ledger,
+                    payload,
+                    manifest_data=manifest_data,
+                    artifact_store=self.store,
+                    expected_runtime_commit=RUNTIME_COMMIT,
+                    expected_source_sha256=RUNTIME_SOURCE_SHA,
+                    clock=at("2026-08-23T11:00:00Z"),
+                    coordination_lock=self.lock,
+                )
+        self.assertFalse(blocked_ledger.exists())
 
     def test_direct_activation_rejects_plain_parent_substitution_before_lock(self):
         fake_live_root = self.root / "fake-live"
@@ -2345,6 +2522,7 @@ class CaptureIntegrationTest(unittest.TestCase):
                         "cohortName": "plain-parent-substitution",
                         "captureVersion": "capture-v2.0.0",
                         "runtimeSourceCommit": RUNTIME_COMMIT,
+                        "runtimeSourceSha256": RUNTIME_SOURCE_SHA,
                         "artifactRootPolicy": "private-content-addressed-v1",
                     },
                     clock=at("2026-08-23T11:00:00Z"),
@@ -2396,6 +2574,7 @@ class CaptureIntegrationTest(unittest.TestCase):
                         "cohortName": "live-inode-substitution",
                         "captureVersion": "capture-v2.0.0",
                         "runtimeSourceCommit": RUNTIME_COMMIT,
+                        "runtimeSourceSha256": RUNTIME_SOURCE_SHA,
                         "artifactRootPolicy": "private-content-addressed-v1",
                     },
                     clock=at("2026-08-23T11:00:00Z"),
@@ -2431,6 +2610,7 @@ class CaptureIntegrationTest(unittest.TestCase):
                     "cohortName": "nested-first-use",
                     "captureVersion": "capture-v2.0.0",
                     "runtimeSourceCommit": RUNTIME_COMMIT,
+                    "runtimeSourceSha256": RUNTIME_SOURCE_SHA,
                     "artifactRootPolicy": "private-content-addressed-v1",
                 },
                 clock=at("2026-08-23T11:00:00Z"),

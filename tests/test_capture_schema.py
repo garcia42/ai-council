@@ -32,6 +32,7 @@ from council_tools.capture_schema import (
 
 
 RUNTIME_COMMIT = "a" * 40
+RUNTIME_SOURCE_SHA = "9" * 64
 BASELINE_BLOB = "b" * 40
 BASELINE_SHA = "c" * 64
 AGENT_CODE_SHA = "d" * 64
@@ -59,6 +60,7 @@ class CaptureSchemaTest(unittest.TestCase):
                 "cohortName": "first-ten-v2",
                 "captureVersion": "capture-v2.0.0",
                 "runtimeSourceCommit": RUNTIME_COMMIT,
+                "runtimeSourceSha256": RUNTIME_SOURCE_SHA,
                 "artifactRootPolicy": "private-content-addressed-v1",
             },
             clock=at("2026-08-23T10:00:00Z"),
@@ -326,7 +328,8 @@ class CaptureSchemaTest(unittest.TestCase):
         expected = {
             "capture-activation": {
                 "schemaVersion", "kind", "activationId", "activatedAt", "cohortName",
-                "captureVersion", "runtimeSourceCommit", "artifactRootPolicy",
+                "captureVersion", "runtimeSourceCommit", "runtimeSourceSha256",
+                "artifactRootPolicy",
             },
             "capture-initiation": {
                 "schemaVersion", "kind", "initiationId", "runId", "activationId",
@@ -360,6 +363,7 @@ class CaptureSchemaTest(unittest.TestCase):
                 make_capture_activation,
                 {
                     "cohortName": "other", "captureVersion": "v2", "runtimeSourceCommit": RUNTIME_COMMIT,
+                    "runtimeSourceSha256": RUNTIME_SOURCE_SHA,
                     "artifactRootPolicy": "private", "activatedAt": "2026-08-23T00:00:00Z",
                 },
                 [],
@@ -400,6 +404,7 @@ class CaptureSchemaTest(unittest.TestCase):
             make_capture_activation(
                 {
                     "cohortName": "other", "captureVersion": "v2", "runtimeSourceCommit": RUNTIME_COMMIT,
+                    "runtimeSourceSha256": RUNTIME_SOURCE_SHA,
                     "artifactRootPolicy": "private",
                 },
                 clock=lambda: datetime(2026, 8, 23),
@@ -584,6 +589,7 @@ class CaptureSchemaTest(unittest.TestCase):
                     "cohortName": "second-cohort",
                     "captureVersion": "capture-v2.0.1",
                     "runtimeSourceCommit": "9" * 40,
+                    "runtimeSourceSha256": "8" * 64,
                     "artifactRootPolicy": "another-private-root-policy",
                 },
                 prior_rows=[self.activation],
@@ -597,6 +603,7 @@ class CaptureSchemaTest(unittest.TestCase):
                 "cohortName": "approved-first-ten",
                 "captureVersion": "capture-v2.0.0",
                 "runtimeSourceCommit": RUNTIME_COMMIT,
+                "runtimeSourceSha256": RUNTIME_SOURCE_SHA,
                 "artifactRootPolicy": "private-content-addressed-v1",
                 "approvalManifest": manifest_ref,
             },
