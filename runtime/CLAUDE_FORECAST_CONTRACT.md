@@ -16,3 +16,8 @@ read or rehearse copied data but must not append. Run the report both before lau
 after appending the sealed completion. Its exit status is the process-boundary alert: exit 1 stops
 the council for invalid state; exit 3 permits collection but blocks decision finalization. Exit 2
 is reserved for command-line usage errors.
+
+Grading debt never blocks incident containment or rollback. A rollback preserves the blind-seat
+tally's forward-compatible `council-attempt` allowlist because appended attempt rows are permanent.
+The runtime reporter is pinned to the installed source commit and source digest and fails closed on
+working-tree drift; develop later changes in a separate worktree and activate a new clean commit.

@@ -68,6 +68,12 @@ def rehearse(source_root: Path, *, today: str) -> dict:
 
     with tempfile.TemporaryDirectory(prefix="council-tools-rehearsal-") as temporary:
         stage_root = Path(temporary)
+        staged_source = stage_root / "council-tools-source"
+        shutil.copytree(
+            REPO,
+            staged_source,
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+        )
         for relative in [*target_relatives, LEDGER_RELATIVE]:
             _copy(source_root, stage_root, relative)
         live_events = source_root / EVENTS_RELATIVE
@@ -82,8 +88,12 @@ def rehearse(source_root: Path, *, today: str) -> dict:
         )
         baseline_tally = baseline_blind.tally(staged_blind_before)
 
-        backup = install.install(stage_root, stage_root / "installer-backups")
-        clean, differences = install.check(stage_root)
+        backup = install.install(
+            stage_root,
+            stage_root / "installer-backups",
+            source_repo=staged_source,
+        )
+        clean, differences = install.check(stage_root, source_repo=staged_source)
         if not clean:
             raise RehearsalError(f"staged install has drift: {differences}")
 
@@ -341,6 +351,36 @@ def rehearse(source_root: Path, *, today: str) -> dict:
                 f"blind-seat decision tally changed: {baseline_stable} != {staged_stable}"
             )
 
+        drift_source = staged_source / "src/council_tools/forecasts.py"
+        drift_original = drift_source.read_bytes()
+        drift_source.write_bytes(drift_original + b"\n# injected rehearsal drift\n")
+        drift_log = stage_root / ".claude/knowledge/council-eval/drift-attempt.jsonl"
+        drift_attempt = subprocess.run(
+            [
+                sys.executable,
+                str(reporter),
+                "attempt",
+                "--log",
+                str(drift_log),
+                "--spec",
+                str(attempt_spec),
+                "--ts",
+                "2026-08-22T12:00:00Z",
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        drift_source.write_bytes(drift_original)
+        if (
+            drift_attempt.returncode == 0
+            or "runtime integrity check failed" not in drift_attempt.stderr
+            or drift_log.exists()
+        ):
+            raise RehearsalError(
+                "write-capable runtime did not fail closed on imported-source drift"
+            )
+
         after_hashes = {str(path): _digest(path) for path in source_files}
         if before_hashes != after_hashes:
             raise RehearsalError("source runtime files changed during rehearsal")
@@ -357,6 +397,15 @@ def rehearse(source_root: Path, *, today: str) -> dict:
                 "unavailableSeatSealedWithoutProbability": True,
                 "completedRows": failure_payload["completeForecastRows"],
                 "forecastIssuances": failure_payload["forecastIssuances"],
+            },
+            "runtimeSourcePin": {
+                "commit": subprocess.run(
+                    ["git", "-C", str(staged_source), "rev-parse", "HEAD"],
+                    text=True,
+                    capture_output=True,
+                    check=True,
+                ).stdout.strip(),
+                "sourceDriftRejectedBeforeAppend": True,
             },
             "blindTallyStable": baseline_stable,
             "blindClassificationBefore": {

@@ -38,7 +38,13 @@ python3 install.py restore --root /home/trader --backup <printed-backup-path> \
 
 The external backup root also maintains a `LATEST` pointer, so loss or cleanup of the source tree
 does not erase either the backup manifest or the path needed to restore it. The installer refuses a
-backup root inside `/home/trader/council-tools`.
+backup root inside `/home/trader/council-tools`. Restore intentionally preserves the forward-safe
+`council-attempt` allowlist in the blind-seat tally, because attempt rows appended after activation
+are permanent even when the other runtime targets roll back.
+
+Live installation requires a clean source commit. The rendered runtime shim pins that commit and a
+SHA-256 over `src/council_tools/*.py`; every invocation refuses to run if either the checked-out
+commit or imported source digest drifts. `install.py check` renders and compares the same pin.
 
 Live ledger writes are host-guarded to `manny`. A corrupt trailing JSONL write is never skipped;
 after inspecting the exact line, quarantine and remove only that final line with:

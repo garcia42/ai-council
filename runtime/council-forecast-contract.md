@@ -23,6 +23,10 @@ authority rule, rehearse on that host, and rerun the council activation review.
    resolved or a principal-approved override is logged. Exit 2 is a command usage error. `--today`
    is test-only and is rejected for live council paths.
 
+   Exit 3 never blocks incident containment or rollback. The installed reporter verifies its pinned
+   git commit and source digest before every command and refuses source drift. Develop future changes
+   in another worktree; do not edit the active source tree.
+
 2. Define one neutral **shared outcome** before any seat answers. It must be binary, material to
    the reviewed decision, and recorded with:
 

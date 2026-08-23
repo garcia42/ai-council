@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import os
 import shutil
+import subprocess
 import sys
 import uuid
 from datetime import datetime, timezone
@@ -33,6 +34,49 @@ ReplaceFunction = Callable[[str | bytes | os.PathLike, str | bytes | os.PathLike
 
 def _digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _source_digest(source_repo: Path) -> str:
+    digest = hashlib.sha256()
+    source = source_repo / "src/council_tools"
+    files = sorted(source.glob("*.py"))
+    if not files:
+        raise InstallError(f"council-tools source files are missing: {source}")
+    for path in files:
+        digest.update(str(path.relative_to(source_repo)).encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _repository_identity(source_repo: Path, *, require_clean: bool) -> tuple[str, str]:
+    try:
+        head = subprocess.run(
+            ["git", "-C", str(source_repo), "rev-parse", "HEAD"],
+            text=True,
+            capture_output=True,
+            check=True,
+        ).stdout.strip()
+        if require_clean:
+            status = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(source_repo),
+                    "status",
+                    "--porcelain=v1",
+                    "--untracked-files=all",
+                ],
+                text=True,
+                capture_output=True,
+                check=True,
+            ).stdout
+            if status:
+                raise InstallError("live install requires a clean council-tools source commit")
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise InstallError(f"cannot identify council-tools source commit: {exc}") from exc
+    return head, _source_digest(source_repo)
 
 
 def _block(begin: str, body: str, end: str) -> str:
@@ -66,22 +110,7 @@ def _runtime_targets(root: Path) -> tuple[Path, ...]:
     return reporter, skill, criterion, claude_md
 
 
-def _render(root: Path) -> dict[Path, bytes]:
-    reporter, skill, criterion, claude_md = _runtime_targets(root)
-    for target in _runtime_targets(root):
-        if not target.exists():
-            raise InstallError(f"runtime target does not exist: {target}")
-
-    skill_text = skill.read_text(encoding="utf-8")
-    skill_text = _upsert_block(
-        skill_text,
-        begin=FORECAST_BEGIN,
-        end=FORECAST_END,
-        body=(REPO / "runtime/council-forecast-contract.md").read_text(encoding="utf-8"),
-        marker="## Steps\n",
-    )
-
-    criterion_text = criterion.read_text(encoding="utf-8")
+def _with_attempt_allowlist(criterion_text: str) -> str:
     old_allowlist = (
         'NON_COUNCIL_RECORD_KINDS = {"pre-mortem-calibration", "council-calibration"}'
     )
@@ -92,30 +121,84 @@ def _render(root: Path) -> dict[Path, bytes]:
         '    "council-attempt",\n'
         '}'
     )
-    if '"council-attempt"' not in criterion_text:
-        if old_allowlist not in criterion_text:
-            raise InstallError("blind-seat allowlist preimage not found")
-        criterion_text = criterion_text.replace(old_allowlist, new_allowlist, 1)
+    if '"council-attempt"' in criterion_text:
+        return criterion_text
+    if old_allowlist not in criterion_text:
+        raise InstallError("blind-seat allowlist preimage not found")
+    return criterion_text.replace(old_allowlist, new_allowlist, 1)
+
+
+def _render(
+    root: Path,
+    *,
+    source_repo: Path = REPO,
+    require_clean_source: bool = False,
+) -> dict[Path, bytes]:
+    source_repo = source_repo.resolve()
+    commit, source_sha256 = _repository_identity(
+        source_repo, require_clean=require_clean_source
+    )
+    reporter, skill, criterion, claude_md = _runtime_targets(root)
+    for target in _runtime_targets(root):
+        if not target.exists():
+            raise InstallError(f"runtime target does not exist: {target}")
+
+    skill_text = skill.read_text(encoding="utf-8")
+    skill_text = _upsert_block(
+        skill_text,
+        begin=FORECAST_BEGIN,
+        end=FORECAST_END,
+        body=(source_repo / "runtime/council-forecast-contract.md").read_text(encoding="utf-8"),
+        marker="## Steps\n",
+    )
+
+    criterion_text = _with_attempt_allowlist(
+        criterion.read_text(encoding="utf-8")
+    )
 
     claude_text = claude_md.read_text(encoding="utf-8")
     claude_text = _upsert_block(
         claude_text,
         begin=CLAUDE_BEGIN,
         end=CLAUDE_END,
-        body=(REPO / "runtime/CLAUDE_FORECAST_CONTRACT.md").read_text(encoding="utf-8"),
+        body=(source_repo / "runtime/CLAUDE_FORECAST_CONTRACT.md").read_text(encoding="utf-8"),
         marker="## SLO/SLI changes require a full council review\n",
     )
 
+    reporter_text = (source_repo / "runtime/predictions_report.py").read_text(
+        encoding="utf-8"
+    )
+    replacements = {
+        "@@COUNCIL_TOOLS_SOURCE_ROOT@@": str(source_repo),
+        "@@COUNCIL_TOOLS_COMMIT@@": commit,
+        "@@COUNCIL_TOOLS_SOURCE_SHA256@@": source_sha256,
+    }
+    for token, value in replacements.items():
+        if reporter_text.count(token) != 1:
+            raise InstallError(f"runtime reporter template token count is not one: {token}")
+        reporter_text = reporter_text.replace(token, value)
+
     return {
-        reporter: (REPO / "runtime/predictions_report.py").read_bytes(),
+        reporter: reporter_text.encode("utf-8"),
         skill: skill_text.encode("utf-8"),
         criterion: criterion_text.encode("utf-8"),
         claude_md: claude_text.encode("utf-8"),
     }
 
 
-def check(root: Path) -> tuple[bool, list[str]]:
-    rendered = _render(root)
+def check(
+    root: Path,
+    *,
+    source_repo: Path = REPO,
+    require_clean_source: bool | None = None,
+) -> tuple[bool, list[str]]:
+    if require_clean_source is None:
+        require_clean_source = root.resolve() == Path("/home/trader")
+    rendered = _render(
+        root,
+        source_repo=source_repo,
+        require_clean_source=require_clean_source,
+    )
     differences = []
     for target, expected in rendered.items():
         if target.read_bytes() != expected:
@@ -235,14 +318,23 @@ def install(
     backup_root: Path,
     *,
     replace_func: ReplaceFunction = os.replace,
+    source_repo: Path = REPO,
+    require_clean_source: bool | None = None,
 ) -> Path:
+    source_repo = source_repo.resolve()
+    if require_clean_source is None:
+        require_clean_source = root.resolve() == Path("/home/trader")
     try:
-        backup_root.resolve().relative_to(REPO)
+        backup_root.resolve().relative_to(source_repo)
     except ValueError:
         pass
     else:
         raise InstallError("backup root must be outside the council-tools source tree")
-    rendered = _render(root)
+    rendered = _render(
+        root,
+        source_repo=source_repo,
+        require_clean_source=require_clean_source,
+    )
     backup = _backup_targets(root, rendered, backup_root)
     rollback_sources = {
         target: backup / target.relative_to(root) for target in rendered
@@ -260,6 +352,10 @@ def install(
 
 def restore(root: Path, backup: Path, backup_root: Path) -> Path:
     payloads = _verified_backup_payloads(root, backup)
+    criterion = root / ".claude/knowledge/council-eval/blind_seat_kill_criterion.py"
+    payloads[criterion] = _with_attempt_allowlist(
+        payloads[criterion].decode("utf-8")
+    ).encode("utf-8")
     for target in payloads:
         if not target.exists():
             raise InstallError(f"runtime target does not exist: {target}")

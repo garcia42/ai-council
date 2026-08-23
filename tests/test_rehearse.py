@@ -65,6 +65,7 @@ class RehearsalTest(unittest.TestCase):
         self.assertEqual(result["runtimeContractTests"], 3)
         self.assertTrue(result["failurePath"]["malformedProbabilityRejectedWithoutAppend"])
         self.assertTrue(result["failurePath"]["unavailableSeatSealedWithoutProbability"])
+        self.assertTrue(result["runtimeSourcePin"]["sourceDriftRejectedBeforeAppend"])
         self.assertEqual(
             (
                 self.root / ".claude/knowledge/council-eval/predictions_report.py"

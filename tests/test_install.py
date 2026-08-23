@@ -53,6 +53,11 @@ class InstallerTest(unittest.TestCase):
         self.assertIn('"council-attempt"', (
             self.root / ".claude/knowledge/council-eval/blind_seat_kill_criterion.py"
         ).read_text(encoding="utf-8"))
+        reporter = (
+            self.root / ".claude/knowledge/council-eval/predictions_report.py"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn("@@COUNCIL_TOOLS_", reporter)
+        self.assertIn(install._repository_identity(install.REPO, require_clean=False)[0], reporter)
 
     def test_partial_install_failure_restores_every_original_target(self):
         calls = 0
@@ -77,10 +82,12 @@ class InstallerTest(unittest.TestCase):
         backup = install.install(self.root, self.backups)
         installed = {target: target.read_bytes() for target in self.targets}
         pre_restore = install.restore(self.root, backup, self.backups)
-        self.assertEqual(
-            {target: target.read_bytes() for target in self.targets},
-            self.originals,
-        )
+        criterion = self.root / ".claude/knowledge/council-eval/blind_seat_kill_criterion.py"
+        for target in self.targets:
+            if target == criterion:
+                self.assertIn('"council-attempt"', target.read_text(encoding="utf-8"))
+            else:
+                self.assertEqual(target.read_bytes(), self.originals[target])
         for target, content in installed.items():
             relative = target.relative_to(self.root)
             self.assertEqual((pre_restore / relative).read_bytes(), content)

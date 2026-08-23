@@ -69,4 +69,6 @@ forecast discipline and descriptive calibration. It does not rank reviewer intel
 - Non-council predictions never enter the default council score.
 - Every current forecast is classified as future, due, resolved, void, or legacy-ineligible.
 - A copied-ledger rehearsal leaves the blind-seat tally unchanged at its pre-install baseline.
+- A copied-runtime write command refuses imported-source drift before appending.
+- Rollback preserves the forward-compatible `council-attempt` blind-tally allowlist.
 - The installed council skill contains attempt, shared-forecast, validation, and debt steps.
