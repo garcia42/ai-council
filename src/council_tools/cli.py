@@ -35,6 +35,11 @@ from .evidence_backup import (
     verify_evidence_snapshot,
 )
 
+from .brief_recovery import (
+    plan_blind_brief_recovery,
+    prepare_blind_brief,
+    recover_blind_brief,
+)
 from .forecasts import (
     LedgerError,
     append_ledger_row,
@@ -924,6 +929,47 @@ def command_evidence_restore(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_prepare_brief(args: argparse.Namespace) -> int:
+    result = prepare_blind_brief(
+        run_id=args.run_id,
+        source_path=args.source,
+        destination_path=args.destination,
+        expected_sha256=args.expected_sha256,
+    )
+    print(json.dumps(result, sort_keys=True))
+    return 0
+
+
+def command_recover_brief(args: argparse.Namespace) -> int:
+    with Path(args.spec).open(encoding="utf-8") as handle:
+        spec = json.load(handle)
+    result = recover_blind_brief(
+        spec,
+        operator_confirmed=args.confirm_operator_approved_rewrite,
+        rehearsal_root=args.rehearsal_root,
+        resume=args.resume,
+    )
+    print(json.dumps(result, sort_keys=True))
+    return 0
+
+
+def command_plan_brief_recovery(args: argparse.Namespace) -> int:
+    spec = plan_blind_brief_recovery(
+        ledger_path=args.ledger,
+        target_line=args.target_line,
+        replacement_source=args.replacement_source,
+        destination_path=args.destination,
+        artifact_dir=args.artifact_dir,
+        operator=args.operator,
+        approval_reference=args.approval_reference,
+        approval_reason=args.approval_reason,
+        approved_at=args.approved_at,
+        rehearsal_root=args.rehearsal_root,
+    )
+    print(json.dumps(spec, indent=2, sort_keys=False))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1129,6 +1175,49 @@ def build_parser() -> argparse.ArgumentParser:
     restore.add_argument("target")
     restore.add_argument("--repository-root", required=True)
     restore.set_defaults(func=command_evidence_restore)
+    prepare_brief = sub.add_parser(
+        "prepare-brief",
+        help="exclusively create one immutable run-scoped blind brief",
+    )
+    prepare_brief.add_argument("--run-id", required=True)
+    prepare_brief.add_argument("--source", required=True)
+    prepare_brief.add_argument("--destination", required=True)
+    prepare_brief.add_argument("--expected-sha256", required=True)
+    prepare_brief.set_defaults(func=command_prepare_brief)
+
+    recover_brief = sub.add_parser(
+        "recover-brief",
+        help="operator-approved hash-pinned recovery of one valid council brief field",
+    )
+    recover_brief.add_argument("--spec", required=True)
+    recover_brief.add_argument(
+        "--confirm-operator-approved-rewrite", action="store_true", required=True
+    )
+    recover_brief.add_argument("--resume", action="store_true")
+    recover_brief.add_argument(
+        "--rehearsal-root",
+        help="test-only mirror root; all absolute spec paths are mapped beneath it",
+    )
+    recover_brief.set_defaults(func=command_recover_brief)
+
+    plan_brief = sub.add_parser(
+        "plan-brief-recovery",
+        help="derive a recovery spec from the live ledger bytes",
+    )
+    plan_brief.add_argument("--ledger", required=True)
+    plan_brief.add_argument("--target-line", required=True, type=int)
+    plan_brief.add_argument("--replacement-source", required=True)
+    plan_brief.add_argument("--destination")
+    plan_brief.add_argument("--artifact-dir")
+    plan_brief.add_argument("--operator", required=True)
+    plan_brief.add_argument("--approval-reference", required=True)
+    plan_brief.add_argument("--approval-reason", required=True)
+    plan_brief.add_argument("--approved-at")
+    plan_brief.add_argument(
+        "--rehearsal-root",
+        help="test-only mirror root; all absolute paths are mapped beneath it",
+    )
+    plan_brief.set_defaults(func=command_plan_brief_recovery)
     return parser
 
 

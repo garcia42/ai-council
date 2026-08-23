@@ -599,6 +599,54 @@ def evidence_write_lock(path: str | Path | None):
         raise LedgerError(str(exc)) from exc
 
 
+
+def validate_blind_brief_identity(
+    row: dict[str, Any], prior_rows: Iterable[dict[str, Any]]
+) -> None:
+    """One immutable run-scoped brief path per council row.
+
+    A blind seat that actually ran must name the brief it read. A skipped or
+    blocked seat may omit it, but any brief it does record is held to the same
+    run-scoped uniqueness, because reuse is what lets one council's answer be
+    attributed to another's question.
+    """
+
+    blind_seat = row.get("blindSeat")
+    if not isinstance(blind_seat, dict):
+        raise LedgerError("new council completion requires blindSeat object")
+    brief = blind_seat.get("brief")
+    ran = blind_seat.get("ran") is True
+    if not isinstance(brief, str) or not brief.strip():
+        if ran:
+            raise LedgerError("new council completion requires a blind brief path")
+        return
+    brief = brief.strip()
+    brief_path = Path(brief)
+    if not brief_path.is_absolute() or brief_path != Path(os.path.abspath(brief_path)):
+        raise LedgerError("new council blind brief path must be absolute and normalized")
+    if row["runId"] not in brief_path.name:
+        raise LedgerError("new council blind brief path must contain its exact runId")
+    resolved_brief = brief_path.resolve(strict=False)
+    for prior in prior_rows:
+        prior_seat = prior.get("blindSeat")
+        if not isinstance(prior_seat, dict):
+            continue
+        prior_brief = prior_seat.get("brief")
+        if not isinstance(prior_brief, str) or not prior_brief.strip():
+            continue
+        prior_path = Path(prior_brief.strip())
+        aliases = prior_path.resolve(strict=False) == resolved_brief
+        if not aliases and prior_path.exists() and brief_path.exists():
+            try:
+                aliases = prior_path.samefile(brief_path)
+            except OSError:
+                aliases = False
+        if aliases:
+            raise LedgerError(
+                f"blind brief path already belongs to another council: {brief}"
+            )
+
+
 def validate_ledger_row(row: dict[str, Any], prior_rows: Iterable[dict[str, Any]]) -> None:
     # This is also the CLI's check-only boundary. Serializing here prevents
     # otherwise unvalidated nested council metadata from poisoning the ledger
@@ -631,6 +679,7 @@ def validate_ledger_row(row: dict[str, Any], prior_rows: Iterable[dict[str, Any]
                 )
     elif kind == "council":
         validate_completion(row, prior_rows)
+        validate_blind_brief_identity(row, prior_rows)
         existing_prediction_ids = {
             prediction.get("predictionId")
             for item in prior_rows

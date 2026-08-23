@@ -331,6 +331,7 @@ def rehearse(source_root: Path, *, today: str) -> dict:
                     "required": True,
                     "ran": True,
                     "changedDecision": False,
+                    "brief": f"{stage_root}/briefs/brief-{run_id}.md",
                 },
             },
         }

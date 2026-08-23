@@ -49,7 +49,31 @@ authority rule, rehearse on that host, and rerun the council activation review.
    This emits `runId` and `outcomeId`. The resulting `council-attempt` ledger row contains no seat
    prices. It makes failed or abandoned council invocations observable without leaking forecasts.
 
-4. Put the byte-identical shared outcome and evidence cutoff in every seated reviewer's prompt.
+4. **Bind one immutable brief to this run before the blind seat reads anything.** The path must
+   contain the emitted `runId`, and it is created exclusively — never with a shell redirect, and
+   never named from the date and topic alone:
+
+   ```
+   python3 /home/trader/.claude/knowledge/council-eval/predictions_report.py \
+     prepare-brief --run-id <runId> --source <draft-brief> \
+     --destination <briefs-dir>/<date>-<topic>-<runId>.md \
+     --expected-sha256 <sha256 of the draft>
+   ```
+
+   The command refuses to overwrite, so two councils drafting the same topic at the same moment
+   cannot silently share one file. Launch the blind seat against the created path and record that
+   exact path in `blindSeat.brief`. Completion rejects a brief that is relative, omits its `runId`,
+   or already belongs to another council row. **Every row carrying an explicit `ran` state needs a
+   brief, whether the seat ran or was skipped** — a skipped seat was still given a question, and the
+   kill criterion refuses a briefless explicit-run-state row. If a completion is rejected for its
+   brief path, no seat work is lost: rename the file with `prepare-brief`, correct the one string in
+   the completion spec, and re-run `complete`.
+
+   This exists because on 2026-08-23 two concurrent sessions chose the same date/topic path, the
+   second overwrote the first between its creation and its blind launch, and one blind answer
+   became unattributable to the question it was actually given.
+
+5. Put the byte-identical shared outcome and evidence cutoff in every seated reviewer's prompt.
    Each reviewer must end with:
 
    `SHARED_PROBABILITY: <0-100>%`
@@ -124,6 +148,31 @@ python3 /home/trader/.claude/knowledge/council-eval/predictions_report.py \
 
 The command holds the append lock, refuses earlier or multiple corruption, saves the byte-exact
 original with its SHA-256 in the backup name, and atomically removes only the confirmed final line.
+
+### Duplicate blind-brief recovery
+
+A valid row that names a brief another council already owns is not a torn write, and `repair-tail`
+must not be used on it. It is repaired only with explicit principal approval, only on the ledger
+authority host, and only through the hash-pinned command below. Derive the spec from the live bytes,
+read it, then run it:
+
+```
+python3 /home/trader/.claude/knowledge/council-eval/predictions_report.py \
+  plan-brief-recovery --ledger <ledger> --target-line <line> \
+  --replacement-source <the bytes that seat actually read> \
+  --operator <name> --approval-reference <where approval was given> \
+  --approval-reason <why> > <spec.json>
+
+python3 /home/trader/.claude/knowledge/council-eval/predictions_report.py \
+  recover-brief --spec <spec.json> --confirm-operator-approved-rewrite
+```
+
+It holds the append lock, refuses any drift from the spec's pinned hashes, proves in advance that no
+prediction and no other row can change, saves a byte-exact SHA-named backup, writes a prepared and a
+completed audit record, and rewrites exactly one `blindSeat.brief` field. An interrupted run is
+re-entered with `--resume`, which refuses to start a new recovery and verifies every artifact it
+finds against the same spec. Reconstructing the replacement brief is evidence work, not a command:
+identify the bytes that seat actually read before planning anything.
 
 ### V2 usefulness capture activation gate
 

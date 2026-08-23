@@ -52,10 +52,11 @@ def completion(attempt, probabilities=None, *, run_id=None, prediction_ids=None)
                 "resolvedBy": outcome["resolvedBy"],
             }
         )
+    completion_run_id = run_id or attempt["runId"]
     return {
         "schemaVersion": 1,
         "kind": "council",
-        "runId": run_id or attempt["runId"],
+        "runId": completion_run_id,
         "ts": "2026-08-22T12:10:00Z",
         "question": attempt["question"],
         "verdicts": {"code": "APPROVE", "theory": "APPROVE", "ops": "APPROVE"},
@@ -64,6 +65,7 @@ def completion(attempt, probabilities=None, *, run_id=None, prediction_ids=None)
             "required": True,
             "ran": True,
             "changedDecision": False,
+            "brief": f"/tmp/council-briefs/brief-{completion_run_id}.md",
         },
         "forecastState": {
             "sealed": True,
