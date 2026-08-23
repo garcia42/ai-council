@@ -794,6 +794,7 @@ class ForecastCliTest(unittest.TestCase):
                             "required": False,
                             "ran": False,
                             "changedDecision": None,
+                            "brief": f"/tmp/council-briefs/brief-{seeded['runId']}.md",
                         },
                     },
                     "seatStates": {"code": "submitted"},

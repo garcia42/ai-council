@@ -631,7 +631,12 @@ def validate_blind_brief_identity(
         raise LedgerError("new council completion requires a blind brief path")
     brief = brief.strip()
     brief_path = Path(brief)
-    if not brief_path.is_absolute() or brief_path != Path(os.path.abspath(brief_path)):
+    if (
+        not brief_path.is_absolute()
+        or str(brief_path) != brief
+        or ".." in brief_path.parts
+        or "." in brief_path.parts
+    ):
         raise LedgerError("new council blind brief path must be absolute and normalized")
     if run_id not in brief_path.name:
         raise LedgerError("new council blind brief path must contain its exact runId")
