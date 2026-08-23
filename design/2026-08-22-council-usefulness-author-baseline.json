@@ -1,0 +1,53 @@
+{
+  "schemaVersion": 1,
+  "createdAt": "2026-08-23T03:15:40Z",
+  "decisionFamilyId": "family-ai-council-usefulness-v2",
+  "question": "Should AI Council implement the corrected usefulness-measurement MVP now?",
+  "options": [
+    "implement-corrected-mvp",
+    "keep-forecast-scoring-only",
+    "adopt-an-external-observability-platform"
+  ],
+  "intendedAction": "implement-corrected-mvp",
+  "rationale": [
+    "Forecast calibration alone cannot measure whether a seat adds a novel useful finding.",
+    "The existing append-only ledger and scoring core provide a tested base for additive evidence capture.",
+    "The Claude review reduced the original plan to a throughput-bounded capture MVP."
+  ],
+  "knownConsiderations": [
+    "The live council currently has four standing seats and no resolved strict council outcomes.",
+    "Historical reconstructed baselines cannot support prospective novelty claims.",
+    "Per-cell novelty and confidently-wrong adjudication was noisy.",
+    "Recent councils are serially dependent within a small number of decision families.",
+    "The evidence tree currently lacks a project-owned backup mechanism.",
+    "Adding seats before finding capture would generate more unscoreable output."
+  ],
+  "scope": [
+    "sealed structured decision-before artifact",
+    "Tier-1 per-seat input and output artifact references and digests",
+    "explicit voting, shadow, and control seat roles",
+    "atomic findings with forced dispositions and co-occurrence groups",
+    "exogenous versus intervention-sensitive outcome strata",
+    "capture-only data-health reporting",
+    "explicit evidence backup and verification"
+  ],
+  "outOfScope": [
+    "new permanent seats",
+    "seat ranking or weighting",
+    "claims of causal decision value",
+    "hidden reasoning or complete tool-output capture",
+    "replay determinism",
+    "automated semantic adjudication",
+    "live activation before final review"
+  ],
+  "mindChangers": [
+    "A reviewer demonstrates that the additive schema cannot preserve strict validation of existing rows.",
+    "The artifact design requires storing secrets, hidden reasoning, or irrelevant raw tool output.",
+    "The workflow cannot keep expected human handling time at or below three minutes per council.",
+    "The proposed metrics allow intervention-sensitive outcomes into headline Brier scores.",
+    "Parallel implementation cannot be integrated without weakening append-only or fail-closed behavior."
+  ],
+  "implementationGate": "All unit and integration tests pass; copied-live rehearsal changes no live evidence; final council has no BLOCK.",
+  "rolloutGate": "Capture-only soak; no seat performance claims until the statistical gate is separately frozen.",
+  "authorForecast": 72
+}
