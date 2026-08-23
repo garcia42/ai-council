@@ -76,6 +76,15 @@ class RuntimeContractTest(unittest.TestCase):
             env = dict(os.environ)
             env["PANEL_LOG"] = str(log)
             env["PANEL_RESOLVED"] = str(events)
+            env["COUNCIL_TOOLS_DENY_OPEN_PATHS"] = os.pathsep.join(
+                (
+                    str(Path.home() / ".claude/knowledge/futures-panel-log.jsonl"),
+                    str(
+                        Path.home()
+                        / ".claude/knowledge/council-eval/predictions_resolved.jsonl"
+                    ),
+                )
+            )
             result = subprocess.run(
                 [sys.executable, str(reporter), "--all"],
                 text=True,
@@ -87,6 +96,32 @@ class RuntimeContractTest(unittest.TestCase):
         self.assertIn("CALIBRATION (1 resolved)", result.stdout)
         self.assertIn("Brier score:", result.stdout)
         self.assertNotIn("councilRows", result.stdout)
+
+    def test_legacy_mode_rejects_filesystem_aliases_to_council_store(self):
+        reporter = RUNTIME_ROOT / "knowledge/council-eval/predictions_report.py"
+        council_log = Path.home() / ".claude/knowledge/futures-panel-log.jsonl"
+        for alias_kind in ("symlink", "hardlink"):
+            with self.subTest(alias_kind=alias_kind), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                alias = root / "alias.jsonl"
+                if alias_kind == "symlink":
+                    alias.symlink_to(council_log)
+                else:
+                    os.link(council_log, alias)
+                events = root / "events.jsonl"
+                events.write_text("", encoding="utf-8")
+                env = dict(os.environ)
+                env["PANEL_LOG"] = str(alias)
+                env["PANEL_RESOLVED"] = str(events)
+                result = subprocess.run(
+                    [sys.executable, str(reporter), "--all"],
+                    text=True,
+                    capture_output=True,
+                    env=env,
+                    check=False,
+                )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("refuses live-knowledge paths or council-store aliases", result.stderr)
 
 
 if __name__ == "__main__":

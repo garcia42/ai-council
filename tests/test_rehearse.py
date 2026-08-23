@@ -50,6 +50,44 @@ class RehearsalTest(unittest.TestCase):
             + "\n",
             encoding="utf-8",
         )
+        legacy_dir = self.root / "truth-and-reconciliation/data"
+        legacy_dir.mkdir(parents=True)
+        (legacy_dir / "forecasts.jsonl").write_text(
+            json.dumps(
+                {
+                    "ts": "2026-08-18T00:00:00Z",
+                    "predictions": [
+                        {
+                            "seat": "research",
+                            "claim": "Resolved rehearsal legacy item",
+                            "probability": 80,
+                            "resolutionDate": "2026-08-19",
+                        },
+                        {
+                            "seat": "research",
+                            "claim": "Unresolved rehearsal legacy item",
+                            "probability": 60,
+                            "resolutionDate": "2026-09-30",
+                        },
+                    ],
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (legacy_dir / "resolved.jsonl").write_text(
+            json.dumps(
+                {
+                    "key": "2026-08-18T00:00:00Z#0",
+                    "ts": "2026-08-18T00:00:00Z",
+                    "index": 0,
+                    "probability": 80,
+                    "came_true": True,
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
 
     def tearDown(self):
         self.temp.cleanup()
@@ -63,7 +101,13 @@ class RehearsalTest(unittest.TestCase):
         self.assertTrue(result["liveFilesUnchanged"])
         self.assertTrue(result["stagedInstallClean"])
         self.assertGreater(result["isolatedCoreTests"], 0)
-        self.assertEqual(result["runtimeContractTests"], 3)
+        self.assertEqual(result["runtimeContractTests"], 4)
+        self.assertEqual(result["legacyCompatibility"]["realRowsParsed"], 1)
+        self.assertEqual(result["legacyCompatibility"]["realResolutionsParsed"], 1)
+        self.assertTrue(result["legacyCompatibility"]["copiedResolutionAppended"])
+        self.assertTrue(
+            result["legacyCompatibility"]["councilPathsDeniedDuringProcess"]
+        )
         self.assertTrue(result["failurePath"]["malformedProbabilityRejectedWithoutAppend"])
         self.assertTrue(result["failurePath"]["unavailableSeatSealedWithoutProbability"])
         self.assertTrue(result["runtimeSourcePin"]["sourceDriftRejectedBeforeAppend"])

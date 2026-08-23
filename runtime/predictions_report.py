@@ -11,6 +11,61 @@ from pathlib import Path
 SOURCE_ROOT = Path("@@COUNCIL_TOOLS_SOURCE_ROOT@@")
 EXPECTED_COMMIT = "@@COUNCIL_TOOLS_COMMIT@@"
 EXPECTED_SOURCE_SHA256 = "@@COUNCIL_TOOLS_SOURCE_SHA256@@"
+COUNCIL_LOG = Path.home() / ".claude/knowledge/futures-panel-log.jsonl"
+COUNCIL_RESOLVED = (
+    Path.home() / ".claude/knowledge/council-eval/predictions_resolved.jsonl"
+)
+LIVE_KNOWLEDGE_ROOT = (Path.home() / ".claude/knowledge").resolve()
+
+
+def _install_deny_path_audit_hook() -> None:
+    """Test-only negative proof: fail if this process opens any named path."""
+
+    raw_paths = os.environ.get("COUNCIL_TOOLS_DENY_OPEN_PATHS")
+    if not raw_paths:
+        return
+    denied = {Path(item).expanduser().resolve() for item in raw_paths.split(os.pathsep)}
+
+    def deny_open(event, args):
+        if event != "open" or not args:
+            return
+        raw_path = args[0]
+        if not isinstance(raw_path, (str, bytes, os.PathLike)):
+            return
+        if Path(raw_path).expanduser().resolve() in denied:
+            raise RuntimeError(f"denied test open: {raw_path}")
+
+    sys.addaudithook(deny_open)
+
+
+def _assert_legacy_store_is_separate(log_path: str, resolved_path: str) -> None:
+    council_paths = (COUNCIL_LOG.resolve(), COUNCIL_RESOLVED.resolve())
+    selected = (
+        Path(log_path).expanduser().resolve(),
+        Path(resolved_path).expanduser().resolve(),
+    )
+
+    def aliases(left: Path, right: Path) -> bool:
+        if left == right:
+            return True
+        try:
+            return left.samefile(right)
+        except (FileNotFoundError, OSError):
+            return False
+
+    overlap = {
+        candidate
+        for candidate in selected
+        if candidate.is_relative_to(LIVE_KNOWLEDGE_ROOT)
+        or any(aliases(candidate, council_path) for council_path in council_paths)
+    }
+    if overlap:
+        raise SystemExit(
+            "legacy compatibility mode refuses live-knowledge paths or council-store aliases: "
+            + ", ".join(str(path) for path in sorted(overlap, key=str))
+        )
+    if aliases(*selected):
+        raise SystemExit("legacy log and resolution paths must be separate files")
 
 
 def _source_digest(source_root: Path) -> str:
@@ -45,11 +100,9 @@ def _assert_source_integrity() -> None:
         )
 
 
+_install_deny_path_audit_hook()
 _assert_source_integrity()
 sys.path.insert(0, str(SOURCE_ROOT / "src"))
-
-from council_tools.cli import main  # noqa: E402
-from council_tools.legacy_report import main as legacy_main  # noqa: E402
 
 
 if __name__ == "__main__":
@@ -58,6 +111,9 @@ if __name__ == "__main__":
     if legacy_log or legacy_resolved:
         if not legacy_log or not legacy_resolved:
             raise SystemExit("legacy mode requires both PANEL_LOG and PANEL_RESOLVED")
+        _assert_legacy_store_is_separate(legacy_log, legacy_resolved)
+        from council_tools.legacy_report import main as legacy_main
+
         raise SystemExit(
             legacy_main(
                 sys.argv[1:],
@@ -65,6 +121,8 @@ if __name__ == "__main__":
                 resolved_path=legacy_resolved,
             )
         )
+    from council_tools.cli import main
+
     if len(sys.argv) == 1:
         sys.argv.append("report")
     elif sys.argv[1] == "--all":

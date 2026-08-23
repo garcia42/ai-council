@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
+import os
 import sys
 from datetime import date
 from pathlib import Path
@@ -37,6 +39,17 @@ def _load(path: Path) -> list[dict]:
 
 def _key(ts: str, index: int) -> str:
     return f"{ts}#{index}"
+
+
+def _resolution_key(row: dict) -> str:
+    key = row.get("key")
+    if isinstance(key, str) and key:
+        return key
+    ts = row.get("ts")
+    index = row.get("index")
+    if isinstance(ts, str) and ts and isinstance(index, int) and not isinstance(index, bool):
+        return _key(ts, index)
+    raise LegacyReportError("legacy resolution requires key or timestamp/index identity")
 
 
 def _probability(value) -> int:
@@ -76,16 +89,30 @@ def resolve(
         "came_true": came_true,
         "note": note,
     }
-    resolved_path.parent.mkdir(parents=True, exist_ok=True)
-    with resolved_path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(event, sort_keys=True) + "\n")
+    if not resolved_path.parent.is_dir():
+        raise LegacyReportError(
+            f"legacy resolution directory does not exist: {resolved_path.parent}"
+        )
+    lock_path = resolved_path.with_name(f"{resolved_path.name}.lock")
+    with lock_path.open("a+", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        if any(_resolution_key(row) == event["key"] for row in _load(resolved_path)):
+            raise LegacyReportError(f"legacy resolution already exists: {event['key']}")
+        with resolved_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(event, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
     print(f"recorded: {str(event['claim'])[:70]!r} -> {'TRUE' if came_true else 'FALSE'}")
 
 
 def report(log_path: Path, resolved_path: Path, *, show_all: bool) -> None:
     rows = _load(log_path)
     resolutions = _load(resolved_path)
-    done = {row.get("key") for row in resolutions if row.get("key")}
+    resolution_keys = [_resolution_key(row) for row in resolutions]
+    if len(resolution_keys) != len(set(resolution_keys)):
+        raise LegacyReportError("legacy resolution store contains duplicate outcome identities")
+    done = set(resolution_keys)
     today = date.today()
     due = []
     pending = []
@@ -157,22 +184,34 @@ def main(
     log_path = Path(log_path)
     resolved_path = Path(resolved_path)
     try:
-        if args and args[0] == "--resolve":
-            if len(args) < 4:
+        if not args or args == ["--all"]:
+            report(log_path, resolved_path, show_all=args == ["--all"])
+        elif args[0] == "--resolve":
+            if len(args) not in (4, 5):
                 raise LegacyReportError(
                     "usage: --resolve <ts> <index> <true|false> [note]"
                 )
+            try:
+                index = int(args[2])
+            except ValueError as exc:
+                raise LegacyReportError("legacy resolution index must be an integer") from exc
+            normalized_outcome = args[3].lower()
+            if normalized_outcome not in ("true", "false"):
+                raise LegacyReportError("legacy outcome must be exactly true or false")
             resolve(
                 log_path,
                 resolved_path,
                 ts=args[1],
-                index=int(args[2]),
-                came_true=args[3].lower() in ("true", "t", "yes", "y", "1"),
+                index=index,
+                came_true=normalized_outcome == "true",
                 note=args[4] if len(args) > 4 else "",
             )
         else:
-            report(log_path, resolved_path, show_all="--all" in args)
+            raise LegacyReportError(
+                "legacy mode accepts only --all or "
+                "--resolve <ts> <index> <true|false> [note]"
+            )
         return 0
-    except (LegacyReportError, OSError, ValueError) as exc:
+    except (LegacyReportError, OSError) as exc:
         print(str(exc), file=sys.stderr)
         return 1

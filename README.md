@@ -65,4 +65,9 @@ review before writes move away from `manny`.
 
 The existing T&R wrapper is deliberately separate: when both `PANEL_LOG` and `PANEL_RESOLVED` are
 set, the pinned runtime dispatches to a version-controlled legacy reporter for that store. It does
-not feed T&R records or timestamp/index resolutions into the council scorer.
+not import the council CLI or feed T&R records or timestamp/index resolutions into the council
+scorer. It accepts only the legacy `--all` and `--resolve` forms and rejects unknown or council CLI
+arguments. The wrapper refuses any path inside the live knowledge tree as well as direct, symlink,
+and hard-link aliases to either council store. Runtime contract tests additionally set
+`COUNCIL_TOOLS_DENY_OPEN_PATHS` so any attempted open of a council file fails the process,
+providing a negative read-access test; this variable is a test-only guard.

@@ -28,6 +28,13 @@ EVENTS_RELATIVE = Path(
 BLIND_RELATIVE = Path(
     ".claude/knowledge/council-eval/blind_seat_kill_criterion.py"
 )
+LEGACY_LOG_RELATIVE = Path("truth-and-reconciliation/data/forecasts.jsonl")
+LEGACY_EVENTS_RELATIVE = Path("truth-and-reconciliation/data/resolved.jsonl")
+LEGACY_ENV_KEYS = (
+    "PANEL_LOG",
+    "PANEL_RESOLVED",
+    "COUNCIL_TOOLS_DENY_OPEN_PATHS",
+)
 
 
 class RehearsalError(RuntimeError):
@@ -45,6 +52,29 @@ def _load_module(path: Path, name: str):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _clean_council_env() -> dict[str, str]:
+    env = dict(os.environ)
+    for key in LEGACY_ENV_KEYS:
+        env.pop(key, None)
+    return env
+
+
+def _load_jsonl(path: Path) -> list[dict]:
+    rows = []
+    with path.open(encoding="utf-8") as handle:
+        for line_number, raw in enumerate(handle, 1):
+            if not raw.strip():
+                continue
+            try:
+                row = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise RehearsalError(f"{path} line {line_number}: {exc}") from exc
+            if not isinstance(row, dict):
+                raise RehearsalError(f"{path} line {line_number}: expected object")
+            rows.append(row)
+    return rows
 
 
 def _copy(source_root: Path, stage_root: Path, relative: Path) -> None:
@@ -68,9 +98,14 @@ def rehearse(source_root: Path, *, today: str) -> dict:
     live_events = source_root / EVENTS_RELATIVE
     if live_events.is_file():
         source_files.append(live_events)
+    legacy_log = source_root / LEGACY_LOG_RELATIVE
+    legacy_events = source_root / LEGACY_EVENTS_RELATIVE
+    if not legacy_log.is_file() or not legacy_events.is_file():
+        raise RehearsalError("real T&R legacy log and resolution sidecar are required")
+    source_files.extend((legacy_log, legacy_events))
     before_hashes = {str(path): _digest(path) for path in source_files}
 
-    core_env = dict(os.environ)
+    core_env = _clean_council_env()
     core_env["PYTHONPATH"] = f"{REPO / 'src'}:{REPO}"
     core_tests = subprocess.run(
         [
@@ -128,7 +163,7 @@ def rehearse(source_root: Path, *, today: str) -> dict:
         if not clean:
             raise RehearsalError(f"staged install has drift: {differences}")
 
-        runtime_env = dict(os.environ)
+        runtime_env = _clean_council_env()
         runtime_env["COUNCIL_RUNTIME_ROOT"] = str(stage_root)
         runtime_tests = subprocess.run(
             [
@@ -161,6 +196,7 @@ def rehearse(source_root: Path, *, today: str) -> dict:
         runtime_test_count = int(runtime_count_match.group(1))
 
         reporter = stage_root / ".claude/knowledge/council-eval/predictions_report.py"
+        council_env = _clean_council_env()
         failure_log = stage_root / ".claude/knowledge/council-eval/failure-path.jsonl"
         failure_events = stage_root / ".claude/knowledge/council-eval/failure-events.jsonl"
         attempt_spec = stage_root / "failure-attempt.json"
@@ -197,6 +233,7 @@ def rehearse(source_root: Path, *, today: str) -> dict:
             ],
             text=True,
             capture_output=True,
+            env=council_env,
             check=False,
         )
         if started.returncode != 0:
@@ -251,6 +288,7 @@ def rehearse(source_root: Path, *, today: str) -> dict:
             ],
             text=True,
             capture_output=True,
+            env=council_env,
             check=False,
         )
         if rejected.returncode != 1 or len(failure_log.read_text(encoding="utf-8").splitlines()) != 1:
@@ -287,6 +325,7 @@ def rehearse(source_root: Path, *, today: str) -> dict:
             ],
             text=True,
             capture_output=True,
+            env=council_env,
             check=False,
         )
         completed = subprocess.run(
@@ -303,6 +342,7 @@ def rehearse(source_root: Path, *, today: str) -> dict:
             ],
             text=True,
             capture_output=True,
+            env=council_env,
             check=False,
         )
         if checked.returncode != 0 or completed.returncode != 0:
@@ -326,6 +366,7 @@ def rehearse(source_root: Path, *, today: str) -> dict:
             ],
             text=True,
             capture_output=True,
+            env=council_env,
             check=False,
         )
         if failure_report.returncode != 0:
@@ -355,6 +396,7 @@ def rehearse(source_root: Path, *, today: str) -> dict:
             report_command,
             text=True,
             capture_output=True,
+            env=council_env,
             check=False,
         )
         if report.returncode not in (0, 3):
@@ -406,6 +448,7 @@ def rehearse(source_root: Path, *, today: str) -> dict:
             ],
             text=True,
             capture_output=True,
+            env=council_env,
             check=False,
         )
         drift_source.write_bytes(drift_original)
@@ -416,6 +459,91 @@ def rehearse(source_root: Path, *, today: str) -> dict:
         ):
             raise RehearsalError(
                 "write-capable runtime did not fail closed on imported-source drift"
+            )
+
+        staged_legacy_log = stage_root / "legacy-copy/forecasts.jsonl"
+        staged_legacy_events = stage_root / "legacy-copy/resolved.jsonl"
+        staged_legacy_log.parent.mkdir(parents=True)
+        shutil.copy2(legacy_log, staged_legacy_log)
+        shutil.copy2(legacy_events, staged_legacy_events)
+        legacy_rows = _load_jsonl(staged_legacy_log)
+        legacy_resolutions = _load_jsonl(staged_legacy_events)
+        resolved_keys = {
+            event.get("key")
+            or f"{event.get('ts')}#{event.get('index')}"
+            for event in legacy_resolutions
+        }
+        unresolved = None
+        for row in legacy_rows:
+            predictions = row.get("predictions") or []
+            if not isinstance(predictions, list):
+                raise RehearsalError("real T&R predictions field is not a list")
+            for index, prediction in enumerate(predictions):
+                key = f"{row.get('ts')}#{index}"
+                if key not in resolved_keys and isinstance(prediction, dict):
+                    unresolved = (str(row.get("ts")), index)
+                    break
+            if unresolved is not None:
+                break
+        if unresolved is None:
+            raise RehearsalError("real T&R log has no unresolved item for copied resolve gate")
+        legacy_env = {
+            **council_env,
+            "PANEL_LOG": str(staged_legacy_log),
+            "PANEL_RESOLVED": str(staged_legacy_events),
+            "COUNCIL_TOOLS_DENY_OPEN_PATHS": os.pathsep.join(
+                (str(source_root / LEDGER_RELATIVE), str(source_root / EVENTS_RELATIVE))
+            ),
+        }
+        legacy_before = subprocess.run(
+            [sys.executable, str(reporter), "--all"],
+            text=True,
+            capture_output=True,
+            env=legacy_env,
+            check=False,
+        )
+        expected_before = f"CALIBRATION ({len(legacy_resolutions)} resolved)"
+        if legacy_before.returncode != 0 or expected_before not in legacy_before.stdout:
+            raise RehearsalError(
+                "real-data-copy T&R report gate failed: "
+                + legacy_before.stdout
+                + legacy_before.stderr
+            )
+        legacy_resolve = subprocess.run(
+            [
+                sys.executable,
+                str(reporter),
+                "--resolve",
+                unresolved[0],
+                str(unresolved[1]),
+                "false",
+                "copied-data rehearsal only",
+            ],
+            text=True,
+            capture_output=True,
+            env=legacy_env,
+            check=False,
+        )
+        copied_resolutions = _load_jsonl(staged_legacy_events)
+        if legacy_resolve.returncode != 0 or len(copied_resolutions) != len(legacy_resolutions) + 1:
+            raise RehearsalError(
+                "real-data-copy T&R resolve gate failed: "
+                + legacy_resolve.stdout
+                + legacy_resolve.stderr
+            )
+        legacy_after = subprocess.run(
+            [sys.executable, str(reporter), "--all"],
+            text=True,
+            capture_output=True,
+            env=legacy_env,
+            check=False,
+        )
+        expected_after = f"CALIBRATION ({len(copied_resolutions)} resolved)"
+        if legacy_after.returncode != 0 or expected_after not in legacy_after.stdout:
+            raise RehearsalError(
+                "post-resolve T&R copied report gate failed: "
+                + legacy_after.stdout
+                + legacy_after.stderr
             )
 
         after_hashes = {str(path): _digest(path) for path in source_files}
@@ -430,6 +558,12 @@ def rehearse(source_root: Path, *, today: str) -> dict:
             "stagedBackupManifest": str(backup.relative_to(stage_root) / "MANIFEST.tsv"),
             "isolatedCoreTests": core_test_count,
             "runtimeContractTests": runtime_test_count,
+            "legacyCompatibility": {
+                "realRowsParsed": len(legacy_rows),
+                "realResolutionsParsed": len(legacy_resolutions),
+                "copiedResolutionAppended": True,
+                "councilPathsDeniedDuringProcess": True,
+            },
             "failurePath": {
                 "malformedProbabilityRejectedWithoutAppend": True,
                 "unavailableSeatSealedWithoutProbability": True,
