@@ -6,7 +6,13 @@ build-backend = "setuptools.build_meta"
 name = "council-tools"
 version = "0.1.0"
 description = "Append-only council forecast validation and descriptive Brier reporting"
+readme = "README.md"
 requires-python = ">=3.11"
+
+[project.urls]
+Homepage = "https://github.com/garcia42/ai-council"
+Repository = "https://github.com/garcia42/ai-council"
+Issues = "https://github.com/garcia42/ai-council/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]

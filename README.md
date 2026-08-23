@@ -1,73 +1,262 @@
-# Council tools
+# AI Council
 
-Version-controlled source for the local council forecast ledger validator and descriptive Brier
-reporter. Runtime logs and resolution evidence are private state and are never committed here.
+**Measure whether a multi-agent review council is useful—not merely verbose.**
 
-The governing pre-implementation design is in
-`design/2026-08-22-forecast-scoring-mvp.md`.
+AI Council is an append-only evidence and scoring layer for consequential multi-agent reviews.
+Before reviewers answer, the operator records one material, resolvable outcome. Each seat then
+prices the same claim independently. The completed set is sealed, the outcome is resolved later,
+and the forecasts are scored with the Brier score.
 
-## Verification and activation
+The current release makes forecast collection and grading operational. It does **not** yet prove
+that any seat improves decisions, catches novel problems, or deserves to remain on the council.
+Those are the next measurements this project is intended to support.
 
-Run the isolated suite and copied-runtime rehearsal before installation:
+## Why this exists
+
+An AI council can look impressive while every seat repeats the same idea. A consensus can also be
+confidently wrong, and a long review can create the feeling of safety without changing the final
+decision.
+
+AI Council starts with a narrower question: **did each reviewer make a contemporaneous,
+falsifiable judgment that can later be graded?** It preserves the evidence needed to ask harder
+questions about correctness, novelty, redundancy, and marginal decision value.
+
+## What works today
+
+- A pre-review `council-attempt` records the question, expected seats, evidence cutoff, decision
+  link, and a shared binary outcome before any forecast is visible.
+- A completion is accepted only when every expected seat is explicitly `submitted`, `abstained`,
+  or `unavailable`.
+- Submitted forecasts use stable run, outcome, and prediction IDs and are sealed as one set.
+- Resolutions live in an append-only sidecar and support reviewed voids and superseding
+  corrections without rewriting history.
+- Reports show forecast coverage, overdue grading debt, voids, repeated issuances, unresolved
+  outcomes, and descriptive per-seat Brier scores.
+- Scores include a constant-50% reference and an explicitly labelled in-sample base-rate bound.
+- JSONL parsing and validation fail closed; appends use file locks, flushes, and `fsync`.
+- A narrowly scoped repair command can quarantine one confirmed torn final line. It will not skip
+  malformed history.
+- The repository contains isolated unit tests plus a copied-runtime rehearsal and reversible local
+  installer.
+
+The current council adapter has four canonical seats: `code`, `theory`, `ops`, and `blind`.
+The scoring core is useful independently, but the installer and runtime contract are intentionally
+specific to the deployment that motivated the project.
+
+## Lifecycle
+
+```mermaid
+flowchart LR
+    A[Define decision and<br/>shared outcome] --> B[Append attempt]
+    B --> C[Run seats independently]
+    C --> D[Seal explicit seat states<br/>and probabilities]
+    D --> E[Append completion]
+    E --> F[Resolve outcome later]
+    F --> G[Audit coverage and<br/>calculate Brier scores]
+```
+
+The attempt and completion are stored in the council ledger. Outcome resolutions and temporary
+grading-debt overrides are stored separately. Both stores are append-only JSONL.
+
+## Quick start
+
+AI Council requires Python 3.11 or newer and a Unix-like platform (`fcntl` is used for locking).
+It has no third-party runtime dependencies.
 
 ```sh
-PYTHONPATH=src:. python3 -m unittest \
-  tests.test_forecasts tests.test_cli tests.test_install tests.test_legacy_report \
+git clone https://github.com/garcia42/ai-council.git
+cd ai-council
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -e .
+```
+
+Run the isolated test suite:
+
+```sh
+PYTHONPATH=src:. python -m unittest \
+  tests.test_forecasts \
+  tests.test_cli \
+  tests.test_install \
+  tests.test_legacy_report \
   tests.test_rehearse -v
-python3 rehearse.py --root /home/trader
-python3 install.py check --root /home/trader
 ```
 
-`rehearse.py` copies the four integration targets and live ledger to a temporary root. It installs
-only there, runs the runtime contract tests and reporter, compares the blind-seat decision tally,
-and verifies that source hashes did not change. It also runs the isolated core suite between hashes
-of the live ledger, optional resolution sidecar, and all four integration targets. Every write-path
-test receives an explicit temporary ledger; the staged T&R compatibility test receives explicit
-temporary `PANEL_LOG` and `PANEL_RESOLVED` paths.
-
-After council approval, install with a complete backup:
+Inspect an empty or existing pair of explicit stores:
 
 ```sh
-python3 install.py install --root /home/trader \
-  --backup-root /home/trader/.local/state/council-tools/runtime-backups
+python -m council_tools.cli report \
+  --log ./council.jsonl \
+  --events ./resolutions.jsonl
 ```
 
-The command prints the exact backup path. To roll back, verify and restore that manifest while also
-backing up the pre-restore state:
+### 1. Record the attempt before calling reviewers
+
+Create an attempt specification:
+
+```json
+{
+  "question": "Should we deploy the proposed change?",
+  "expectedSeats": ["code", "theory", "ops", "blind"],
+  "sharedOutcome": {
+    "claim": "The change completes its observation window without rollback",
+    "resolutionDate": "2027-03-31",
+    "resolvedBy": "Inspect the deployment and rollback records",
+    "decisionLink": "change-1042",
+    "materiality": "A rollback would reject the deployment decision",
+    "actionIfTrue": "Retain the change",
+    "actionIfFalse": "Revert and investigate",
+    "evidenceCutoffAt": "2027-03-01T12:00:00Z"
+  }
+}
+```
+
+Append it and retain the emitted `runId` and `outcomeId`:
 
 ```sh
-python3 install.py restore --root /home/trader --backup <printed-backup-path> \
-  --backup-root /home/trader/.local/state/council-tools/runtime-backups
+python -m council_tools.cli attempt \
+  --log ./council.jsonl \
+  --spec ./attempt.json \
+  --ts 2027-03-01T12:00:00Z
 ```
 
-The external backup root also maintains a `LATEST` pointer, so loss or cleanup of the source tree
-does not erase either the backup manifest or the path needed to restore it. The installer refuses a
-backup root inside `/home/trader/council-tools`. Restore intentionally preserves the forward-safe
-`council-attempt` allowlist in the blind-seat tally, because attempt rows appended after activation
-are permanent even when the other runtime targets roll back.
+Every reviewer receives the byte-identical shared claim and evidence cutoff. Reviewers must not see
+one another's probabilities.
 
-Live installation requires a clean source commit. The rendered runtime shim pins that commit and a
-SHA-256 over `src/council_tools/*.py`; every invocation refuses to run if either the checked-out
-commit or imported source digest drifts. `install.py check` renders and compares the same pin.
+### 2. Seal the completed council
 
-Live ledger writes are host-guarded to `manny`. A corrupt trailing JSONL write is never skipped;
-after inspecting the exact line, quarantine and remove only that final line with:
+After all calls return, build a completion specification using the emitted `runId`:
+
+```json
+{
+  "runId": "run-REPLACE_WITH_EMITTED_ID",
+  "councilFields": {
+    "verdicts": {
+      "code": "APPROVE",
+      "theory": "CONCERN",
+      "ops": "APPROVE"
+    },
+    "blindSeat": {
+      "required": true,
+      "ran": true,
+      "changedDecision": false
+    }
+  },
+  "seatStates": {
+    "code": "submitted",
+    "theory": "submitted",
+    "ops": "submitted",
+    "blind": "submitted"
+  },
+  "probabilities": {
+    "code": 80,
+    "theory": 55,
+    "ops": 70,
+    "blind": 60
+  }
+}
+```
+
+Validate before appending:
 
 ```sh
-python3 /home/trader/.claude/knowledge/council-eval/predictions_report.py \
-  repair-tail --path <exact-ledger-path> --confirm-final-line <line-number> \
-  --backup-dir <quarantine-directory>
+python -m council_tools.cli complete \
+  --log ./council.jsonl \
+  --spec ./completion.json \
+  --check-only
+
+python -m council_tools.cli complete \
+  --log ./council.jsonl \
+  --spec ./completion.json
 ```
 
-`--today` exists only for isolated tests and copied-ledger rehearsal; the CLI rejects it on live
-council paths. A host migration requires a versioned authority change, rehearsal, and new council
-review before writes move away from `manny`.
+### 3. Resolve and score
 
-The existing T&R wrapper is deliberately separate: when both `PANEL_LOG` and `PANEL_RESOLVED` are
-set, the pinned runtime dispatches to a version-controlled legacy reporter for that store. It does
-not import the council CLI or feed T&R records or timestamp/index resolutions into the council
-scorer. It accepts only the legacy `--all` and `--resolve` forms and rejects unknown or council CLI
-arguments. The wrapper refuses any path inside the live knowledge tree as well as direct, symlink,
-and hard-link aliases to either council store. Runtime contract tests additionally set
-`COUNCIL_TOOLS_DENY_OPEN_PATHS` so any attempted open of a council file fails the process,
-providing a negative read-access test; this variable is a test-only guard.
+Once the complete resolution date has passed in America/New_York, record durable evidence by the
+stable `outcomeId`:
+
+```sh
+python -m council_tools.cli resolve outcome-REPLACE_WITH_EMITTED_ID true \
+  --log ./council.jsonl \
+  --events ./resolutions.jsonl \
+  --evidence "deployment record 1042; no rollback during the observation window" \
+  --resolver "release-operator" \
+  --method deterministic
+
+python -m council_tools.cli report \
+  --log ./council.jsonl \
+  --events ./resolutions.jsonl
+```
+
+For a binary outcome, the Brier score is:
+
+```text
+(forecast probability - observed outcome)^2
+```
+
+Lower is better: `0` is perfect, `0.25` is the score from always forecasting 50%, and `1` is a
+fully confident miss. Early scores remain descriptive because outcomes may be correlated,
+seat-controlled, selectively resolved, or too few to support comparisons.
+
+## Safety model
+
+The ledger is evidence, not a cache:
+
+- Existing records are never edited in place.
+- Duplicate IDs, malformed JSON, unknown seats, invalid dates, partial completions, and invalid
+  corrections are rejected.
+- Repeated forecasts remain visible but do not silently replace the earliest forecast for the same
+  seat and outcome.
+- Three or more outcomes overdue by more than 14 days block decision finalization unless an
+  explicit, expiring override is recorded.
+- Missing or selectively unresolved outcomes make score status `INCOMPLETE`.
+- Runtime logs, prompts, responses, and resolution evidence are private operational data and are
+  not included in this repository.
+
+See [the implemented scoring contract](design/2026-08-22-forecast-scoring-mvp.md) for the full set
+of invariants and explicit non-goals.
+
+## What comes next
+
+Forecast accuracy is necessary but insufficient. The next phase is designed to measure whether
+the council changes decisions for the better:
+
+1. Record immutable references and digests for each seat's exact input and output.
+2. Normalize responses into atomic findings with forced operator dispositions.
+3. Blindly adjudicate finding correctness, novelty, actionability, and confident errors.
+4. Record the decision before and after council review, separating exogenous outcomes from outcomes
+   the decision itself controls.
+5. Measure finding co-occurrence, error correlation, duplicate coverage, and leave-one-seat-out
+   decision effects.
+6. Add, replace, or remove seats only after those measurements reveal a coverage gap.
+
+This is deliberately not presented as a seat leaderboard. A low Brier score alone does not show
+that a reviewer caught something novel or changed the action usefully.
+
+## Repository map
+
+| Path | Purpose |
+| --- | --- |
+| `src/council_tools/forecasts.py` | Ledger validation, append operations, resolution rules, audit, and scoring |
+| `src/council_tools/cli.py` | Explicit-store command-line interface |
+| `runtime/` | Pinned local runtime shim and council contract |
+| `install.py` | Checked, backed-up, reversible integration installer |
+| `rehearse.py` | Copied-runtime activation rehearsal; does not write live evidence |
+| `design/` | Pre-mortem, implementation contract, and design evidence |
+| `tests/` | Unit, compatibility, installer, rehearsal, and runtime-contract tests |
+
+## Deployment-specific integration
+
+The checked-in runtime adapter integrates with an existing Claude-based council under
+`/home/trader`. It pins the installed shim to a clean source commit and source-tree SHA-256,
+backs up all changed targets, rehearses against copied runtime files, keeps a legacy forecasting
+store isolated, and restricts live ledger writes to the configured authority host.
+
+That adapter is included as an auditable real deployment, not as a claim of portability. Use
+explicit `--log` and `--events` paths for standalone evaluation. Generalizing the seat registry,
+runtime paths, and writer authority is future work.
+
+## License
+
+No open-source license has been selected yet. Public availability of the source does not itself
+grant reuse rights. Add a license before treating the project as an open-source dependency.

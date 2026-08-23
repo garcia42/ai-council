@@ -2,5 +2,9 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .coverage
+.venv/
+*.egg-info/
+build/
+dist/
 runtime/*.jsonl
 runtime/*.lock
