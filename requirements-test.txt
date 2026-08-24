@@ -1,0 +1,3 @@
+# AI Council test environment. Keep this file usable from a clean repository clone.
+-e .
+pytest==9.1.1
