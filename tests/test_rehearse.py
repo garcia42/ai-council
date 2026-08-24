@@ -104,7 +104,7 @@ class RehearsalTest(unittest.TestCase):
         self.assertTrue(result["liveCoordinationLockUnopened"])
         self.assertTrue(result["stagedInstallClean"])
         self.assertGreater(result["isolatedCoreTests"], 0)
-        self.assertEqual(result["runtimeContractTests"], 5)
+        self.assertEqual(result["runtimeContractTests"], 6)
         self.assertEqual(
             result["runtimeContractIsolation"]["executedProofTest"],
             "test_rehearsal_audit_guard_denies_live_access_and_path_mutators",

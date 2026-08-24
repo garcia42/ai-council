@@ -18,10 +18,15 @@ from council_tools.forecasts import (
     append_resolution,
     audit,
     brier_score,
+    load_jsonl_with_raw_identity,
     make_attempt,
+    make_supersede,
     new_id,
+    normalize_duplicate_brief,
     outcome_fingerprint,
     repair_trailing_jsonl,
+    superseded_lines,
+    validate_ledger_row,
 )
 
 
@@ -93,6 +98,444 @@ def attempt(**overrides):
     return make_attempt(**values)
 
 
+DUPLICATE_BRIEF = "/tmp/council-briefs/duplicate-{run_id}.md"
+DUPLICATE_FIXTURE_ROOT = (
+    Path(__file__).parent / "fixtures/duplicate-council-row-supersede"
+)
+SUPERSEDE_ADVERSARIAL_PARITY_CASES = (
+    ("boolean schemaVersion", ("schemaVersion",), True),
+    ("non-integer schemaVersion", ("schemaVersion",), 1.0),
+    (
+        "spaced target digest",
+        ("supersedes", "rawLineSha256"),
+        "surround-with-spaces",
+    ),
+    (
+        "spaced witness digest",
+        ("duplicateOf", "rawLineSha256"),
+        "surround-with-spaces",
+    ),
+)
+STRICT_JSON_ADVERSARIAL_PARITY_CASES = (
+    (
+        "duplicate top-level key",
+        b'{"kind":"council","kind":"council-superseded"}\n',
+        "invalid JSON",
+    ),
+    (
+        "duplicate nested key",
+        b'{"kind":"council","blindSeat":{"ran":true,"ran":false}}\n',
+        "invalid JSON",
+    ),
+    ("NaN", b'{"kind":"council","cost":NaN}\n', "invalid JSON"),
+    ("Infinity", b'{"kind":"council","cost":Infinity}\n', "invalid JSON"),
+    ("negative Infinity", b'{"kind":"council","cost":-Infinity}\n', "invalid JSON"),
+    ("overflowed float", b'{"kind":"council","cost":1e400}\n', "invalid JSON"),
+    ("non-object root", b'[]\n', "record must be an object"),
+    ("invalid UTF-8", b'{"kind":"council","value":"\xff"}\n', "invalid JSON"),
+    ("malformed JSON", b'{"kind":"council"\n', "invalid JSON"),
+    (
+        "excessive nesting",
+        b'{"kind":"council","value":' + b"[" * 2000 + b"0" + b"]" * 2000 + b"}\n",
+        "invalid JSON",
+    ),
+)
+
+
+def apply_supersede_adversarial_case(row, case):
+    """Apply one shared appender/reader parity mutation to a valid assertion."""
+
+    _name, path, replacement = case
+    parent = row
+    for component in path[:-1]:
+        parent = parent[component]
+    field = path[-1]
+    if replacement == "surround-with-spaces":
+        replacement = f" {parent[field]} "
+    parent[field] = replacement
+
+
+def hand_appended_duplicate(completion_row):
+    """The shape a reviewer produces by logging a council row that was already written.
+
+    It is a council row with no ``forecastState`` and no ``predictions``: the forecasts
+    live on the row it duplicates.  Nothing in this repository can write it, which is
+    the point -- it arrives by hand, and an append-only store then has to carry it.
+    """
+
+    return {
+        "kind": "council",
+        "runId": completion_row["runId"],
+        "ts": "2026-08-22T12:10:17Z",
+        "question": completion_row["question"],
+        "verdicts": {"code": "APPROVE"},
+        "blindSeat": dict(completion_row["blindSeat"]),
+    }
+
+
+class SupersedeRecordTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        root = Path(self.temp.name)
+        self.log = root / "panel.jsonl"
+        self.attempt = attempt()
+        self.completion = completion(self.attempt)
+        append_ledger_row(self.log, self.attempt)
+        append_ledger_row(self.log, self.completion)
+        self.original_line, _row, self.original_digest = (
+            load_jsonl_with_raw_identity(self.log)[-1]
+        )
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def hand_append(self, row):
+        """Append bytes the way a reviewer does: straight to the file, no validator."""
+
+        with self.log.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n")
+        loaded = load_jsonl_with_raw_identity(self.log)
+        return loaded[-1][0], loaded[-1][2]
+
+    def supersede(self, line, digest, **overrides):
+        values = dict(
+            line=line,
+            raw_line_sha256=digest,
+            duplicate_of_line=self.original_line,
+            duplicate_of_raw_line_sha256=self.original_digest,
+            reason="Hand-appended duplicate of an earlier council row",
+            operator="operator",
+            approved_at="2026-08-22T13:00:00Z",
+            reference="https://github.com/garcia42/ai-council/issues/25",
+            ts="2026-08-22T13:00:00Z",
+        )
+        values.update(overrides)
+        return make_supersede(**values)
+
+    def test_supersede_retires_a_hand_appended_duplicate(self):
+        line, digest = self.hand_append(hand_appended_duplicate(self.completion))
+
+        append_ledger_row(self.log, self.supersede(line, digest))
+
+        loaded = load_jsonl_with_raw_identity(self.log)
+        self.assertEqual(superseded_lines(loaded), {line: line + 1})
+        self.assertEqual(loaded[-1][1]["kind"], "council-superseded")
+        self.assertEqual(loaded[line - 1][2], digest)
+
+    def test_supersede_refuses_a_row_carrying_sealed_forecasts(self):
+        loaded = load_jsonl_with_raw_identity(self.log)
+        line, _row, digest = loaded[1]
+        self.assertIsNotNone(_row.get("forecastState"))
+        retained_line, retained_digest = self.hand_append(
+            hand_appended_duplicate(self.completion)
+        )
+
+        with self.assertRaisesRegex(LedgerError, "carries a forecastState"):
+            append_ledger_row(
+                self.log,
+                self.supersede(
+                    line,
+                    digest,
+                    duplicate_of_line=retained_line,
+                    duplicate_of_raw_line_sha256=retained_digest,
+                ),
+            )
+
+    def test_supersede_refuses_a_row_carrying_predictions(self):
+        row = hand_appended_duplicate(self.completion)
+        row["predictions"] = self.completion["predictions"]
+        line, digest = self.hand_append(row)
+
+        with self.assertRaisesRegex(LedgerError, "carries predictions"):
+            append_ledger_row(self.log, self.supersede(line, digest))
+
+    def test_supersede_accepts_null_forecast_state_and_an_empty_prediction_list(self):
+        row = hand_appended_duplicate(self.completion)
+        row["forecastState"] = None
+        row["predictions"] = []
+        line, digest = self.hand_append(row)
+
+        append_ledger_row(self.log, self.supersede(line, digest))
+
+    def test_supersede_refuses_malformed_predictions_as_nonempty_evidence(self):
+        for malformed in (None, {}, "not-a-list"):
+            with self.subTest(predictions=malformed):
+                row = hand_appended_duplicate(self.completion)
+                row["predictions"] = malformed
+                line, digest = self.hand_append(row)
+                with self.assertRaisesRegex(LedgerError, "carries predictions"):
+                    append_ledger_row(self.log, self.supersede(line, digest))
+
+    def test_supersede_refuses_a_digest_that_names_a_different_row(self):
+        line, _digest = self.hand_append(hand_appended_duplicate(self.completion))
+        other = load_jsonl_with_raw_identity(self.log)[0][2]
+
+        with self.assertRaisesRegex(LedgerError, "does not match line"):
+            append_ledger_row(self.log, self.supersede(line, other))
+
+    def test_supersede_refuses_a_line_that_holds_no_row(self):
+        _line, digest = self.hand_append(hand_appended_duplicate(self.completion))
+
+        with self.assertRaisesRegex(LedgerError, "names no ledger row"):
+            append_ledger_row(self.log, self.supersede(99, digest))
+
+    def test_supersede_refuses_a_record_that_is_not_a_council_row(self):
+        loaded = load_jsonl_with_raw_identity(self.log)
+        line, _row, digest = loaded[0]
+
+        with self.assertRaisesRegex(LedgerError, "only a council row"):
+            append_ledger_row(self.log, self.supersede(line, digest))
+
+    def test_a_line_cannot_be_superseded_twice(self):
+        line, digest = self.hand_append(hand_appended_duplicate(self.completion))
+        append_ledger_row(self.log, self.supersede(line, digest))
+
+        with self.assertRaisesRegex(LedgerError, "already superseded"):
+            append_ledger_row(self.log, self.supersede(line, digest))
+
+    def test_a_supersede_record_cannot_itself_be_superseded(self):
+        line, digest = self.hand_append(hand_appended_duplicate(self.completion))
+        append_ledger_row(self.log, self.supersede(line, digest))
+        loaded = load_jsonl_with_raw_identity(self.log)
+        record_line, _row, record_digest = loaded[-1]
+
+        with self.assertRaisesRegex(LedgerError, "only a council row"):
+            append_ledger_row(self.log, self.supersede(record_line, record_digest))
+
+    def test_supersede_without_raw_line_identity_is_refused(self):
+        loaded = load_jsonl_with_raw_identity(self.log)
+        line, _row, digest = loaded[1]
+        prior = [row for _line, row, _raw in loaded]
+
+        with self.assertRaisesRegex(LedgerError, "raw line identity"):
+            validate_ledger_row(self.supersede(line, digest), prior)
+
+    def test_supersede_shape_is_exact(self):
+        line, digest = self.hand_append(hand_appended_duplicate(self.completion))
+        loaded = load_jsonl_with_raw_identity(self.log)
+        prior = [row for _line, row, _raw in loaded]
+        cases = {
+            "extra key": lambda row: row.update({"note": "extra"}),
+            "missing approval": lambda row: row.pop("approval"),
+            "missing duplicateOf": lambda row: row.pop("duplicateOf"),
+            "empty reason": lambda row: row.update({"reason": "  "}),
+            "empty operator": lambda row: row["approval"].update({"operator": ""}),
+            "naive approval time": lambda row: row["approval"].update(
+                {"approvedAt": "2026-08-22T13:00:00"}
+            ),
+            "extra approval key": lambda row: row["approval"].update({"host": "manny"}),
+            "short digest": lambda row: row["supersedes"].update(
+                {"rawLineSha256": "abc"}
+            ),
+            "uppercase digest": lambda row: row["supersedes"].update(
+                {"rawLineSha256": digest.upper()}
+            ),
+            "extra supersedes key": lambda row: row["supersedes"].update(
+                {"runId": self.attempt["runId"]}
+            ),
+            "short duplicateOf digest": lambda row: row["duplicateOf"].update(
+                {"rawLineSha256": "abc"}
+            ),
+            "uppercase duplicateOf digest": lambda row: row["duplicateOf"].update(
+                {"rawLineSha256": self.original_digest.upper()}
+            ),
+            "extra duplicateOf key": lambda row: row["duplicateOf"].update(
+                {"runId": self.attempt["runId"]}
+            ),
+            "zero line": lambda row: row["supersedes"].update({"line": 0}),
+            "boolean line": lambda row: row["supersedes"].update({"line": True}),
+            "zero duplicateOf line": lambda row: row["duplicateOf"].update(
+                {"line": 0}
+            ),
+            "boolean duplicateOf line": lambda row: row["duplicateOf"].update(
+                {"line": True}
+            ),
+            "same target and retained row": lambda row: row["duplicateOf"].update(
+                {"line": line, "rawLineSha256": digest}
+            ),
+            "wrong schema version": lambda row: row.update({"schemaVersion": 2}),
+        }
+        for name, mutate in cases.items():
+            with self.subTest(shape=name):
+                row = self.supersede(line, digest)
+                mutate(row)
+                with self.assertRaises(LedgerError):
+                    validate_ledger_row(row, prior, prior_identity=loaded)
+
+    def test_adversarial_parity_cases_never_append_or_retire_a_row(self):
+        line, digest = self.hand_append(hand_appended_duplicate(self.completion))
+        before = self.log.read_bytes()
+
+        for case in SUPERSEDE_ADVERSARIAL_PARITY_CASES:
+            with self.subTest(case=case[0]):
+                row = self.supersede(line, digest)
+                apply_supersede_adversarial_case(row, case)
+                with self.assertRaises(LedgerError):
+                    append_ledger_row(self.log, row)
+                self.assertEqual(self.log.read_bytes(), before)
+                self.assertEqual(
+                    superseded_lines(load_jsonl_with_raw_identity(self.log)), {}
+                )
+
+    def test_superseded_lines_ignores_a_record_whose_target_drifted(self):
+        line, digest = self.hand_append(hand_appended_duplicate(self.completion))
+        append_ledger_row(self.log, self.supersede(line, digest))
+        loaded = load_jsonl_with_raw_identity(self.log)
+        forged = [
+            (
+                number,
+                row,
+                "0" * 64 if number == line else raw,
+            )
+            for number, row, raw in loaded
+        ]
+
+        self.assertEqual(superseded_lines(forged), {})
+
+    def test_a_retired_duplicate_still_blocks_a_second_completion_of_its_run(self):
+        line, digest = self.hand_append(hand_appended_duplicate(self.completion))
+        append_ledger_row(self.log, self.supersede(line, digest))
+
+        with self.assertRaisesRegex(LedgerError, "duplicate council completion"):
+            append_ledger_row(self.log, completion(self.attempt))
+
+    def test_matching_identifier_with_a_third_active_owner_is_ambiguous(self):
+        target_line, target_digest = self.hand_append(
+            hand_appended_duplicate(self.completion)
+        )
+        self.hand_append(hand_appended_duplicate(self.completion))
+
+        with self.assertRaisesRegex(LedgerError, "unique active retained owner"):
+            append_ledger_row(
+                self.log, self.supersede(target_line, target_digest)
+            )
+
+    def test_later_ordinary_collision_does_not_revise_an_accepted_edge(self):
+        target_line, target_digest = self.hand_append(
+            hand_appended_duplicate(self.completion)
+        )
+        append_ledger_row(self.log, self.supersede(target_line, target_digest))
+        supersede_line = load_jsonl_with_raw_identity(self.log)[-1][0]
+
+        self.hand_append(hand_appended_duplicate(self.completion))
+
+        self.assertEqual(
+            superseded_lines(load_jsonl_with_raw_identity(self.log)),
+            {target_line: supersede_line},
+        )
+
+    def test_duplicate_brief_normalization_is_pure_lexical_posix(self):
+        self.assertEqual(
+            normalize_duplicate_brief(
+                " \t/fixtures//normalization/./segment/../blind.md\r\n"
+            ),
+            "/fixtures/normalization/blind.md",
+        )
+        self.assertEqual(
+            normalize_duplicate_brief("//fixtures/$ROOT/~/blind.md/"),
+            "/fixtures/$ROOT/~/blind.md",
+        )
+        for invalid in (
+            None,
+            "",
+            "relative/brief.md",
+            "/",
+            "///",
+            "/..",
+            "/segment/../..",
+            "/segment/\x00brief.md",
+            "\u00a0/brief.md",
+        ):
+            with self.subTest(invalid=invalid):
+                self.assertIsNone(normalize_duplicate_brief(invalid))
+
+    def test_normative_composition_fixtures_drive_appender_replay(self):
+        manifest = json.loads(
+            (DUPLICATE_FIXTURE_ROOT / "manifest.json").read_text(encoding="utf-8")
+        )
+        for scenario in manifest["scenarios"]:
+            if "acceptedSupersedes" not in scenario:
+                continue
+            with self.subTest(fixture=scenario["fixture"]):
+                loaded = load_jsonl_with_raw_identity(
+                    DUPLICATE_FIXTURE_ROOT / scenario["fixture"]
+                )
+                prefix = []
+                accepted = []
+                rejected = []
+                for entry in loaded:
+                    line_number, row, _digest = entry
+                    if row.get("kind") == forecasts.SUPERSEDE_KIND:
+                        try:
+                            forecasts.validate_supersede(row, prefix)
+                        except LedgerError:
+                            rejected.append(line_number)
+                        else:
+                            accepted.append(line_number)
+                    prefix.append(entry)
+                retired = superseded_lines(loaded)
+                all_councils = {
+                    line_number
+                    for line_number, row, _digest in loaded
+                    if row.get("kind") == "council"
+                }
+                self.assertEqual(accepted, scenario["acceptedSupersedes"])
+                self.assertEqual(rejected, scenario["rejectedSupersedes"])
+                self.assertEqual(
+                    sorted(retired), scenario["retiredCouncilLines"]
+                )
+                self.assertEqual(
+                    sorted(all_councils - set(retired)),
+                    scenario["activeCouncilLines"],
+                )
+
+    def test_live_shape_fixture_accepts_only_the_two_named_duplicates(self):
+        manifest = json.loads(
+            (DUPLICATE_FIXTURE_ROOT / "manifest.json").read_text(encoding="utf-8")
+        )
+        scenario = manifest["scenarios"][0]
+        loaded = load_jsonl_with_raw_identity(
+            DUPLICATE_FIXTURE_ROOT / scenario["fixture"]
+        )
+        by_line = {
+            line_number: (row, digest)
+            for line_number, row, digest in loaded
+        }
+
+        def assertion(target_line, retained_line):
+            return make_supersede(
+                line=target_line,
+                raw_line_sha256=by_line[target_line][1],
+                duplicate_of_line=retained_line,
+                duplicate_of_raw_line_sha256=by_line[retained_line][1],
+                reason="fixture duplicate assertion",
+                operator="fixture-operator",
+                approved_at="2030-01-01T00:02:00Z",
+                reference="fixture://issue-32",
+                ts="2030-01-01T00:02:00Z",
+            )
+
+        for candidate in scenario["candidateAssertions"]:
+            self.assertTrue(candidate["valid"])
+            forecasts.validate_supersede(
+                assertion(candidate["supersedes"], candidate["duplicateOf"]),
+                loaded,
+            )
+
+        council_lines = sorted(by_line)
+        for target_line in scenario["candidatesWithNoValidDuplicateOf"]:
+            for retained_line in council_lines:
+                if retained_line == target_line:
+                    continue
+                with self.subTest(
+                    target=target_line, retained=retained_line
+                ):
+                    with self.assertRaises(LedgerError):
+                        forecasts.validate_supersede(
+                            assertion(target_line, retained_line), loaded
+                        )
+
+
 class ForecastLedgerTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -131,15 +574,14 @@ class ForecastLedgerTest(unittest.TestCase):
         with self.assertRaisesRegex(LedgerError, "line 2"):
             audit(self.log, self.events, today=date(2026, 10, 1))
 
-    def test_duplicate_keys_and_nonfinite_json_fail_closed(self):
-        for payload in (
-            '{"kind":"council","kind":"council-attempt"}\n',
-            '{"kind":"council","cost":NaN}\n',
-            '{"kind":"council","cost":1e999}\n',
-        ):
-            with self.subTest(payload=payload):
-                self.log.write_text(payload, encoding="utf-8")
-                with self.assertRaisesRegex(LedgerError, "invalid JSON"):
+    def test_strict_json_adversarial_parity_corpus_fails_closed(self):
+        for name, payload, expected_error in STRICT_JSON_ADVERSARIAL_PARITY_CASES:
+            with self.subTest(case=name):
+                self.log.write_bytes(b'{}\n' + payload)
+                with self.assertRaisesRegex(
+                    LedgerError,
+                    rf"^{self.log.name} line 2: {expected_error}$",
+                ):
                     forecasts.load_jsonl(self.log)
 
     def test_excessively_nested_jsonl_is_one_generic_ledger_parse_error(self):

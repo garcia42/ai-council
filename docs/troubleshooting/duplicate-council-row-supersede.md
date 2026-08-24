@@ -1,11 +1,11 @@
 # A council row that should not exist
 
-> **STOP — specification only.** PR #29 was not approved for merge. Its
-> no-forecast guard admits 20 completed rows on the live ledger, while only two are
-> duplicates. Do not activate that implementation and do not apply a supersede to the
-> live ledger. The required duplicate predicate and append-time composition rules are in
-> [the issue #32 design](../../design/2026-08-24-duplicate-council-row-supersede.md);
-> #33 must implement them and #34 must make reader verification fail closed first.
+> **STOP — not approved for activation.** Issues #33 and #34 implement the duplicate
+> predicate, append-time composition, and fail-closed reader rules in
+> [the issue #32 design](../../design/2026-08-24-duplicate-council-row-supersede.md).
+> A merge council governs repository merge only: merging the code does not activate it
+> or authorize a live supersede. Runtime activation and any live-ledger record each
+> require their own explicit approval.
 
 ## Problem
 
@@ -25,6 +25,10 @@ It is worse than a red gate. Both rows carry `ran: true` and a Boolean `changedD
 so the deployed kill criterion counts each as a completed run. **The denominator the blind
 seat's retire/keep decision rests on is inflated**, and one of the 2026-08-23 pair
 duplicated a `changedDecision: true` — the exact field the criterion is scored on.
+
+A supersede asserts **"this pinned row duplicates that pinned retained row."** It does
+not assert "this row does not count." Absence of forecasts protects the evidence-bearing
+original, but it does not prove that the other row is a duplicate.
 
 ## Root cause
 
@@ -73,9 +77,9 @@ forecasts, this playbook does not apply — you have two councils, not one writt
 
 ## Target-state solution
 
-The procedure below describes the operational sequence only after #33 and #34 have
-implemented the design and the resulting runtime has separately been approved for
-activation. It is not executable against PR #29 as reviewed.
+The procedure below describes the operational sequence only after the corrected code has
+merged and its resulting runtime has separately been approved, rehearsed, activated, and
+verified. Do not execute it merely because the repository contains the implementation.
 
 **Nothing else can cure this.** `repair-tail` removes only a line that fails JSON parsing,
 and these parse. `recover-brief` rewrites `blindSeat.brief`; pointing a duplicate at a
@@ -106,6 +110,8 @@ sed -n '<line>p' ~/.claude/knowledge/futures-panel-log.jsonl | sha256sum
 python3 ~/.claude/knowledge/council-eval/predictions_report.py \
   supersede --log ~/.claude/knowledge/futures-panel-log.jsonl \
   --line <line> --confirm-raw-line-sha256 <digest of that exact line> \
+  --duplicate-of-line <retained-line> \
+  --confirm-duplicate-of-raw-line-sha256 <digest of retained exact line> \
   --reason <why this row should not exist> \
   --operator <name> --reference <where approval was given> --check-only
 ```
@@ -113,12 +119,12 @@ python3 ~/.claude/knowledge/council-eval/predictions_report.py \
 Drop `--check-only` to append. The digest is required rather than derived: a line number
 names a position, and only the digest names a row.
 
-The finished appender must pin both the target (`supersedes`) and its retained witness
-(`duplicateOf`) by line and raw-line digest. It must re-derive the design's duplicate
-predicate, uniqueness rule, and prefix state. The no-forecast check remains a necessary
-evidence-preservation guard on the target, but it is not evidence of duplication and is
-never sufficient. The reader independently re-checks every rule and reports rather than
-obeys: a supersede it cannot verify is an error that retires nothing.
+The appender pins both the target (`supersedes`) and its retained witness (`duplicateOf`)
+by line and raw-line digest. It re-derives the design's duplicate predicate, uniqueness
+rule, and prefix state. The no-forecast check remains a necessary evidence-preservation
+guard on the target, but it is not evidence of duplication and is never sufficient. The
+reader independently replays the same shape, identity, duplicate, and composition checks;
+any record or raw JSON it cannot verify retires nothing.
 
 **4. Re-run the gate.** It should reach exit 0 with `superseded_rows=<n>`.
 
@@ -133,10 +139,11 @@ append any bytes to the ledger, and no in-tool mechanism can prevent it. What th
 record adds is that the correction is now itself append-only, attributed, and re-derivable
 — an operator, a reason, an approval reference, and a digest that pins one exact row.
 
-Known gaps, deliberately not closed here:
+Known gaps and activation prerequisites:
 
-- PR #29 does not carry `duplicateOf` and does not implement the issue #32 predicate or
-  composition rules. It is unsafe to activate or use.
+- Activation must confirm the runtime-only `test_blind_seat_kill_criterion.py` supplies
+  raw-line SHA-256 triples. If it still supplies two-item identities, update it first;
+  the corrected reader deliberately fails those identities closed.
 - The record retires a row from the tally; it does not mark the retired row itself. A
   reader that does not implement supersedes still counts it, which is why activation
   order matters.

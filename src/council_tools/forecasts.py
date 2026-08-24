@@ -55,6 +55,8 @@ ID_RE = re.compile(
 )
 LOCK_TIMEOUT_SECONDS = 10.0
 OUTCOME_FINGERPRINT_RE = re.compile(r"^[0-9a-f]{64}$")
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+SUPERSEDE_KIND = "council-superseded"
 
 
 class LedgerError(ValueError):
@@ -661,12 +663,305 @@ def validate_blind_brief_identity(
             )
 
 
-def validate_ledger_row(row: dict[str, Any], prior_rows: Iterable[dict[str, Any]]) -> None:
+def make_supersede(
+    *,
+    line: int,
+    raw_line_sha256: str,
+    duplicate_of_line: int,
+    duplicate_of_raw_line_sha256: str,
+    reason: str,
+    operator: str,
+    approved_at: str,
+    reference: str,
+    ts: str,
+) -> dict[str, Any]:
+    """Assert that one pinned council row duplicates another pinned council row."""
+
+    return {
+        "schemaVersion": SCHEMA_VERSION,
+        "kind": SUPERSEDE_KIND,
+        "ts": ts,
+        "supersedes": {
+            "line": line,
+            "rawLineSha256": raw_line_sha256,
+        },
+        "duplicateOf": {
+            "line": duplicate_of_line,
+            "rawLineSha256": duplicate_of_raw_line_sha256,
+        },
+        "reason": reason,
+        "approval": {
+            "operator": operator,
+            "approvedAt": approved_at,
+            "reference": reference,
+        },
+    }
+
+
+def _require_exact_keys(value: Any, expected: set[str], label: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise LedgerError(f"{label} must be an object")
+    observed = set(value)
+    if observed != expected:
+        raise LedgerError(
+            f"{label} has unexpected shape; missing={sorted(expected - observed)} "
+            f"extra={sorted(observed - expected)}"
+        )
+    return value
+
+
+def _require_sha256(value: Any, field: str) -> str:
+    if not isinstance(value, str) or not SHA256_RE.fullmatch(value):
+        raise LedgerError(f"{field} must be a lowercase SHA-256 digest")
+    return value
+
+
+def _require_line_number(value: Any, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise LedgerError(f"{field} must be a positive integer")
+    return value
+
+
+_BRIEF_ASCII_TRIM = " \t\r\n"
+
+
+def normalize_duplicate_brief(value: Any) -> str | None:
+    """Return the contract's pure lexical absolute-POSIX brief identity.
+
+    This deliberately does not use :class:`Path`: filesystem state, host path rules,
+    symlinks, and mounts cannot be allowed to change the meaning of an immutable row.
+    """
+
+    if not isinstance(value, str):
+        return None
+    value = value.strip(_BRIEF_ASCII_TRIM)
+    if not value or not value.startswith("/") or "\x00" in value:
+        return None
+    segments: list[str] = []
+    for segment in value.split("/"):
+        if segment in ("", "."):
+            continue
+        if segment == "..":
+            if not segments:
+                return None
+            segments.pop()
+            continue
+        segments.append(segment)
+    if not segments:
+        return None
+    return "/" + "/".join(segments)
+
+
+def _duplicate_run_id(row: dict[str, Any]) -> str | None:
+    value = row.get("runId")
+    return value if isinstance(value, str) and value != "" else None
+
+
+def _duplicate_brief(row: dict[str, Any]) -> str | None:
+    blind_seat = row.get("blindSeat")
+    if not isinstance(blind_seat, dict):
+        return None
+    return normalize_duplicate_brief(blind_seat.get("brief"))
+
+
+def _validate_duplicate_relationship(
+    *,
+    target_line: int,
+    target_row: dict[str, Any],
+    retained_line: int,
+    retained_row: dict[str, Any],
+    active: Mapping[int, dict[str, Any]],
+) -> None:
+    comparable: list[tuple[str, str, Callable[[dict[str, Any]], str | None]]] = []
+    for label, extractor in (
+        ("runId", _duplicate_run_id),
+        ("blindSeat.brief", _duplicate_brief),
+    ):
+        target_value = extractor(target_row)
+        retained_value = extractor(retained_row)
+        if target_value is None or retained_value is None:
+            continue
+        if target_value != retained_value:
+            raise LedgerError(f"duplicate council rows have conflicting {label}")
+        comparable.append((label, target_value, extractor))
+    if not comparable:
+        raise LedgerError("duplicate council rows have no comparable identifier")
+
+    for label, value, extractor in comparable:
+        owners = {
+            line_number
+            for line_number, council_row in active.items()
+            if line_number != target_line and extractor(council_row) == value
+        }
+        if owners != {retained_line}:
+            raise LedgerError(
+                f"duplicate {label} does not have one unique active retained owner"
+            )
+
+
+def _validate_supersede_against_active_prefix(
+    row: dict[str, Any],
+    prior_by_line: Mapping[int, tuple[dict[str, Any], str]],
+    active: Mapping[int, dict[str, Any]],
+) -> tuple[int, int]:
+    _require_exact_keys(
+        row,
+        {
+            "schemaVersion",
+            "kind",
+            "ts",
+            "supersedes",
+            "duplicateOf",
+            "reason",
+            "approval",
+        },
+        "council-superseded record",
+    )
+    if (
+        isinstance(row["schemaVersion"], bool)
+        or not isinstance(row["schemaVersion"], int)
+        or row["schemaVersion"] != SCHEMA_VERSION
+    ):
+        raise LedgerError("council-superseded schemaVersion must be 1")
+    if row["kind"] != SUPERSEDE_KIND:
+        raise LedgerError(f"supersede kind must be {SUPERSEDE_KIND}")
+    _parse_timestamp(row["ts"], "ts")
+    _require_text(row["reason"], "reason")
+    approval = _require_exact_keys(
+        row["approval"], {"operator", "approvedAt", "reference"}, "approval"
+    )
+    _require_text(approval["operator"], "approval.operator")
+    _parse_timestamp(approval["approvedAt"], "approval.approvedAt")
+    _require_text(approval["reference"], "approval.reference")
+
+    references: dict[str, tuple[int, str]] = {}
+    for label in ("supersedes", "duplicateOf"):
+        spec = _require_exact_keys(
+            row[label], {"line", "rawLineSha256"}, label
+        )
+        references[label] = (
+            _require_line_number(spec["line"], f"{label}.line"),
+            _require_sha256(spec["rawLineSha256"], f"{label}.rawLineSha256"),
+        )
+
+    target_line, target_digest = references["supersedes"]
+    retained_line, retained_digest = references["duplicateOf"]
+    if target_line == retained_line:
+        raise LedgerError("supersedes and duplicateOf must name distinct rows")
+
+    resolved: dict[str, dict[str, Any]] = {}
+    for label, line_number, digest in (
+        ("supersedes", target_line, target_digest),
+        ("duplicateOf", retained_line, retained_digest),
+    ):
+        if line_number not in prior_by_line:
+            raise LedgerError(f"{label}.line names no ledger row: {line_number}")
+        council_row, raw_sha256 = prior_by_line[line_number]
+        if raw_sha256 != digest:
+            raise LedgerError(
+                f"{label}.rawLineSha256 does not match line {line_number}"
+            )
+        if council_row.get("kind") != "council":
+            raise LedgerError(
+                f"only a council row can be named by {label}; line {line_number} is "
+                f"kind {council_row.get('kind')!r}"
+            )
+        if line_number not in active:
+            if label == "supersedes":
+                raise LedgerError(
+                    f"line {line_number} is already superseded or otherwise inactive"
+                )
+            raise LedgerError(
+                f"{label}.line names an inactive council row: {line_number}"
+            )
+        resolved[label] = council_row
+
+    target_row = resolved["supersedes"]
+    if target_row.get("forecastState") is not None:
+        raise LedgerError(
+            f"line {target_line} carries a forecastState and cannot be superseded"
+        )
+    if "predictions" in target_row and target_row["predictions"] != []:
+        raise LedgerError(
+            f"line {target_line} carries predictions and cannot be superseded"
+        )
+    _validate_duplicate_relationship(
+        target_line=target_line,
+        target_row=target_row,
+        retained_line=retained_line,
+        retained_row=resolved["duplicateOf"],
+        active=active,
+    )
+    return target_line, retained_line
+
+
+def _replay_supersedes(
+    prior_identity: Iterable[tuple[int, dict[str, Any], str]],
+) -> tuple[dict[int, dict[str, Any]], dict[int, int]]:
+    """Replay accepted edges against each physical prefix without reconsideration."""
+
+    prior_by_line: dict[int, tuple[dict[str, Any], str]] = {}
+    active: dict[int, dict[str, Any]] = {}
+    retired: dict[int, int] = {}
+    for line_number, row, raw_sha256 in prior_identity:
+        if row.get("kind") == "council":
+            active[line_number] = row
+        elif row.get("kind") == SUPERSEDE_KIND:
+            try:
+                target_line, _retained_line = _validate_supersede_against_active_prefix(
+                    row, prior_by_line, active
+                )
+            except LedgerError:
+                pass
+            else:
+                retired[target_line] = line_number
+                del active[target_line]
+        prior_by_line[line_number] = (row, raw_sha256)
+    return active, retired
+
+
+def superseded_lines(
+    prior_identity: Iterable[tuple[int, dict[str, Any], str]],
+) -> dict[int, int]:
+    """Map every retired line number to the supersede record that retired it.
+
+    Only records whose target still verifies retire anything.  A supersede record
+    that cannot be trusted must not be able to hide a row, so an unverifiable one
+    is ignored here and reported by :func:`validate_supersede` when it is appended
+    and by the deployed kill criterion when it is read.
+    """
+
+    _active, retired = _replay_supersedes(prior_identity)
+    return retired
+
+
+def validate_supersede(
+    row: dict[str, Any],
+    prior_identity: Iterable[tuple[int, dict[str, Any], str]],
+) -> None:
+    """Admit only a proven duplicate assertion against the active ledger prefix."""
+
+    prior_identity = list(prior_identity)
+    active, _retired = _replay_supersedes(prior_identity)
+    prior_by_line = {
+        line_number: (prior_row, raw_sha256)
+        for line_number, prior_row, raw_sha256 in prior_identity
+    }
+    _validate_supersede_against_active_prefix(row, prior_by_line, active)
+
+
+def validate_ledger_row(
+    row: dict[str, Any],
+    prior_rows: Iterable[dict[str, Any]],
+    *,
+    prior_identity: Iterable[tuple[int, dict[str, Any], str]] | None = None,
+) -> None:
     # This is also the CLI's check-only boundary. Serializing here prevents
     # otherwise unvalidated nested council metadata from poisoning the ledger
     # with Python's non-standard NaN/Infinity tokens.
     _canonical_json_line(row)
     prior_rows = list(prior_rows)
+    prior_identity = None if prior_identity is None else list(prior_identity)
     kind = row.get("kind")
     if kind == "council-attempt":
         validate_attempt(row)
@@ -692,6 +987,13 @@ def validate_ledger_row(row: dict[str, Any], prior_rows: Iterable[dict[str, Any]
                     "outcome fingerprint already exists; link it in relatedOutcomeIds"
                 )
     elif kind == "council":
+        # Completion and brief identity both stay deliberately unfiltered by
+        # supersedes. The kill criterion stops counting a retired row, which makes the
+        # reader the looser of the two; leaving the appender strict keeps it stricter
+        # than or equal to the reader in every field, which is the only safe direction.
+        # Retiring a duplicate must never make room for a second completion of the same
+        # run, and a brief path carries its own runId, so no legitimate append is
+        # blocked by a row that has been retired.
         validate_completion(row, prior_rows)
         validate_blind_brief_identity(row, prior_rows)
         existing_prediction_ids = {
@@ -705,6 +1007,13 @@ def validate_ledger_row(row: dict[str, Any], prior_rows: Iterable[dict[str, Any]
                 raise LedgerError(
                     f"duplicate predictionId: {prediction['predictionId']}"
                 )
+    elif kind == SUPERSEDE_KIND:
+        if prior_identity is None:
+            raise LedgerError(
+                "superseding a ledger row requires the raw line identity of the "
+                "store it names"
+            )
+        validate_supersede(row, prior_identity)
     else:
         raise LedgerError(f"record command does not accept kind: {kind}")
 
@@ -718,10 +1027,9 @@ def append_ledger_row(
     path = Path(path)
     with evidence_write_lock(coordination_lock):
         with ledger_write_transaction(path) as transaction:
-            prior = [
-                row_value for _, row_value in load_transaction_jsonl(transaction)
-            ]
-            validate_ledger_row(row, prior)
+            prior_identity = load_transaction_jsonl_with_raw_identity(transaction)
+            prior = [row_value for _, row_value, _raw in prior_identity]
+            validate_ledger_row(row, prior, prior_identity=prior_identity)
             _append_jsonl_line(transaction, row)
 
 

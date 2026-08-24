@@ -56,8 +56,10 @@ from .forecasts import (
     derived_ledger_lock_path,
     evidence_write_lock,
     load_jsonl,
+    load_jsonl_with_raw_identity,
     make_attempt,
     make_completion,
+    make_supersede,
     repair_trailing_jsonl,
     transaction_escrow_inventory,
     validate_ledger_row,
@@ -355,13 +357,55 @@ def command_record(args: argparse.Namespace) -> int:
     if not args.check_only:
         _require_ledger_write_authority(args.log, args.coordination_lock)
     row = _load_spec(args.row, "record")
-    prior = [item for _, item in load_jsonl(args.log)]
-    validate_ledger_row(row, prior)
+    prior_identity = load_jsonl_with_raw_identity(args.log)
+    prior = [item for _, item, _raw in prior_identity]
+    validate_ledger_row(row, prior, prior_identity=prior_identity)
     if not args.check_only:
         append_ledger_row(
             args.log, row, coordination_lock=args.coordination_lock
         )
     print("valid" if args.check_only else "recorded")
+    return 0
+
+
+def command_supersede(args: argparse.Namespace) -> int:
+    """Assert that one exact council row duplicates another retained council row.
+
+    The operator supplies both raw-line digests rather than letting the tool trust
+    whatever currently sits at either line number. A line number names a position;
+    the digest names a row.
+    """
+
+    if not args.check_only:
+        _require_ledger_write_authority(args.log, args.coordination_lock)
+    prior_identity = load_jsonl_with_raw_identity(args.log)
+    prior = [item for _, item, _raw in prior_identity]
+    row = make_supersede(
+        line=args.line,
+        raw_line_sha256=args.confirm_raw_line_sha256,
+        duplicate_of_line=args.duplicate_of_line,
+        duplicate_of_raw_line_sha256=(
+            args.confirm_duplicate_of_raw_line_sha256
+        ),
+        reason=args.reason,
+        operator=args.operator,
+        approved_at=args.approved_at or _now(),
+        reference=args.reference,
+        ts=args.ts or _now(),
+    )
+    validate_ledger_row(row, prior, prior_identity=prior_identity)
+    if not args.check_only:
+        append_ledger_row(args.log, row, coordination_lock=args.coordination_lock)
+    print(
+        json.dumps(
+            {
+                "status": "valid" if args.check_only else "recorded",
+                "supersedes": row["supersedes"],
+                "duplicateOf": row["duplicateOf"],
+            },
+            sort_keys=True,
+        )
+    )
     return 0
 
 
@@ -1058,6 +1102,26 @@ def build_parser() -> argparse.ArgumentParser:
     record.add_argument("--check-only", action="store_true")
     coordinated(record, anchor_field="log", context_fields=("log",))
     record.set_defaults(func=command_record)
+
+    supersede = sub.add_parser(
+        "supersede",
+        help="retire one ledger row by appending a council-superseded record",
+    )
+    supersede.add_argument("--log", default=DEFAULT_LOG)
+    supersede.add_argument("--line", required=True, type=int)
+    supersede.add_argument("--confirm-raw-line-sha256", required=True)
+    supersede.add_argument("--duplicate-of-line", required=True, type=int)
+    supersede.add_argument(
+        "--confirm-duplicate-of-raw-line-sha256", required=True
+    )
+    supersede.add_argument("--reason", required=True)
+    supersede.add_argument("--operator", required=True)
+    supersede.add_argument("--reference", required=True)
+    supersede.add_argument("--approved-at")
+    supersede.add_argument("--ts")
+    supersede.add_argument("--check-only", action="store_true")
+    coordinated(supersede, anchor_field="log", context_fields=("log",))
+    supersede.set_defaults(func=command_supersede)
 
     attempt = sub.add_parser("attempt")
     attempt.add_argument("--log", default=DEFAULT_LOG)

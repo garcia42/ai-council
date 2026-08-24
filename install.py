@@ -678,6 +678,7 @@ def _with_attempt_allowlist(criterion_text: str) -> str:
         "council-attempt-v2",
         "council-seats-finished",
         "capture-invalidation",
+        "council-superseded",
     )
     old_allowlist = (
         'NON_COUNCIL_RECORD_KINDS = {"pre-mortem-calibration", "council-calibration"}'
@@ -707,6 +708,430 @@ def _with_attempt_allowlist(criterion_text: str) -> str:
         if f'"{kind}"' not in criterion_text[start:finish]
     )
     return criterion_text[: finish + 1] + missing + criterion_text[finish + 1 :]
+
+
+SUPERSEDE_READER_MARKER = "_apply_supersedes"
+
+_SUPERSEDE_READER_REWRITES = (
+    (
+        "import argparse\nimport json\nimport os\nimport sys\n",
+        "import argparse\nfrom datetime import datetime\nimport hashlib\nimport json\nimport math\nimport os\nimport re\n"
+        "import sys\n",
+    ),
+    (
+        """\
+def load_rows(path):
+    rows = []
+    with open(path, encoding="utf-8") as handle:
+        for line_number, raw in enumerate(handle, 1):
+            if not raw.strip():
+                continue
+            try:
+                rows.append((line_number, json.loads(raw)))
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"line {line_number}: invalid JSON: {exc}") from exc
+    return rows
+
+
+""",
+        """\
+def load_rows(path):
+    rows = []
+    with open(path, "rb") as handle:
+        for line_number, raw in enumerate(handle, 1):
+            if not raw.strip():
+                continue
+            try:
+                row = json.loads(
+                    raw.decode("utf-8"),
+                    object_pairs_hook=_strict_json_object,
+                    parse_constant=_reject_json_constant,
+                )
+                _reject_nonfinite_json_numbers(row)
+            except (
+                UnicodeDecodeError,
+                json.JSONDecodeError,
+                RecursionError,
+                ValueError,
+            ) as exc:
+                raise ValueError(f"line {line_number}: invalid JSON") from exc
+            if not isinstance(row, dict):
+                raise ValueError(f"line {line_number}: record must be an object")
+            rows.append((line_number, row, hashlib.sha256(raw).hexdigest()))
+    return rows
+
+
+def _strict_json_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("invalid JSON: duplicate key")
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(_value):
+    raise ValueError("invalid JSON: non-finite number")
+
+
+def _reject_nonfinite_json_numbers(value):
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError("invalid JSON: non-finite number")
+    if isinstance(value, dict):
+        for nested in value.values():
+            _reject_nonfinite_json_numbers(nested)
+    elif isinstance(value, list):
+        for nested in value:
+            _reject_nonfinite_json_numbers(nested)
+
+
+SUPERSEDE_RECORD_KIND = "council-superseded"
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+SUPERSEDE_BRIEF_ASCII_TRIM = " \\t\\r\\n"
+SUPERSEDE_RECORD_KEYS = {
+    "schemaVersion", "kind", "ts", "supersedes", "duplicateOf", "reason", "approval"
+}
+SUPERSEDE_REFERENCE_KEYS = {"line", "rawLineSha256"}
+SUPERSEDE_APPROVAL_KEYS = {"operator", "approvedAt", "reference"}
+
+# Activation precondition outside this repository: the runtime-only
+# ~/.claude/knowledge/council-eval/test_blind_seat_kill_criterion.py must be updated
+# to pass three-item (line, row, raw_sha256) identities. The former two-item caller
+# is deliberately rejected here and must not be tolerated at activation.
+
+
+def _supersede_nonempty_text(value):
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _supersede_timestamp_is_valid(value):
+    if not _supersede_nonempty_text(value):
+        return False
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except (OverflowError, ValueError):
+        return False
+    return parsed.tzinfo is not None and parsed.utcoffset() is not None
+
+
+def _supersede_record_error(row):
+    observed = set(row)
+    if observed != SUPERSEDE_RECORD_KEYS:
+        return (
+            "council-superseded record has unexpected shape; "
+            f"missing={sorted(SUPERSEDE_RECORD_KEYS - observed)} "
+            f"extra={sorted(observed - SUPERSEDE_RECORD_KEYS)}"
+        )
+    if (
+        isinstance(row["schemaVersion"], bool)
+        or not isinstance(row["schemaVersion"], int)
+        or row["schemaVersion"] != 1
+    ):
+        return "council-superseded schemaVersion must be 1"
+    if row["kind"] != SUPERSEDE_RECORD_KIND:
+        return f"supersede kind must be {SUPERSEDE_RECORD_KIND}"
+    if not _supersede_timestamp_is_valid(row["ts"]):
+        return "ts must be a timezone-aware ISO timestamp"
+    if not _supersede_nonempty_text(row["reason"]):
+        return "reason must be non-empty text"
+    approval = row["approval"]
+    if not isinstance(approval, dict):
+        return "approval must be an object"
+    observed_approval = set(approval)
+    if observed_approval != SUPERSEDE_APPROVAL_KEYS:
+        return (
+            "approval has unexpected shape; "
+            f"missing={sorted(SUPERSEDE_APPROVAL_KEYS - observed_approval)} "
+            f"extra={sorted(observed_approval - SUPERSEDE_APPROVAL_KEYS)}"
+        )
+    if not _supersede_nonempty_text(approval["operator"]):
+        return "approval.operator must be non-empty text"
+    if not _supersede_timestamp_is_valid(approval["approvedAt"]):
+        return "approval.approvedAt must be a timezone-aware ISO timestamp"
+    if not _supersede_nonempty_text(approval["reference"]):
+        return "approval.reference must be non-empty text"
+    for label in ("supersedes", "duplicateOf"):
+        spec = row[label]
+        if not isinstance(spec, dict):
+            return f"{label} must be an object"
+        observed_reference = set(spec)
+        if observed_reference != SUPERSEDE_REFERENCE_KEYS:
+            return (
+                f"{label} has unexpected shape; "
+                f"missing={sorted(SUPERSEDE_REFERENCE_KEYS - observed_reference)} "
+                f"extra={sorted(observed_reference - SUPERSEDE_REFERENCE_KEYS)}"
+            )
+        referenced_line = spec["line"]
+        if (
+            isinstance(referenced_line, bool)
+            or not isinstance(referenced_line, int)
+            or referenced_line < 1
+        ):
+            return f"{label}.line must be a positive integer"
+        digest = spec["rawLineSha256"]
+        if not isinstance(digest, str) or not SHA256_RE.fullmatch(digest):
+            return f"{label}.rawLineSha256 must be a lowercase SHA-256 digest"
+    return None
+
+
+def _normalize_supersede_brief(row):
+    blind_seat = row.get("blindSeat")
+    if not isinstance(blind_seat, dict):
+        return None
+    value = blind_seat.get("brief")
+    if not isinstance(value, str):
+        return None
+    value = value.strip(SUPERSEDE_BRIEF_ASCII_TRIM)
+    if not value or not value.startswith("/") or "\\x00" in value:
+        return None
+    segments = []
+    for segment in value.split("/"):
+        if segment in ("", "."):
+            continue
+        if segment == "..":
+            if not segments:
+                return None
+            segments.pop()
+            continue
+        segments.append(segment)
+    if not segments:
+        return None
+    return "/" + "/".join(segments)
+
+
+def _supersede_run_id(row):
+    value = row.get("runId")
+    return value if isinstance(value, str) and value != "" else None
+
+
+def _supersede_duplicate_error(target_line, target_row, retained_line, retained_row, active):
+    comparable = []
+    for label, extractor in (
+        ("runId", _supersede_run_id),
+        ("blindSeat.brief", _normalize_supersede_brief),
+    ):
+        target_value = extractor(target_row)
+        retained_value = extractor(retained_row)
+        if target_value is None or retained_value is None:
+            continue
+        if target_value != retained_value:
+            return f"duplicate council rows have conflicting {label}"
+        comparable.append((label, target_value, extractor))
+    if not comparable:
+        return "duplicate council rows have no comparable identifier"
+    for label, value, extractor in comparable:
+        owners = {
+            owner_line
+            for owner_line, owner_row in active.items()
+            if owner_line != target_line and extractor(owner_row) == value
+        }
+        if owners != {retained_line}:
+            return f"duplicate {label} does not have one unique active retained owner"
+    return None
+
+
+def _apply_supersedes(rows):
+    \"\"\"Drop ledger rows retired by a council-superseded record.
+
+    An append-only store cannot delete a row that should never have been written, so
+    it says so by appending: the record pins one target by line number and raw-line
+    digest, and this tally then reads as though the target were absent.  Every guard
+    the appender applies is re-checked here rather than assumed, because a record
+    this reader cannot verify must not be able to hide a row -- an unverifiable
+    supersede is an error and retires nothing.
+
+    Refusing to retire a row carrying predictions or a forecastState preserves sealed
+    evidence, but it does not prove duplication. The target and retained witness must
+    also share every comparable identifier and have one unique active retained owner.
+    \"\"\"
+
+    normalized = []
+    errors = []
+    unverifiable_lines = set()
+    for entry_number, entry in enumerate(rows, 1):
+        try:
+            arity = len(entry)
+        except TypeError as exc:
+            raise ValueError(
+                f"ledger row identity entry {entry_number} must contain exactly "
+                "three items"
+            ) from exc
+        if arity == 2:
+            line_number, row = entry
+            raw_sha256 = None
+            errors.append(
+                f"line {line_number}: raw-line identity is missing; record is "
+                "unverifiable"
+            )
+            unverifiable_lines.add(line_number)
+        elif arity == 3:
+            line_number, row, raw_sha256 = entry
+            if not isinstance(raw_sha256, str) or not SHA256_RE.fullmatch(raw_sha256):
+                errors.append(
+                    f"line {line_number}: raw-line identity is invalid; record is "
+                    "unverifiable"
+                )
+                unverifiable_lines.add(line_number)
+        else:
+            raise ValueError(
+                f"ledger row identity entry {entry_number} must contain exactly "
+                f"three items; got {arity}"
+            )
+        normalized.append((line_number, row, raw_sha256))
+
+    targets = {
+        line_number: (row, raw_sha256) for line_number, row, raw_sha256 in normalized
+    }
+    retired = {}
+    active = {}
+    for line_number, row, _raw_sha256 in normalized:
+        if row.get("kind") == "council":
+            active[line_number] = row
+            continue
+        if row.get("kind") != SUPERSEDE_RECORD_KIND:
+            continue
+        if line_number in unverifiable_lines:
+            continue
+        record_error = _supersede_record_error(row)
+        if record_error is not None:
+            errors.append(f"line {line_number}: {record_error}")
+            continue
+        references = {}
+        reference_error = None
+        for label in ("supersedes", "duplicateOf"):
+            spec = row.get(label)
+            if not isinstance(spec, dict):
+                reference_error = f"{label} must be an object"
+                break
+            referenced_line = spec.get("line")
+            digest = spec.get("rawLineSha256")
+            if (
+                isinstance(referenced_line, bool)
+                or not isinstance(referenced_line, int)
+                or referenced_line < 1
+            ):
+                reference_error = f"{label}.line must be a positive integer"
+                break
+            if not isinstance(digest, str) or not SHA256_RE.fullmatch(digest):
+                reference_error = (
+                    f"{label}.rawLineSha256 must be a lowercase SHA-256 digest"
+                )
+                break
+            if referenced_line >= line_number:
+                reference_error = f"{label}.line must name an earlier row"
+                break
+            if referenced_line not in targets:
+                reference_error = (
+                    f"{label}.line names no ledger row: {referenced_line}"
+                )
+                break
+            referenced_row, referenced_sha256 = targets[referenced_line]
+            if referenced_sha256 != digest:
+                reference_error = (
+                    f"{label}.rawLineSha256 does not match line {referenced_line}"
+                )
+                break
+            if referenced_row.get("kind") != "council":
+                reference_error = f"{label}.line must name a council row"
+                break
+            if referenced_line not in active:
+                reference_error = f"{label}.line names an inactive council row"
+                break
+            references[label] = (referenced_line, referenced_row)
+        if reference_error is not None:
+            errors.append(f"line {line_number}: {reference_error}")
+            continue
+        target_line, target_row = references["supersedes"]
+        retained_line, retained_row = references["duplicateOf"]
+        if target_line == retained_line:
+            errors.append(
+                f"line {line_number}: supersedes and duplicateOf must name distinct rows"
+            )
+            continue
+        if target_row.get("forecastState") is not None:
+            errors.append(
+                f"line {line_number}: line {target_line} carries a forecastState and "
+                "cannot be superseded"
+            )
+            continue
+        if "predictions" in target_row and target_row["predictions"] != []:
+            errors.append(
+                f"line {line_number}: line {target_line} carries predictions and "
+                "cannot be superseded"
+            )
+            continue
+        duplicate_error = _supersede_duplicate_error(
+            target_line, target_row, retained_line, retained_row, active
+        )
+        if duplicate_error is not None:
+            errors.append(f"line {line_number}: {duplicate_error}")
+            continue
+        retired[target_line] = line_number
+        del active[target_line]
+    kept = [
+        (line_number, row)
+        for line_number, row, _raw_sha256 in normalized
+        if line_number not in retired
+    ]
+    return kept, len(retired), errors
+
+""",
+    ),
+    (
+        "def tally(rows):\n    completed = []\n",
+        "def tally(rows):\n"
+        "    rows, superseded_rows, errors = _apply_supersedes(rows)\n"
+        "    completed = []\n",
+    ),
+    (
+        "    non_council = []\n    errors = []\n",
+        "    non_council = []\n",
+    ),
+    (
+        '        "legacyBlindRows": len(legacy_blind),\n',
+        '        "legacyBlindRows": len(legacy_blind),\n'
+        '        "supersededRows": superseded_rows,\n',
+    ),
+    (
+        '            "legacy_blind_rows={legacyBlindRows} "\n',
+        '            "legacy_blind_rows={legacyBlindRows} "\n'
+        '            "superseded_rows={supersededRows} "\n',
+    ),
+)
+
+
+def _with_superseded_reader(criterion_text: str) -> str:
+    """Teach the deployed kill criterion to honour council-superseded records.
+
+    The criterion's body is not carried in this repository, so the reader change
+    that must ship with the appender travels as an idempotent, preimage-anchored
+    rewrite -- the same shape as the record-kind allowlist above.  A preimage that
+    no longer matches fails the install rather than producing a reader that admits
+    the record kind while still counting the rows it retires.
+    """
+
+    if SUPERSEDE_READER_MARKER in criterion_text:
+        return criterion_text
+    for preimage, image in _SUPERSEDE_READER_REWRITES:
+        if criterion_text.count(preimage) != 1:
+            raise InstallError(
+                "blind-seat superseded-reader preimage is not unique: "
+                + preimage.splitlines()[0]
+            )
+        criterion_text = criterion_text.replace(preimage, image, 1)
+    return criterion_text
+
+
+def _compile_rendered_criterion(criterion_text: str) -> str:
+    """Fail before publication when the transformed runtime reader is not Python."""
+
+    try:
+        compile(criterion_text, "<rendered blind-seat kill criterion>", "exec")
+    except (SyntaxError, TypeError, ValueError) as exc:
+        raise InstallError(
+            "rendered blind-seat kill criterion does not compile"
+        ) from exc
+    return criterion_text
 
 
 def _render_with_source_custody(
@@ -743,8 +1168,10 @@ def _render_with_source_custody(
             marker="## Steps\n",
         )
 
-        criterion_text = _with_attempt_allowlist(
-            criterion.read_text(encoding="utf-8")
+        criterion_text = _compile_rendered_criterion(
+            _with_superseded_reader(
+                _with_attempt_allowlist(criterion.read_text(encoding="utf-8"))
+            )
         )
 
         claude_text = claude_md.read_text(encoding="utf-8")
@@ -2431,8 +2858,10 @@ def restore(
         criterion = (
             root / ".claude/knowledge/council-eval/blind_seat_kill_criterion.py"
         )
-        payloads[criterion] = _with_attempt_allowlist(
-            payloads[criterion].decode("utf-8")
+        payloads[criterion] = _compile_rendered_criterion(
+            _with_superseded_reader(
+                _with_attempt_allowlist(payloads[criterion].decode("utf-8"))
+            )
         ).encode("utf-8")
         for target in payloads:
             if not target.exists():

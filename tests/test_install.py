@@ -1,15 +1,52 @@
-import io
+import copy
 import hashlib
+import io
+import json
+import math
 import os
+import re
 import shutil
 import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
 import install
+from tests.test_forecasts import (
+    STRICT_JSON_ADVERSARIAL_PARITY_CASES,
+    SUPERSEDE_ADVERSARIAL_PARITY_CASES,
+    apply_supersede_adversarial_case,
+)
+
+
+# The kill criterion's body is not carried in this repository, so an install fixture
+# cannot be a copy of it without drifting from it. This minimal valid module embeds
+# every transform preimage exactly once; the deployed file's independent match is
+# asserted separately, and again by rehearse.py against a copy of the real runtime.
+_SUPERSEDE_PREIMAGES = tuple(
+    preimage for preimage, _image in install._SUPERSEDE_READER_REWRITES
+)
+CRITERION_FIXTURE = (
+    'NON_COUNCIL_RECORD_KINDS = {"pre-mortem-calibration", "council-calibration"}\n'
+    + _SUPERSEDE_PREIMAGES[0]
+    + _SUPERSEDE_PREIMAGES[1]
+    + _SUPERSEDE_PREIMAGES[2]
+    + _SUPERSEDE_PREIMAGES[3]
+    + "    legacy_blind = []\n"
+    + "    result = {\n"
+    + _SUPERSEDE_PREIMAGES[4]
+    + "    }\n"
+    + "    message = (\n"
+    + _SUPERSEDE_PREIMAGES[5]
+    + "    )\n"
+    + "    return result\n"
+)
+DUPLICATE_FIXTURE_ROOT = (
+    Path(__file__).parent / "fixtures/duplicate-council-row-supersede"
+)
 
 
 class InstallerTest(unittest.TestCase):
@@ -25,8 +62,7 @@ class InstallerTest(unittest.TestCase):
             "# Council\n\n## Steps\n\nOld steps\n", encoding="utf-8"
         )
         (self.root / ".claude/knowledge/council-eval/blind_seat_kill_criterion.py").write_text(
-            'NON_COUNCIL_RECORD_KINDS = {"pre-mortem-calibration", "council-calibration"}\n',
-            encoding="utf-8",
+            CRITERION_FIXTURE, encoding="utf-8"
         )
         (self.root / "CLAUDE.md").write_text(
             "# Rules\n\n## SLO/SLI changes require a full council review\n",
@@ -106,6 +142,42 @@ class InstallerTest(unittest.TestCase):
             self.assertNotEqual(target.read_bytes(), self.originals[target])
         return message
 
+    def _apply_rendered_supersede_reader(self, rows):
+        namespace = {
+            "datetime": datetime,
+            "hashlib": hashlib,
+            "json": json,
+            "math": math,
+            "re": re,
+        }
+        exec(install._SUPERSEDE_READER_REWRITES[1][1], namespace)
+        return namespace["_apply_supersedes"](rows)
+
+    def _rendered_supersede_namespace(self):
+        namespace = {
+            "datetime": datetime,
+            "hashlib": hashlib,
+            "json": json,
+            "math": math,
+            "re": re,
+        }
+        exec(install._SUPERSEDE_READER_REWRITES[1][1], namespace)
+        return namespace
+
+    def _fixture_identity(self, fixture):
+        rows = []
+        data = (DUPLICATE_FIXTURE_ROOT / fixture).read_bytes()
+        for line_number, raw in enumerate(data.splitlines(keepends=True), 1):
+            if raw.strip():
+                rows.append(
+                    (
+                        line_number,
+                        json.loads(raw.decode("utf-8")),
+                        hashlib.sha256(raw).hexdigest(),
+                    )
+                )
+        return rows
+
     def test_install_is_backed_up_idempotent_and_checkable(self):
         clean, differences = install.check(self.root)
         self.assertFalse(clean)
@@ -146,13 +218,349 @@ class InstallerTest(unittest.TestCase):
             "council-attempt-v2",
             "council-seats-finished",
             "capture-invalidation",
+            "council-superseded",
         ):
             self.assertIn(f'"{kind}"', criterion)
+        self.assertIn(install.SUPERSEDE_READER_MARKER, criterion)
         reporter = (
             self.root / ".claude/knowledge/council-eval/predictions_report.py"
         ).read_text(encoding="utf-8")
         self.assertNotIn("@@COUNCIL_TOOLS_", reporter)
         self.assertIn(install._repository_identity(install.REPO, require_clean=False)[0], reporter)
+
+    def test_superseded_reader_transform_is_idempotent(self):
+        once = install._with_superseded_reader(CRITERION_FIXTURE)
+        twice = install._with_superseded_reader(once)
+
+        self.assertNotEqual(once, CRITERION_FIXTURE)
+        self.assertEqual(once, twice)
+        self.assertIn(install.SUPERSEDE_READER_MARKER, once)
+
+    def test_superseded_reader_transform_fails_closed_on_a_drifted_criterion(self):
+        drifted = CRITERION_FIXTURE.replace("def tally(rows):", "def tally(records):")
+
+        with self.assertRaisesRegex(install.InstallError, "preimage is not unique"):
+            install._with_superseded_reader(drifted)
+
+    def test_superseded_reader_transform_still_matches_the_deployed_criterion(self):
+        deployed = Path(
+            "/home/trader/.claude/knowledge/council-eval/blind_seat_kill_criterion.py"
+        )
+        if not deployed.is_file():
+            self.skipTest("deployed blind-seat kill criterion is not present")
+        text = deployed.read_text(encoding="utf-8")
+        if install.SUPERSEDE_READER_MARKER in text:
+            self.skipTest("deployed kill criterion already carries the reader change")
+
+        rendered = install._with_superseded_reader(install._with_attempt_allowlist(text))
+
+        compile(rendered, str(deployed), "exec")
+        self.assertIn('"council-superseded"', rendered)
+
+    def test_reader_rechecks_every_current_appender_record_shape_guard(self):
+        base = self._fixture_identity("retained-row-later.jsonl")
+        valid_record = base[-1][1]
+        namespace = self._rendered_supersede_namespace()
+        record_error = namespace["_supersede_record_error"]
+
+        def drop(key):
+            return lambda row: row.pop(key)
+
+        def set_value(key, value):
+            return lambda row: row.__setitem__(key, value)
+
+        def approval_drop(key):
+            return lambda row: row["approval"].pop(key)
+
+        def approval_set(key, value):
+            return lambda row: row["approval"].__setitem__(key, value)
+
+        def reference_drop(label, key):
+            return lambda row: row[label].pop(key)
+
+        def reference_set(label, key, value):
+            return lambda row: row[label].__setitem__(key, value)
+
+        cases = {
+            "missing kind": drop("kind"),
+            "wrong kind": set_value("kind", "not-a-supersede"),
+            "missing schemaVersion": drop("schemaVersion"),
+            "boolean schemaVersion": set_value("schemaVersion", True),
+            "wrong schemaVersion": set_value("schemaVersion", 2),
+            "missing ts": drop("ts"),
+            "empty ts": set_value("ts", " "),
+            "naive ts": set_value("ts", "2030-01-01T00:02:00"),
+            "missing reason": drop("reason"),
+            "empty reason": set_value("reason", " "),
+            "non-string reason": set_value("reason", 1),
+            "missing approval": drop("approval"),
+            "non-object approval": set_value("approval", None),
+            "missing operator": approval_drop("operator"),
+            "empty operator": approval_set("operator", " "),
+            "missing approvedAt": approval_drop("approvedAt"),
+            "naive approvedAt": approval_set(
+                "approvedAt", "2030-01-01T00:02:00"
+            ),
+            "missing reference": approval_drop("reference"),
+            "empty reference": approval_set("reference", " "),
+            "extra approval field": approval_set("host", "fixture-host"),
+            "extra record field": set_value("note", "not allowed"),
+            "non-object supersedes": set_value("supersedes", None),
+            "non-object duplicateOf": set_value("duplicateOf", None),
+            "missing supersedes line": reference_drop("supersedes", "line"),
+            "missing duplicateOf line": reference_drop("duplicateOf", "line"),
+            "extra supersedes field": reference_set(
+                "supersedes", "runId", "run-extra"
+            ),
+            "extra duplicateOf field": reference_set(
+                "duplicateOf", "runId", "run-extra"
+            ),
+            "zero supersedes line": reference_set("supersedes", "line", 0),
+            "boolean duplicateOf line": reference_set(
+                "duplicateOf", "line", True
+            ),
+            "short supersedes digest": reference_set(
+                "supersedes", "rawLineSha256", "abc"
+            ),
+            "uppercase duplicateOf digest": reference_set(
+                "duplicateOf",
+                "rawLineSha256",
+                valid_record["duplicateOf"]["rawLineSha256"].upper(),
+            ),
+            "missing supersedes digest": reference_drop(
+                "supersedes", "rawLineSha256"
+            ),
+            "missing duplicateOf digest": reference_drop(
+                "duplicateOf", "rawLineSha256"
+            ),
+        }
+        for name, mutate in cases.items():
+            with self.subTest(guard=name):
+                record = copy.deepcopy(valid_record)
+                mutate(record)
+                self.assertIsNotNone(record_error(record))
+                if record.get("kind") == "council-superseded":
+                    rows = [*base[:2], (3, record, base[2][2])]
+                    kept, retired_count, errors = (
+                        self._apply_rendered_supersede_reader(rows)
+                    )
+                    self.assertEqual(retired_count, 0)
+                    self.assertEqual(
+                        [line for line, row in kept if row.get("kind") == "council"],
+                        [1, 2],
+                    )
+                    self.assertEqual(len(errors), 1, errors)
+
+    def test_shared_adversarial_parity_cases_never_retire_in_rendered_reader(self):
+        base = self._fixture_identity("retained-row-later.jsonl")
+
+        for case in SUPERSEDE_ADVERSARIAL_PARITY_CASES:
+            with self.subTest(case=case[0]):
+                record = copy.deepcopy(base[-1][1])
+                apply_supersede_adversarial_case(record, case)
+                rows = [*base[:2], (3, record, base[2][2])]
+
+                kept, retired_count, errors = (
+                    self._apply_rendered_supersede_reader(rows)
+                )
+
+                self.assertEqual(retired_count, 0)
+                self.assertEqual(
+                    [line for line, row in kept if row.get("kind") == "council"],
+                    [1, 2],
+                )
+                self.assertEqual(len(errors), 1, errors)
+
+    def test_rendered_loader_matches_strict_appender_json_before_tally(self):
+        load_rows = self._rendered_supersede_namespace()["load_rows"]
+        ledger = self.root / "strict-json-parity.jsonl"
+
+        for name, payload, expected_error in STRICT_JSON_ADVERSARIAL_PARITY_CASES:
+            with self.subTest(case=name):
+                ledger.write_bytes(b'{}\n' + payload)
+                with self.assertRaisesRegex(
+                    ValueError, rf"^line 2: {expected_error}$"
+                ):
+                    load_rows(ledger)
+
+    def test_reader_requires_raw_identity_and_never_skips_digest_comparison(self):
+        rows = self._fixture_identity("retained-row-later.jsonl")
+
+        kept, retired_count, errors = self._apply_rendered_supersede_reader(
+            [(line, row) for line, row, _digest in rows]
+        )
+
+        self.assertEqual(retired_count, 0)
+        self.assertEqual(
+            [line for line, row in kept if row.get("kind") == "council"],
+            [1, 2],
+        )
+        self.assertEqual(
+            len([error for error in errors if "unverifiable" in error]), 3
+        )
+
+        missing_digest_rows = [*rows[:2], (rows[2][0], rows[2][1], None)]
+        kept, retired_count, errors = self._apply_rendered_supersede_reader(
+            missing_digest_rows
+        )
+        self.assertEqual(retired_count, 0)
+        self.assertEqual(
+            [line for line, row in kept if row.get("kind") == "council"],
+            [1, 2],
+        )
+        self.assertTrue(
+            any("line 3" in error and "unverifiable" in error for error in errors)
+        )
+
+        for reference in ("supersedes", "duplicateOf"):
+            with self.subTest(bogus_digest=reference):
+                record = copy.deepcopy(rows[2][1])
+                record[reference]["rawLineSha256"] = "f" * 64
+                kept, retired_count, errors = self._apply_rendered_supersede_reader(
+                    [*rows[:2], (3, record, rows[2][2])]
+                )
+                self.assertEqual(retired_count, 0)
+                self.assertTrue(
+                    any("does not match line" in error for error in errors), errors
+                )
+
+    def test_reader_rejects_unexpected_row_identity_arity_clearly(self):
+        namespace = self._rendered_supersede_namespace()
+        apply_supersedes = namespace["_apply_supersedes"]
+        for entry in ((1,), (1, {}, "a" * 64, "extra"), object()):
+            with self.subTest(entry=entry):
+                with self.assertRaisesRegex(ValueError, "exactly three items"):
+                    apply_supersedes([entry])
+
+    def test_external_two_tuple_runtime_test_is_an_activation_precondition(self):
+        rendered_reader = install._SUPERSEDE_READER_REWRITES[1][1]
+        self.assertIn(
+            "test_blind_seat_kill_criterion.py must be updated", rendered_reader
+        )
+        self.assertIn("must not be tolerated at activation", rendered_reader)
+
+    def test_install_refuses_a_noncompiling_rendered_reader_before_backup(self):
+        criterion = (
+            self.root / ".claude/knowledge/council-eval/blind_seat_kill_criterion.py"
+        )
+        criterion.write_text(
+            criterion.read_text(encoding="utf-8") + "\ndef malformed(:\n",
+            encoding="utf-8",
+        )
+        before = {target: target.read_bytes() for target in self.targets}
+
+        with self.assertRaisesRegex(install.InstallError, "does not compile"):
+            install.install(self.root, self.backups)
+
+        self.assertEqual(
+            {target: target.read_bytes() for target in self.targets}, before
+        )
+        self.assertFalse(self.backups.exists())
+
+    def test_normative_composition_fixtures_drive_independent_reader_replay(self):
+        manifest = json.loads(
+            (DUPLICATE_FIXTURE_ROOT / "manifest.json").read_text(encoding="utf-8")
+        )
+        for scenario in manifest["scenarios"]:
+            if "acceptedSupersedes" not in scenario:
+                continue
+            with self.subTest(fixture=scenario["fixture"]):
+                rows = self._fixture_identity(scenario["fixture"])
+                kept, retired_count, errors = self._apply_rendered_supersede_reader(
+                    rows
+                )
+                active_councils = sorted(
+                    line_number
+                    for line_number, row in kept
+                    if row.get("kind") == "council"
+                )
+                rejected = sorted(
+                    int(error.split(":", 1)[0].split()[1]) for error in errors
+                )
+                self.assertEqual(
+                    retired_count, len(scenario["acceptedSupersedes"])
+                )
+                self.assertEqual(rejected, scenario["rejectedSupersedes"])
+                self.assertEqual(active_councils, scenario["activeCouncilLines"])
+
+    def test_live_shape_fixture_has_only_two_reader_provable_duplicates(self):
+        manifest = json.loads(
+            (DUPLICATE_FIXTURE_ROOT / "manifest.json").read_text(encoding="utf-8")
+        )
+        scenario = manifest["scenarios"][0]
+        rows = self._fixture_identity(scenario["fixture"])
+        by_line = {
+            line_number: digest for line_number, _row, digest in rows
+        }
+
+        def replay_assertion(target_line, retained_line):
+            record = {
+                "schemaVersion": 1,
+                "kind": "council-superseded",
+                "ts": "2030-01-01T00:02:00Z",
+                "supersedes": {
+                    "line": target_line,
+                    "rawLineSha256": by_line[target_line],
+                },
+                "duplicateOf": {
+                    "line": retained_line,
+                    "rawLineSha256": by_line[retained_line],
+                },
+                "reason": "fixture duplicate assertion",
+                "approval": {
+                    "operator": "fixture-operator",
+                    "approvedAt": "2030-01-01T00:02:00Z",
+                    "reference": "fixture://issue-32",
+                },
+            }
+            return self._apply_rendered_supersede_reader(
+                [*rows, (23, record, "d" * 64)]
+            )
+
+        for candidate in scenario["candidateAssertions"]:
+            kept, retired_count, errors = replay_assertion(
+                candidate["supersedes"], candidate["duplicateOf"]
+            )
+            self.assertEqual(errors, [])
+            self.assertEqual(retired_count, 1)
+            self.assertNotIn(candidate["supersedes"], {line for line, _row in kept})
+
+        for target_line in scenario["candidatesWithNoValidDuplicateOf"]:
+            _kept, retired_count, errors = replay_assertion(target_line, 1)
+            self.assertEqual(retired_count, 0)
+            self.assertEqual(len(errors), 1)
+
+    def test_reader_does_not_revise_an_edge_after_a_later_ordinary_collision(self):
+        rows = self._fixture_identity("retained-row-later.jsonl")
+        later = dict(rows[1][1])
+        later["ts"] = "2030-01-01T00:03:00Z"
+        rows.append((4, later, "f" * 64))
+
+        kept, retired_count, errors = self._apply_rendered_supersede_reader(rows)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(retired_count, 1)
+        self.assertEqual(
+            [line for line, row in kept if row.get("kind") == "council"],
+            [2, 4],
+        )
+
+    def test_reader_refuses_a_matching_identifier_with_three_active_owners(self):
+        rows = self._fixture_identity("retained-row-later.jsonl")
+        target, retained, supersede = rows
+        third = dict(retained[1])
+        third["ts"] = "2030-01-01T00:01:30Z"
+        rows = [target, retained, (3, third, "e" * 64), (4, supersede[1], supersede[2])]
+
+        kept, retired_count, errors = self._apply_rendered_supersede_reader(rows)
+
+        self.assertEqual(retired_count, 0)
+        self.assertEqual(
+            [line for line, row in kept if row.get("kind") == "council"],
+            [1, 2, 3],
+        )
+        self.assertEqual(len(errors), 1)
+        self.assertIn("unique active retained owner", errors[0])
 
     def test_retained_report_create_failure_reports_committed_custody(self):
         self._assert_committed_runtime_report_failure("create")
