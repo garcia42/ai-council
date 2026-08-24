@@ -151,6 +151,7 @@ class ForecastCliTest(unittest.TestCase):
                 {
                     "runId": run_id,
                     "councilFields": {
+                        "commits": ["1" * 40, "2" * 40],
                         "verdicts": {
                             "code": "APPROVE",
                             "theory": "APPROVE",
@@ -788,6 +789,7 @@ class ForecastCliTest(unittest.TestCase):
                 {
                     "runId": seeded["runId"],
                     "councilFields": {
+                        "commits": {"state": "decision-only"},
                         "verdicts": {"code": "APPROVE"},
                         "blindSeat": {
                             "role": "SKIPPED",

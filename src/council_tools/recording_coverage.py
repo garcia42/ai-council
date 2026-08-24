@@ -40,6 +40,7 @@ ARRAY_ABBREVIATED = "array-abbreviated"
 ARRAY_EMPTY = "array-empty"
 OBJECT_NAMES_CANDIDATE = "object-names-candidate-commit"
 OBJECT_PRECOMMIT = "object-precommit-review"
+OBJECT_NO_CONTENT = "object-no-reviewable-content"
 OBJECT_BASE_ONLY = "object-base-pointer-only"
 FIELD_NULL = "field-null"
 FIELD_ABSENT = "field-absent"
@@ -51,6 +52,7 @@ SHAPES = (
     ARRAY_EMPTY,
     OBJECT_NAMES_CANDIDATE,
     OBJECT_PRECOMMIT,
+    OBJECT_NO_CONTENT,
     OBJECT_BASE_ONLY,
     FIELD_NULL,
     FIELD_ABSENT,
@@ -69,6 +71,7 @@ SHAPE_DESCRIPTIONS = {
     ARRAY_EMPTY: "empty array; indistinguishable from an unpopulated field",
     OBJECT_NAMES_CANDIDATE: "object naming the reviewed tip commit alongside its base",
     OBJECT_PRECOMMIT: "object recording a review of a staged or uncommitted tree",
+    OBJECT_NO_CONTENT: "object recording a review that had no diff to read",
     OBJECT_BASE_ONLY: "object naming only a branch point or production head, not what was read",
     FIELD_NULL: "field present and null",
     FIELD_ABSENT: "field absent",
@@ -79,6 +82,12 @@ SHAPE_DESCRIPTIONS = {
 #: commit.  Those reviews were real; there was simply nothing to name.
 _TREE_KEYS = frozenset({"stagedTree", "candidate_tree", "candidateTree"})
 _PRECOMMIT_VALUE_PREFIX = "uncommitted"
+
+#: The validated `state` vocabulary a completion may now write. Kept as literals
+#: rather than imported from `reviewed_record` so this reader stays able to read
+#: a ledger written by any version of the writer.
+_DECLARED_CONTENT_STATES = frozenset({"uncommitted", "staged"})
+_DECLARED_EMPTY_STATES = frozenset({"no-diff", "decision-only"})
 
 #: Keys whose value names the reviewed *tip*. A reconciler can join on these:
 #: with the row's base they bound exactly what was read. ``base`` is excluded --
@@ -170,9 +179,17 @@ def classify_shape(row: Mapping[str, Any]) -> str:
             return ARRAY_FULL_SHAS
         return ARRAY_ABBREVIATED
     if isinstance(commits, Mapping):
-        # An explicit "uncommitted" declaration is the row stating outright what
-        # it reviewed, so it outranks everything: a tip recorded beside it does
-        # not undo the statement that the reviewed content was not a commit.
+        # An explicit declared state is the row stating outright what it
+        # reviewed, so it outranks everything: a tip recorded beside it does not
+        # undo the statement that the reviewed content was not a commit. The
+        # validated vocabulary is checked first, then the older free-text
+        # `uncommitted-*` values that predate it.
+        state = commits.get("state")
+        if isinstance(state, str):
+            if state in _DECLARED_CONTENT_STATES:
+                return OBJECT_PRECOMMIT
+            if state in _DECLARED_EMPTY_STATES:
+                return OBJECT_NO_CONTENT
         if any(
             isinstance(value, str) and value.startswith(_PRECOMMIT_VALUE_PREFIX)
             for value in commits.values()

@@ -14,6 +14,7 @@ from typing import Any, Callable, Iterable, Mapping
 from zoneinfo import ZoneInfo
 
 from .capture_schema import strict_json_loads
+from .reviewed_record import ReviewedRecordError, validate_reviewed_record
 from .safe_files import (
     PinnedFileTransaction,
     SafeFileError,
@@ -221,6 +222,16 @@ def validate_attempt(row: dict[str, Any]) -> None:
         _require_id(item, "outcome", "relatedOutcomeIds item")
 
 
+def _reviewed_shapes_hint() -> str:
+    """The two valid shapes, spelled out wherever the record is refused."""
+
+    return (
+        'either a non-empty array of full 40-character object names, or an '
+        'object such as {"state": "uncommitted", "contentSha256": "<64 hex>"} '
+        'for a review of something that was not a commit'
+    )
+
+
 def make_completion(
     *,
     attempt: dict[str, Any],
@@ -277,6 +288,19 @@ def make_completion(
     overlap = protected.intersection(council_fields)
     if overlap:
         raise LedgerError(f"councilFields contains protected keys: {sorted(overlap)}")
+    if "commits" not in council_fields:
+        # Required, not merely validated when present. An optional field is how
+        # a quarter of the ledger ended up unable to say what it reviewed, and a
+        # council that cannot state what it read has not left a reviewable
+        # record of having read anything.
+        raise LedgerError(
+            "councilFields must record what was reviewed in commits; "
+            + _reviewed_shapes_hint()
+        )
+    try:
+        validate_reviewed_record(council_fields["commits"])
+    except ReviewedRecordError as exc:
+        raise LedgerError(str(exc)) from exc
     row = {
         "schemaVersion": SCHEMA_VERSION,
         "kind": "council",

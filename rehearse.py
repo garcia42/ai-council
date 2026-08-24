@@ -321,6 +321,9 @@ def rehearse(source_root: Path, *, today: str) -> dict:
         common_completion = {
             "runId": run_id,
             "councilFields": {
+                # A rehearsal reviews nothing, and now has to say so rather than
+                # leave the field off.
+                "commits": {"state": "decision-only", "note": "rehearsal"},
                 "verdicts": {
                     "code": "APPROVE",
                     "theory": "APPROVE",

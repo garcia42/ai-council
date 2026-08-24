@@ -22,6 +22,7 @@ problems—or are they correlated copies producing expensive reassurance?
 | Off-host durability age and verified-restore evidence | Implemented and evidence-gated |
 | Content-manifested local snapshot and clean restore | Rehearsal-only |
 | Live V2 capture activation | Evidence-gated; not activated by install or this release |
+| Validated record of what each council reviewed | Implemented and tested |
 | Recording-coverage reporting (precondition for review coverage) | Implemented and tested |
 | Review coverage against version control | Blocked on a producer for the reviewed-commit record |
 | Seat ranking, weighting, admission, or retirement | Deliberately not implemented |
@@ -211,6 +212,39 @@ observation time.
 For a binary outcome, Brier is `(forecast probability - observed outcome)^2`. Lower is better:
 `0` is perfect, `0.25` is the score from always forecasting 50%, and `1` is a fully confident miss.
 
+## What a council reviewed, recorded so it can be read
+
+`complete` used to accept whatever `councilFields` a caller supplied, checking only that it did not
+collide with a protected key. `commits` — the one field saying what the seats actually read — was
+never validated, and had no producer. Seven shapes accumulated, and about a quarter of rows ended up
+able to name what they reviewed.
+
+It is now **required and validated**, in exactly two shapes:
+
+```json
+["7d1a…", "9f30…"]
+{"state": "uncommitted", "contentSha256": "<64 hex>", "base": "<sha>"}
+```
+
+`state` is one of `uncommitted`, `staged`, `no-diff`, `decision-only`. The first two reviewed content
+and require its digest; the last two had none and must omit it. `base` and `note` are optional. No
+other key is accepted — an open vocabulary is how the seven shapes happened.
+
+The second shape exists because a fifth of real councils review a staged or uncommitted tree. This
+project's own convention is *commit first, then convene*, and it is honoured less often than it is
+stated. Those reviews are real and have no commit to name, so forcing them into an array would make
+the record lie.
+
+Refused, though all appear in history: an empty array (indistinguishable from a field nobody
+populated — a council that read no diff says `{"state": "no-diff"}`), an abbreviation (does not
+survive a rewritten history, and cannot be resolved from the ledger alone), and a bare
+`{"base": "<sha>"}` (a branch point is where the work started, not what was reviewed).
+
+This validates; it does not derive. Deriving the array inside `complete` would put git in the one
+code path that must not acquire new ways to fail mid-transaction, and the caller already computes the
+range it briefed the seats on. Validation makes an unreadable claim impossible to append. It cannot
+make a false one impossible, and nothing here should be read as proving a review happened.
+
 ## Recording coverage: can we tell what a council read?
 
 Every rate this project reports is over councils that *happened*. A skipped review writes nothing,
@@ -387,6 +421,7 @@ adjudication and statistical rules.
 | `src/council_tools/gcs_durability.py` | Narrow create-only Google Cloud Storage adapter |
 | `src/council_tools/activation_evidence.py` | Source-bound manifest validation and activation readiness evaluation |
 | `src/council_tools/capture_runtime.py` | Cross-module atomic integration and uniform-binding preflight |
+| `src/council_tools/reviewed_record.py` | The two valid shapes for what a council reviewed; required and validated on completion |
 | `src/council_tools/recording_coverage.py` | Ledger-only report on whether councils record what they reviewed |
 | `src/council_tools/cli.py` | Standalone and deployment command-line interface |
 | `runtime/` | Pinned Claude-based runtime adapter and operating contract |

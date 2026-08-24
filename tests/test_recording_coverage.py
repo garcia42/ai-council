@@ -11,6 +11,8 @@ from pathlib import Path
 
 from council_tools.recording_coverage import (
     ARRAY_ABBREVIATED,
+    NAMES_COMMITS,
+    OBJECT_NO_CONTENT,
     SHAPES,
     OBJECT_NAMES_CANDIDATE,
     ARRAY_EMPTY,
@@ -498,3 +500,47 @@ class RecordingCliTest(ReportTestBase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ValidatedVocabularyTest(unittest.TestCase):
+    """The reader must recognise the only shapes the writer will now accept.
+
+    Without this the reporter files every `no-diff` and `decision-only` record
+    as OTHER -- "some other shape" -- the moment the write-side validation lands.
+    """
+
+    def shape(self, commits):
+        return classify_shape(
+            {"kind": "council", "ts": "2026-09-01T00:00:00Z", "commits": commits}
+        )
+
+    def test_declared_content_states_are_tree_reviews(self):
+        for state in ("uncommitted", "staged"):
+            with self.subTest(state=state):
+                self.assertEqual(
+                    self.shape({"state": state, "contentSha256": "c" * 64}),
+                    OBJECT_PRECOMMIT,
+                )
+
+    def test_declared_empty_states_are_not_unreadable(self):
+        for state in ("no-diff", "decision-only"):
+            with self.subTest(state=state):
+                self.assertEqual(self.shape({"state": state}), OBJECT_NO_CONTENT)
+
+    def test_a_declared_state_outranks_a_tip_recorded_beside_it(self):
+        self.assertEqual(
+            self.shape({"state": "staged", "contentSha256": "c" * 64,
+                        "base": "a" * 40, "candidate": "b" * 40}),
+            OBJECT_PRECOMMIT,
+        )
+
+    def test_the_older_free_text_states_still_read(self):
+        # The ledger is append-only; rows written before the vocabulary existed
+        # must keep classifying the way they always did.
+        self.assertEqual(
+            self.shape({"base": "a" * 40, "state": "uncommitted-untracked"}),
+            OBJECT_PRECOMMIT,
+        )
+
+    def test_no_reviewable_content_does_not_count_toward_adoption(self):
+        self.assertNotIn(OBJECT_NO_CONTENT, NAMES_COMMITS)

@@ -89,6 +89,33 @@ After all seat calls have returned, write one completion spec containing:
 
 - the attempt `runId`;
 - `councilFields`, including verdicts, blind-seat state, notes, outcome, commits, and artifacts;
+
+`commits` is **required** and validated. It records what the seats actually read, in exactly one
+of two shapes, and `complete` refuses anything else:
+
+- a **non-empty JSON array of full 40-character object names** — the commits reviewed:
+
+  ```
+  git -C <worktree> rev-list <base>..HEAD | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read().split()))'
+  ```
+
+- an **object** when what was reviewed was not a commit:
+
+  ```json
+  {"state": "uncommitted", "contentSha256": "<sha256 of the exact diff the seats read>", "base": "<sha>"}
+  ```
+
+  `state` is one of `uncommitted`, `staged`, `no-diff`, `decision-only`. The first two reviewed
+  content, so they require `contentSha256`; the last two had none, so they must omit it. `base` and
+  `note` are optional; no other key is accepted.
+
+An empty array is refused: it cannot be told apart from a field nobody populated, and a council that
+genuinely read no diff records `{"state": "no-diff"}`. An abbreviation is refused: it does not
+survive a rewritten history and cannot be resolved from the ledger alone. A bare `{"base": "<sha>"}`
+is refused: a branch point is where the work started, not what was reviewed.
+
+This is validation, not proof. It makes an unreadable claim impossible to append; it cannot make a
+false one impossible, and nothing in the record establishes that a review actually happened.
 - a sealed `forecastState` generated from the submitted `seatStates`;
 - `seatStates` for every expected seat (`submitted`, `abstained`, or `unavailable`);
 - one integer probability for every and only every submitted seat.
