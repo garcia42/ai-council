@@ -29,6 +29,13 @@ from .capture_runtime import (
     validate_capture_ledger,
 )
 from .capture_schema import strict_json_loads
+from .recording_coverage import (
+    RecordingCoverageError,
+    format_recording_coverage,
+    parse_timestamp,
+    recording_exit_code,
+    report_recording_coverage,
+)
 from .evidence_backup import (
     create_evidence_snapshot,
     restore_evidence_snapshot,
@@ -970,6 +977,29 @@ def command_plan_brief_recovery(args: argparse.Namespace) -> int:
     return 0
 
 
+def _recording_timestamp(value: str) -> datetime:
+    """argparse converter, so a malformed window is a usage error (exit 2)."""
+
+    try:
+        return parse_timestamp(value, field="window bound")
+    except RecordingCoverageError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+def command_recording_coverage(args: argparse.Namespace) -> int:
+    if args.since and args.until and args.since >= args.until:
+        print("--since must be strictly before --until", file=sys.stderr)
+        return 2
+    result = report_recording_coverage(
+        log_path=args.log, since=args.since, until=args.until
+    )
+    rendered = json.dumps(result, sort_keys=True) if args.json else (
+        format_recording_coverage(result)
+    )
+    print(rendered, file=sys.stdout if result["determined"] else sys.stderr)
+    return recording_exit_code(result)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -992,6 +1022,32 @@ def build_parser() -> argparse.ArgumentParser:
     report.add_argument("--today")
     report.add_argument("--json", action="store_true")
     report.set_defaults(func=command_report)
+
+    recording = sub.add_parser(
+        "recording-coverage",
+        help="report how councils record what they reviewed, from the ledger alone",
+        epilog=(
+            "Reads the ledger only; it never invokes git, never classifies a commit, "
+            "and never reports that a change went unreviewed. Exit 0 the report ran "
+            "and can be trusted; 3 it cannot. There is deliberately no exit 1: low "
+            "adoption is the finding, not an error state."
+        ),
+    )
+    recording.add_argument(
+        "--log", default=DEFAULT_LOG, help="council ledger to read (default: the live ledger)"
+    )
+    recording.add_argument(
+        "--since",
+        type=_recording_timestamp,
+        help="only council rows at or after this instant; ISO-8601 or a bare date read as UTC midnight",
+    )
+    recording.add_argument(
+        "--until", type=_recording_timestamp, help="only council rows strictly before this instant"
+    )
+    recording.add_argument(
+        "--json", action="store_true", help="emit the full result as JSON"
+    )
+    recording.set_defaults(func=command_recording_coverage)
 
     record = sub.add_parser("record")
     record.add_argument("--log", default=DEFAULT_LOG)

@@ -22,6 +22,8 @@ problems—or are they correlated copies producing expensive reassurance?
 | Off-host durability age and verified-restore evidence | Implemented and evidence-gated |
 | Content-manifested local snapshot and clean restore | Rehearsal-only |
 | Live V2 capture activation | Evidence-gated; not activated by install or this release |
+| Recording-coverage reporting (precondition for review coverage) | Implemented and tested |
+| Review coverage against version control | Blocked on a producer for the reviewed-commit record |
 | Seat ranking, weighting, admission, or retirement | Deliberately not implemented |
 
 Installing this repository does not activate V2 on a live ledger. The first prospective cohort is
@@ -209,6 +211,52 @@ observation time.
 For a binary outcome, Brier is `(forecast probability - observed outcome)^2`. Lower is better:
 `0` is perfect, `0.25` is the score from always forecasting 50%, and `1` is a fully confident miss.
 
+## Recording coverage: can we tell what a council read?
+
+Every rate this project reports is over councils that *happened*. A skipped review writes nothing,
+so nothing says how often a change shipped with no council at all. Closing that gap needs a join
+from version control to what each council row says it reviewed — and that turns out to be blocked
+on a prior question: **is what a council reviewed recorded in a form anything can read?**
+
+Today, mostly not. Measured over the live ledger's 69 council rows:
+
+| rows | share | shape of `commits` |
+|---:|---:|---|
+| 19 | 27.5% | field absent |
+| 18 | 26.1% | object — base pointer only |
+| 14 | 20.3% | object — reviewed an uncommitted or staged tree |
+| 10 | 14.5% | array of full SHAs |
+| 7 | 10.1% | empty array |
+| 1 | 1.4% | array, abbreviated |
+
+**11 of 69 rows name actual commits.** The field has no producer — it is typed by hand by the same
+session that ran the council — so it records format adoption, not review.
+
+`recording-coverage` reports exactly that, and nothing else:
+
+```sh
+python -m council_tools.cli recording-coverage --log ./council.jsonl --since 2026-09-01
+```
+
+It reads the ledger only. It never invokes git, never classifies a commit, and never reports that a
+change went unreviewed. That restraint is the design: a reader that *did* join against version
+control had to work from a key present in a sixth of rows, and inherited a false-accusation rate to
+match.
+
+The 14 pre-commit rows are called out separately rather than counted as failures. Those reviews were
+real; there was simply no commit in existence to name. Any design that assumes "a review names
+commits" is wrong for a fifth of actual reviews.
+
+### Exit codes
+
+`0` the report ran and can be trusted; `3` it cannot — an unreadable ledger, or a window containing
+no council rows. `2` is usage errors only.
+
+There is deliberately **no exit 1**. Low adoption is the finding this report exists to surface, not
+an error state: an exit code that stayed red until adoption was perfect would be red for months and
+would teach its reader to ignore it. Rows whose timestamp cannot be read are counted and reported
+rather than silently dropped from the denominator.
+
 ## V2 workflow
 
 V2 is intentionally more demanding because it is preserving evidence, not just a score. The
@@ -333,6 +381,7 @@ adjudication and statistical rules.
 | `src/council_tools/gcs_durability.py` | Narrow create-only Google Cloud Storage adapter |
 | `src/council_tools/activation_evidence.py` | Source-bound manifest validation and activation readiness evaluation |
 | `src/council_tools/capture_runtime.py` | Cross-module atomic integration and uniform-binding preflight |
+| `src/council_tools/recording_coverage.py` | Ledger-only report on whether councils record what they reviewed |
 | `src/council_tools/cli.py` | Standalone and deployment command-line interface |
 | `runtime/` | Pinned Claude-based runtime adapter and operating contract |
 | `install.py` | Checked, backed-up, reversible local runtime installer |
