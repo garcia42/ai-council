@@ -20,9 +20,10 @@ from typing import Any, Iterable
 from council_tools.ticket_contracts import (
     MAX_LIST_ITEMS,
     MAX_PATH_LENGTH,
-    PATH_KINDS,
     AllowedPath,
     TicketContract,
+    contract_sha256,
+    validate_ticket_envelope,
 )
 
 
@@ -112,6 +113,7 @@ class MutationDecision:
 
 @dataclass(frozen=True, slots=True)
 class _ContractView:
+    contract: TicketContract
     target_branch: str
     base_commit: str
 
@@ -140,35 +142,62 @@ def _contract_view(value: Any) -> _ContractView | None:
     if type(value) is not TicketContract:
         return None
     try:
-        target_branch = value.target_branch
-        base_commit = value.base_commit
         allowed_paths = value.allowed_paths
+        acceptance_criteria = value.acceptance_criteria
+        test_commands = value.test_commands
+        out_of_scope = value.out_of_scope
+        dependencies = value.dependencies
     except Exception:
-        return None
-    if type(target_branch) is not str or type(base_commit) is not str:
-        return None
-    if not _BASE_COMMIT_RE.fullmatch(base_commit):
         return None
     if (
         type(allowed_paths) is not tuple
         or not allowed_paths
         or len(allowed_paths) > MAX_LIST_ITEMS
+        or type(acceptance_criteria) is not tuple
+        or type(test_commands) is not tuple
+        or type(out_of_scope) is not tuple
+        or type(dependencies) is not tuple
     ):
         return None
     try:
         for scope in allowed_paths:
-            if (
-                type(scope) is not AllowedPath
-                or type(scope.kind) is not str
-                or scope.kind not in PATH_KINDS
-                or type(scope.path) is not str
-            ):
+            if type(scope) is not AllowedPath:
                 return None
+        raw_contract = {
+            "schemaVersion": value.schema_version,
+            "repository": value.repository,
+            "issueNumber": value.issue_number,
+            "targetBranch": value.target_branch,
+            "baseCommit": value.base_commit,
+            "workType": value.work_type,
+            "priority": value.priority,
+            "points": value.points,
+            "problemStatement": value.problem_statement,
+            "acceptanceCriteria": list(acceptance_criteria),
+            "testCommands": list(test_commands),
+            "allowedPaths": [
+                AllowedPath.as_dict(scope) for scope in allowed_paths
+            ],
+            "outOfScope": list(out_of_scope),
+            "dependencies": list(dependencies),
+            "rollbackPlan": value.rollback_plan,
+        }
+        digest = contract_sha256(raw_contract)
+        normalized = validate_ticket_envelope(
+            {
+                "contract": raw_contract,
+                "reviewRef": {
+                    "runId": "ticket-mutations-structural-revalidation",
+                    "contractSha256": digest,
+                },
+            }
+        ).contract
     except Exception:
         return None
     return _ContractView(
-        target_branch=target_branch,
-        base_commit=base_commit,
+        contract=normalized,
+        target_branch=normalized.target_branch,
+        base_commit=normalized.base_commit,
     )
 
 
@@ -471,7 +500,7 @@ def evaluate_ticket_mutations(
             if applicable_path in checked_paths:
                 continue
             checked_paths.add(applicable_path)
-            allowed = _allowed_path(contract, applicable_path)
+            allowed = _allowed_path(contract_view.contract, applicable_path)
             if allowed is None:
                 return _decision((Finding("invalid-contract"),))
             if not allowed:

@@ -3,6 +3,7 @@ from dataclasses import FrozenInstanceError, replace
 
 import council_tools.ticket_mutations as ticket_mutations
 from council_tools.ticket_contracts import (
+    AllowedPath,
     TicketContract,
     contract_sha256,
     validate_ticket_envelope,
@@ -274,15 +275,71 @@ class TicketMutationsTest(unittest.TestCase):
         finally:
             TicketContract.allows_path = original
 
-    def test_symlink_gitlink_and_unknown_kinds_fail_closed(self):
-        for kind in ("symlink", "gitlink", "future"):
-            declared, observed = create_pair(kind=kind)
-            with self.subTest(kind=kind):
-                result = evaluate_ticket_mutations(
-                    normalized_contract(),
-                    request(mutations=(declared,), diff_entries=(observed,)),
-                )
-                self.assertCodes(result, ("unsupported-entry-kind",))
+    def test_every_applicable_status_kind_slot_fails_closed(self):
+        cases = (
+            (
+                mutation("create", "pkg/new.py"),
+                diff("A", None, "pkg/new.py", None, "regular"),
+                ("new_kind",),
+            ),
+            (
+                mutation("modify", "pkg/code.py"),
+                diff(
+                    "M",
+                    "pkg/code.py",
+                    "pkg/code.py",
+                    "regular",
+                    "regular",
+                ),
+                ("old_kind", "new_kind"),
+            ),
+            (
+                mutation("delete", "pkg/old.py"),
+                diff("D", "pkg/old.py", None, "regular", None),
+                ("old_kind",),
+            ),
+            (
+                mutation("rename", "pkg/new.py", "pkg/old.py"),
+                diff(
+                    "R",
+                    "pkg/old.py",
+                    "pkg/new.py",
+                    "regular",
+                    "regular",
+                ),
+                ("old_kind", "new_kind"),
+            ),
+            (
+                mutation("copy", "pkg/copy.py", "pkg/source.py"),
+                diff(
+                    "C",
+                    "pkg/source.py",
+                    "pkg/copy.py",
+                    "regular",
+                    "regular",
+                ),
+                ("old_kind", "new_kind"),
+            ),
+        )
+        for declared, observed, kind_fields in cases:
+            for kind_field in kind_fields:
+                for kind in ("symlink", "gitlink", "future"):
+                    candidate = replace(observed, **{kind_field: kind})
+                    with self.subTest(
+                        status=observed.status,
+                        kind_field=kind_field,
+                        kind=kind,
+                    ):
+                        result = evaluate_ticket_mutations(
+                            normalized_contract(),
+                            request(
+                                mutations=(declared,),
+                                diff_entries=(candidate,),
+                            ),
+                        )
+                        self.assertCodes(
+                            result, ("unsupported-entry-kind",)
+                        )
 
     def test_rename_and_copy_require_both_paths_and_distinct_endpoints(self):
         for status, op in (("R", "rename"), ("C", "copy")):
@@ -500,6 +557,41 @@ class TicketMutationsTest(unittest.TestCase):
             ),
         )
 
+        valid_mutations = tuple(
+            mutation("create", f"pkg/file-{index}.py")
+            for index in range(MAX_MUTATIONS + 1)
+        )
+        valid_diffs = tuple(
+            diff(
+                "A",
+                None,
+                f"pkg/file-{index}.py",
+                None,
+                "regular",
+            )
+            for index in range(MAX_DIFF_ENTRIES + 1)
+        )
+        self.assertCodes(
+            evaluate_ticket_mutations(
+                normalized_contract(),
+                request(
+                    mutations=valid_mutations[:MAX_MUTATIONS],
+                    diff_entries=valid_diffs,
+                ),
+            ),
+            ("too-many-diff-entries",),
+        )
+        self.assertCodes(
+            evaluate_ticket_mutations(
+                normalized_contract(),
+                request(
+                    mutations=valid_mutations,
+                    diff_entries=valid_diffs[:MAX_DIFF_ENTRIES],
+                ),
+            ),
+            ("too-many-mutations",),
+        )
+
     def test_arbitrary_and_uninitialized_inputs_return_instead_of_raising(self):
         contract = normalized_contract()
         for invalid in (None, {}, [], object(), object.__new__(MutationRequest)):
@@ -541,6 +633,14 @@ class TicketMutationsTest(unittest.TestCase):
             object(),
             object.__new__(TicketContract),
             replace(contract, allowed_paths=(object(),)),
+            replace(contract, target_branch=""),
+            replace(
+                contract,
+                allowed_paths=(
+                    contract.allowed_paths[0],
+                    AllowedPath("file", ""),
+                ),
+            ),
         ):
             with self.subTest(contract_type=type(invalid_contract).__name__):
                 self.assertCodes(
