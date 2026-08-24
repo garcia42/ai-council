@@ -216,6 +216,7 @@ class RuntimeContractTest(unittest.TestCase):
             "kind": "council-superseded",
             "ts": "2026-08-24T00:00:00Z",
             "supersedes": {"line": 2, "rawLineSha256": "b" * 64},
+            "duplicateOf": {"line": 1, "rawLineSha256": "a" * 64},
             "reason": "hand-appended duplicate",
             "approval": {
                 "operator": "operator",
@@ -247,7 +248,11 @@ class RuntimeContractTest(unittest.TestCase):
             drifted["errors"],
         )
 
-        forged = dict(record, supersedes={"line": 1, "rawLineSha256": "a" * 64})
+        forged = dict(
+            record,
+            supersedes={"line": 1, "rawLineSha256": "a" * 64},
+            duplicateOf={"line": 2, "rawLineSha256": "b" * 64},
+        )
         protected = module.tally(
             [(1, original, "a" * 64), (2, duplicate, "b" * 64), (3, forged, "c" * 64)]
         )
