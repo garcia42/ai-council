@@ -102,10 +102,9 @@ has no third-party runtime dependencies.
 git clone https://github.com/garcia42/ai-council.git
 cd ai-council
 python3 -m venv .venv
-. .venv/bin/activate
-python -m pip install -e .
-PYTHONPATH=src:. python -m unittest discover -s tests -v
-python3 plugins/ai-council-run-guard/scripts/run_guard.py doctor --probe
+env -u PYTHONPATH -u PYTHONHOME .venv/bin/python -m pip install -r requirements-test.txt
+PYTHONPATH=src:. .venv/bin/python -m pytest tests/ -q
+env -u PYTHONPATH -u PYTHONHOME .venv/bin/python plugins/ai-council-run-guard/scripts/run_guard.py doctor --probe
 ```
 
 Codex work in this repository is governed by the checked-in bounded-run policy. It creates a
