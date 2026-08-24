@@ -21,6 +21,8 @@ from typing import Callable, Iterable
 REPO = Path(__file__).resolve().parent
 FORECAST_BEGIN = "<!-- council-tools forecast contract BEGIN -->"
 FORECAST_END = "<!-- council-tools forecast contract END -->"
+STEPS_BEGIN = "<!-- council-tools operator steps BEGIN -->"
+STEPS_END = "<!-- council-tools operator steps END -->"
 CLAUDE_BEGIN = "<!-- council-tools durable forecast contract BEGIN -->"
 CLAUDE_END = "<!-- council-tools durable forecast contract END -->"
 DEFAULT_BACKUP_ROOT = Path(
@@ -427,6 +429,7 @@ def _digest(path: Path) -> str:
 def _installed_source_relatives(source_repo: Path) -> tuple[Path, ...]:
     fixed = (
         Path("runtime/council-forecast-contract.md"),
+        Path("runtime/council-operator-steps.md"),
         Path("runtime/CLAUDE_FORECAST_CONTRACT.md"),
         Path("runtime/predictions_report.py"),
     )
@@ -659,6 +662,48 @@ def _upsert_block(text: str, *, begin: str, end: str, body: str, marker: str) ->
     if position < 0:
         raise InstallError(f"install marker not found: {marker}")
     return text[:position] + replacement + "\n" + text[position:]
+
+
+def _line_anchored_index(text: str, needle: str) -> int:
+    """Index of ``needle`` where it starts a line, or -1.
+
+    ``str.find`` would match "## Steps\n" inside "### Steps\n", which would
+    wrap the wrong span.
+    """
+
+    if text.startswith(needle):
+        return 0
+    found = text.find("\n" + needle)
+    return -1 if found < 0 else found + 1
+
+
+def _upsert_section(text: str, *, begin: str, end: str, body: str, heading: str) -> str:
+    """Replace a managed block, adopting an unmanaged section on first install.
+
+    ``_upsert_block`` inserts *before* its marker, which suits a block that is
+    additional to the document.  This one takes ownership of a section that is
+    already there: on first install it replaces the span from ``heading`` up to
+    the next top-level heading, so the section stops existing in two places.
+    """
+
+    replacement = _block(begin, body, end)
+    if begin in text:
+        start = text.index(begin)
+        try:
+            finish = text.index(end, start) + len(end)
+        except ValueError as exc:
+            raise InstallError(f"found {begin} without {end}") from exc
+        suffix = text[finish:]
+        if suffix.startswith("\n"):
+            suffix = suffix[1:]
+        return text[:start] + replacement + suffix
+    position = _line_anchored_index(text, heading)
+    if position < 0:
+        raise InstallError(f"install marker not found: {heading}")
+    following = text.find("\n## ", position + len(heading))
+    if following < 0:
+        return text[:position] + replacement
+    return text[:position] + replacement + "\n" + text[following + 1 :]
 
 
 def _runtime_targets(root: Path) -> tuple[Path, ...]:
@@ -1158,6 +1203,18 @@ def _render_with_source_custody(
         reporter, skill, criterion, claude_md = _validated_runtime_targets(root)
 
         skill_text = skill.read_text(encoding="utf-8")
+        # Adopt the operator procedure first: once it is inside the managed
+        # block its "## Steps" heading is no longer a safe anchor for anything
+        # else, so the forecast block anchors on this block's own marker.
+        skill_text = _upsert_section(
+            skill_text,
+            begin=STEPS_BEGIN,
+            end=STEPS_END,
+            body=source_bytes[
+                Path("runtime/council-operator-steps.md")
+            ].decode("utf-8"),
+            heading="## Steps\n",
+        )
         skill_text = _upsert_block(
             skill_text,
             begin=FORECAST_BEGIN,
@@ -1165,7 +1222,7 @@ def _render_with_source_custody(
             body=source_bytes[
                 Path("runtime/council-forecast-contract.md")
             ].decode("utf-8"),
-            marker="## Steps\n",
+            marker=STEPS_BEGIN + "\n",
         )
 
         criterion_text = _compile_rendered_criterion(
