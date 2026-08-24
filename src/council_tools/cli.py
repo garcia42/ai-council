@@ -369,11 +369,11 @@ def command_record(args: argparse.Namespace) -> int:
 
 
 def command_supersede(args: argparse.Namespace) -> int:
-    """Retire one ledger row that should never have been written, by appending.
+    """Assert that one exact council row duplicates another retained council row.
 
-    The operator must supply the target's raw-line digest rather than have the tool
-    read whatever currently sits at that line number.  A line number alone names a
-    position; the digest names a row.
+    The operator supplies both raw-line digests rather than letting the tool trust
+    whatever currently sits at either line number. A line number names a position;
+    the digest names a row.
     """
 
     if not args.check_only:
@@ -383,6 +383,10 @@ def command_supersede(args: argparse.Namespace) -> int:
     row = make_supersede(
         line=args.line,
         raw_line_sha256=args.confirm_raw_line_sha256,
+        duplicate_of_line=args.duplicate_of_line,
+        duplicate_of_raw_line_sha256=(
+            args.confirm_duplicate_of_raw_line_sha256
+        ),
         reason=args.reason,
         operator=args.operator,
         approved_at=args.approved_at or _now(),
@@ -397,6 +401,7 @@ def command_supersede(args: argparse.Namespace) -> int:
             {
                 "status": "valid" if args.check_only else "recorded",
                 "supersedes": row["supersedes"],
+                "duplicateOf": row["duplicateOf"],
             },
             sort_keys=True,
         )
@@ -1105,6 +1110,10 @@ def build_parser() -> argparse.ArgumentParser:
     supersede.add_argument("--log", default=DEFAULT_LOG)
     supersede.add_argument("--line", required=True, type=int)
     supersede.add_argument("--confirm-raw-line-sha256", required=True)
+    supersede.add_argument("--duplicate-of-line", required=True, type=int)
+    supersede.add_argument(
+        "--confirm-duplicate-of-raw-line-sha256", required=True
+    )
     supersede.add_argument("--reason", required=True)
     supersede.add_argument("--operator", required=True)
     supersede.add_argument("--reference", required=True)

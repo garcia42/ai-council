@@ -881,6 +881,10 @@ class ForecastCliTest(unittest.TestCase):
             str(duplicate_line - 1),
             "--confirm-raw-line-sha256",
             hashlib.sha256(raw_lines[-2]).hexdigest(),
+            "--duplicate-of-line",
+            str(duplicate_line),
+            "--confirm-duplicate-of-raw-line-sha256",
+            digest,
             "--reason",
             "Superseding the original is the dangerous direction",
             "--operator",
@@ -900,6 +904,10 @@ class ForecastCliTest(unittest.TestCase):
             str(duplicate_line),
             "--confirm-raw-line-sha256",
             digest,
+            "--duplicate-of-line",
+            str(duplicate_line - 1),
+            "--confirm-duplicate-of-raw-line-sha256",
+            hashlib.sha256(raw_lines[-2]).hexdigest(),
             "--reason",
             "Hand-appended duplicate of the preceding council row",
             "--operator",
@@ -908,6 +916,11 @@ class ForecastCliTest(unittest.TestCase):
             "https://github.com/garcia42/ai-council/issues/25",
         )
         self.assertEqual(recorded.returncode, 0, recorded.stderr)
+        recorded_payload = json.loads(recorded.stdout)
+        self.assertEqual(recorded_payload["supersedes"]["line"], duplicate_line)
+        self.assertEqual(
+            recorded_payload["duplicateOf"]["line"], duplicate_line - 1
+        )
 
         after = self.read_criterion(criterion)
         self.assertEqual(after["errors"], [])

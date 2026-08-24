@@ -1,6 +1,8 @@
 import io
 import hashlib
+import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -20,6 +22,9 @@ import install
 CRITERION_FIXTURE = (
     'NON_COUNCIL_RECORD_KINDS = {"pre-mortem-calibration", "council-calibration"}\n'
     + "".join(preimage for preimage, _image in install._SUPERSEDE_READER_REWRITES)
+)
+DUPLICATE_FIXTURE_ROOT = (
+    Path(__file__).parent / "fixtures/duplicate-council-row-supersede"
 )
 
 
@@ -116,6 +121,25 @@ class InstallerTest(unittest.TestCase):
             self.assertNotEqual(target.read_bytes(), self.originals[target])
         return message
 
+    def _apply_rendered_supersede_reader(self, rows):
+        namespace = {"hashlib": hashlib, "json": json, "re": re}
+        exec(install._SUPERSEDE_READER_REWRITES[1][1], namespace)
+        return namespace["_apply_supersedes"](rows)
+
+    def _fixture_identity(self, fixture):
+        rows = []
+        data = (DUPLICATE_FIXTURE_ROOT / fixture).read_bytes()
+        for line_number, raw in enumerate(data.splitlines(keepends=True), 1):
+            if raw.strip():
+                rows.append(
+                    (
+                        line_number,
+                        json.loads(raw.decode("utf-8")),
+                        hashlib.sha256(raw).hexdigest(),
+                    )
+                )
+        return rows
+
     def test_install_is_backed_up_idempotent_and_checkable(self):
         clean, differences = install.check(self.root)
         self.assertFalse(clean)
@@ -194,6 +218,111 @@ class InstallerTest(unittest.TestCase):
 
         compile(rendered, str(deployed), "exec")
         self.assertIn('"council-superseded"', rendered)
+
+    def test_normative_composition_fixtures_drive_independent_reader_replay(self):
+        manifest = json.loads(
+            (DUPLICATE_FIXTURE_ROOT / "manifest.json").read_text(encoding="utf-8")
+        )
+        for scenario in manifest["scenarios"]:
+            if "acceptedSupersedes" not in scenario:
+                continue
+            with self.subTest(fixture=scenario["fixture"]):
+                rows = self._fixture_identity(scenario["fixture"])
+                kept, retired_count, errors = self._apply_rendered_supersede_reader(
+                    rows
+                )
+                active_councils = sorted(
+                    line_number
+                    for line_number, row in kept
+                    if row.get("kind") == "council"
+                )
+                rejected = sorted(
+                    int(error.split(":", 1)[0].split()[1]) for error in errors
+                )
+                self.assertEqual(
+                    retired_count, len(scenario["acceptedSupersedes"])
+                )
+                self.assertEqual(rejected, scenario["rejectedSupersedes"])
+                self.assertEqual(active_councils, scenario["activeCouncilLines"])
+
+    def test_live_shape_fixture_has_only_two_reader_provable_duplicates(self):
+        manifest = json.loads(
+            (DUPLICATE_FIXTURE_ROOT / "manifest.json").read_text(encoding="utf-8")
+        )
+        scenario = manifest["scenarios"][0]
+        rows = self._fixture_identity(scenario["fixture"])
+        by_line = {
+            line_number: digest for line_number, _row, digest in rows
+        }
+
+        def replay_assertion(target_line, retained_line):
+            record = {
+                "schemaVersion": 1,
+                "kind": "council-superseded",
+                "ts": "2030-01-01T00:02:00Z",
+                "supersedes": {
+                    "line": target_line,
+                    "rawLineSha256": by_line[target_line],
+                },
+                "duplicateOf": {
+                    "line": retained_line,
+                    "rawLineSha256": by_line[retained_line],
+                },
+                "reason": "fixture duplicate assertion",
+                "approval": {
+                    "operator": "fixture-operator",
+                    "approvedAt": "2030-01-01T00:02:00Z",
+                    "reference": "fixture://issue-32",
+                },
+            }
+            return self._apply_rendered_supersede_reader(
+                [*rows, (23, record, "d" * 64)]
+            )
+
+        for candidate in scenario["candidateAssertions"]:
+            kept, retired_count, errors = replay_assertion(
+                candidate["supersedes"], candidate["duplicateOf"]
+            )
+            self.assertEqual(errors, [])
+            self.assertEqual(retired_count, 1)
+            self.assertNotIn(candidate["supersedes"], {line for line, _row in kept})
+
+        for target_line in scenario["candidatesWithNoValidDuplicateOf"]:
+            _kept, retired_count, errors = replay_assertion(target_line, 1)
+            self.assertEqual(retired_count, 0)
+            self.assertEqual(len(errors), 1)
+
+    def test_reader_does_not_revise_an_edge_after_a_later_ordinary_collision(self):
+        rows = self._fixture_identity("retained-row-later.jsonl")
+        later = dict(rows[1][1])
+        later["ts"] = "2030-01-01T00:03:00Z"
+        rows.append((4, later, "f" * 64))
+
+        kept, retired_count, errors = self._apply_rendered_supersede_reader(rows)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(retired_count, 1)
+        self.assertEqual(
+            [line for line, row in kept if row.get("kind") == "council"],
+            [2, 4],
+        )
+
+    def test_reader_refuses_a_matching_identifier_with_three_active_owners(self):
+        rows = self._fixture_identity("retained-row-later.jsonl")
+        target, retained, supersede = rows
+        third = dict(retained[1])
+        third["ts"] = "2030-01-01T00:01:30Z"
+        rows = [target, retained, (3, third, "e" * 64), (4, supersede[1], supersede[2])]
+
+        kept, retired_count, errors = self._apply_rendered_supersede_reader(rows)
+
+        self.assertEqual(retired_count, 0)
+        self.assertEqual(
+            [line for line, row in kept if row.get("kind") == "council"],
+            [1, 2, 3],
+        )
+        self.assertEqual(len(errors), 1)
+        self.assertIn("unique active retained owner", errors[0])
 
     def test_retained_report_create_failure_reports_committed_custody(self):
         self._assert_committed_runtime_report_failure("create")

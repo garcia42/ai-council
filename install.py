@@ -751,6 +751,63 @@ def load_rows(path):
 
 SUPERSEDE_RECORD_KIND = "council-superseded"
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+SUPERSEDE_BRIEF_ASCII_TRIM = " \\t\\r\\n"
+
+
+def _normalize_supersede_brief(row):
+    blind_seat = row.get("blindSeat")
+    if not isinstance(blind_seat, dict):
+        return None
+    value = blind_seat.get("brief")
+    if not isinstance(value, str):
+        return None
+    value = value.strip(SUPERSEDE_BRIEF_ASCII_TRIM)
+    if not value or not value.startswith("/") or "\\x00" in value:
+        return None
+    segments = []
+    for segment in value.split("/"):
+        if segment in ("", "."):
+            continue
+        if segment == "..":
+            if not segments:
+                return None
+            segments.pop()
+            continue
+        segments.append(segment)
+    if not segments:
+        return None
+    return "/" + "/".join(segments)
+
+
+def _supersede_run_id(row):
+    value = row.get("runId")
+    return value if isinstance(value, str) and value != "" else None
+
+
+def _supersede_duplicate_error(target_line, target_row, retained_line, retained_row, active):
+    comparable = []
+    for label, extractor in (
+        ("runId", _supersede_run_id),
+        ("blindSeat.brief", _normalize_supersede_brief),
+    ):
+        target_value = extractor(target_row)
+        retained_value = extractor(retained_row)
+        if target_value is None or retained_value is None:
+            continue
+        if target_value != retained_value:
+            return f"duplicate council rows have conflicting {label}"
+        comparable.append((label, target_value, extractor))
+    if not comparable:
+        return "duplicate council rows have no comparable identifier"
+    for label, value, extractor in comparable:
+        owners = {
+            owner_line
+            for owner_line, owner_row in active.items()
+            if owner_line != target_line and extractor(owner_row) == value
+        }
+        if owners != {retained_line}:
+            return f"duplicate {label} does not have one unique active retained owner"
+    return None
 
 
 def _apply_supersedes(rows):
@@ -782,46 +839,63 @@ def _apply_supersedes(rows):
     }
     errors = []
     retired = {}
+    active = {}
     for line_number, row, _raw_sha256 in normalized:
+        if row.get("kind") == "council":
+            active[line_number] = row
+            continue
         if row.get("kind") != SUPERSEDE_RECORD_KIND:
             continue
-        target = row.get("supersedes")
-        if not isinstance(target, dict):
-            errors.append(f"line {line_number}: supersedes must be an object")
+        references = {}
+        reference_error = None
+        for label in ("supersedes", "duplicateOf"):
+            spec = row.get(label)
+            if not isinstance(spec, dict):
+                reference_error = f"{label} must be an object"
+                break
+            referenced_line = spec.get("line")
+            digest = spec.get("rawLineSha256")
+            if (
+                isinstance(referenced_line, bool)
+                or not isinstance(referenced_line, int)
+                or referenced_line < 1
+            ):
+                reference_error = f"{label}.line must be a positive integer"
+                break
+            if not isinstance(digest, str) or not SHA256_RE.fullmatch(digest):
+                reference_error = (
+                    f"{label}.rawLineSha256 must be a lowercase SHA-256 digest"
+                )
+                break
+            if referenced_line >= line_number:
+                reference_error = f"{label}.line must name an earlier row"
+                break
+            if referenced_line not in targets:
+                reference_error = (
+                    f"{label}.line names no ledger row: {referenced_line}"
+                )
+                break
+            referenced_row, referenced_sha256 = targets[referenced_line]
+            if referenced_sha256 is not None and referenced_sha256 != digest:
+                reference_error = (
+                    f"{label}.rawLineSha256 does not match line {referenced_line}"
+                )
+                break
+            if referenced_row.get("kind") != "council":
+                reference_error = f"{label}.line must name a council row"
+                break
+            if referenced_line not in active:
+                reference_error = f"{label}.line names an inactive council row"
+                break
+            references[label] = (referenced_line, referenced_row)
+        if reference_error is not None:
+            errors.append(f"line {line_number}: {reference_error}")
             continue
-        target_line = target.get("line")
-        digest = target.get("rawLineSha256")
-        if isinstance(target_line, bool) or not isinstance(target_line, int) or target_line < 1:
+        target_line, target_row = references["supersedes"]
+        retained_line, retained_row = references["duplicateOf"]
+        if target_line == retained_line:
             errors.append(
-                f"line {line_number}: supersedes.line must be a positive integer"
-            )
-            continue
-        if not isinstance(digest, str) or not SHA256_RE.fullmatch(digest):
-            errors.append(
-                f"line {line_number}: supersedes.rawLineSha256 must be a lowercase "
-                "SHA-256 digest"
-            )
-            continue
-        if target_line >= line_number:
-            errors.append(
-                f"line {line_number}: supersedes.line must name an earlier row"
-            )
-            continue
-        if target_line not in targets:
-            errors.append(
-                f"line {line_number}: supersedes.line names no ledger row: {target_line}"
-            )
-            continue
-        target_row, target_sha256 = targets[target_line]
-        if target_sha256 is not None and target_sha256 != digest:
-            errors.append(
-                f"line {line_number}: supersedes.rawLineSha256 does not match line "
-                f"{target_line}"
-            )
-            continue
-        if target_row.get("kind") != "council":
-            errors.append(
-                f"line {line_number}: only a council row can be superseded"
+                f"line {line_number}: supersedes and duplicateOf must name distinct rows"
             )
             continue
         if target_row.get("forecastState") is not None:
@@ -830,20 +904,20 @@ def _apply_supersedes(rows):
                 "cannot be superseded"
             )
             continue
-        predictions = target_row.get("predictions")
-        if isinstance(predictions, list) and predictions:
+        if "predictions" in target_row and target_row["predictions"] != []:
             errors.append(
                 f"line {line_number}: line {target_line} carries predictions and "
                 "cannot be superseded"
             )
             continue
-        if target_line in retired:
-            errors.append(
-                f"line {line_number}: line {target_line} is already superseded by "
-                f"line {retired[target_line]}"
-            )
+        duplicate_error = _supersede_duplicate_error(
+            target_line, target_row, retained_line, retained_row, active
+        )
+        if duplicate_error is not None:
+            errors.append(f"line {line_number}: {duplicate_error}")
             continue
         retired[target_line] = line_number
+        del active[target_line]
     kept = [
         (line_number, row)
         for line_number, row, _raw_sha256 in normalized
