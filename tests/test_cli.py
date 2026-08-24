@@ -930,6 +930,81 @@ class ForecastCliTest(unittest.TestCase):
         self.assertEqual(after["nonCouncilRecords"], before["nonCouncilRecords"] + 1)
         self.assertEqual(after["legacyBlindRows"], before["legacyBlindRows"])
 
+    def test_installed_reader_refuses_unattributed_and_bogus_supersedes(self):
+        criterion = self.installed_kill_criterion()
+        seat = {
+            "role": "generic",
+            "required": True,
+            "ran": True,
+            "changedDecision": True,
+            "agreedWithPanel": True,
+            "blockedReason": None,
+        }
+        original = {
+            "kind": "council",
+            "runId": "run-reader-fail-closed",
+            "blindSeat": {**seat, "brief": "/tmp/reader-fail-closed.md"},
+            "forecastState": {"sealed": True, "seats": {}},
+            "predictions": [],
+        }
+        duplicate = {
+            "kind": "council",
+            "runId": "run-reader-fail-closed",
+            "blindSeat": {**seat, "brief": "/tmp/reader-fail-closed.md"},
+        }
+
+        def raw_line(row):
+            return (
+                json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n"
+            ).encode("utf-8")
+
+        original_raw = raw_line(original)
+        duplicate_raw = raw_line(duplicate)
+        valid_record = {
+            "schemaVersion": 1,
+            "kind": "council-superseded",
+            "ts": "2026-08-24T00:00:00Z",
+            "supersedes": {
+                "line": 2,
+                "rawLineSha256": hashlib.sha256(duplicate_raw).hexdigest(),
+            },
+            "duplicateOf": {
+                "line": 1,
+                "rawLineSha256": hashlib.sha256(original_raw).hexdigest(),
+            },
+            "reason": "hand-appended duplicate",
+            "approval": {
+                "operator": "operator",
+                "approvedAt": "2026-08-24T00:00:00Z",
+                "reference": "https://github.com/garcia42/ai-council/issues/25",
+            },
+        }
+        unattributed = {
+            "kind": "council-superseded",
+            "supersedes": valid_record["supersedes"],
+            "duplicateOf": valid_record["duplicateOf"],
+        }
+        bogus_target = json.loads(json.dumps(valid_record))
+        bogus_target["supersedes"]["rawLineSha256"] = "f" * 64
+        bogus_retained = json.loads(json.dumps(valid_record))
+        bogus_retained["duplicateOf"]["rawLineSha256"] = "f" * 64
+
+        for name, record, expected_error in (
+            ("unattributed", unattributed, "unexpected shape"),
+            ("bogus target digest", bogus_target, "does not match line"),
+            ("bogus retained digest", bogus_retained, "does not match line"),
+        ):
+            with self.subTest(record=name):
+                self.log.write_bytes(original_raw + duplicate_raw + raw_line(record))
+                result = self.read_criterion(criterion)
+                self.assertEqual(result["supersededRows"], 0)
+                self.assertEqual(result["completedRuns"], 2)
+                self.assertEqual(result["changedDecisionRuns"], 2)
+                self.assertTrue(
+                    any(expected_error in error for error in result["errors"]),
+                    result["errors"],
+                )
+
     def installed_kill_criterion(self):
         """Render the deployed kill criterion the way ``install.py`` would render it."""
 

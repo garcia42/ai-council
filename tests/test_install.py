@@ -1,5 +1,6 @@
-import io
+import copy
 import hashlib
+import io
 import json
 import os
 import re
@@ -8,6 +9,7 @@ import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
@@ -15,13 +17,26 @@ import install
 
 
 # The kill criterion's body is not carried in this repository, so an install fixture
-# cannot be a copy of it without drifting from it. Building the fixture out of the
-# transform's own preimages keeps the two in step by construction; that the deployed
-# file still matches those preimages is asserted separately, and again by rehearse.py
-# against a copy of the real runtime.
+# cannot be a copy of it without drifting from it. This minimal valid module embeds
+# every transform preimage exactly once; the deployed file's independent match is
+# asserted separately, and again by rehearse.py against a copy of the real runtime.
+_SUPERSEDE_PREIMAGES = tuple(
+    preimage for preimage, _image in install._SUPERSEDE_READER_REWRITES
+)
 CRITERION_FIXTURE = (
     'NON_COUNCIL_RECORD_KINDS = {"pre-mortem-calibration", "council-calibration"}\n'
-    + "".join(preimage for preimage, _image in install._SUPERSEDE_READER_REWRITES)
+    + _SUPERSEDE_PREIMAGES[0]
+    + _SUPERSEDE_PREIMAGES[1]
+    + _SUPERSEDE_PREIMAGES[2]
+    + _SUPERSEDE_PREIMAGES[3]
+    + "    legacy_blind = []\n"
+    + "    result = {\n"
+    + _SUPERSEDE_PREIMAGES[4]
+    + "    }\n"
+    + "    message = (\n"
+    + _SUPERSEDE_PREIMAGES[5]
+    + "    )\n"
+    + "    return result\n"
 )
 DUPLICATE_FIXTURE_ROOT = (
     Path(__file__).parent / "fixtures/duplicate-council-row-supersede"
@@ -122,9 +137,24 @@ class InstallerTest(unittest.TestCase):
         return message
 
     def _apply_rendered_supersede_reader(self, rows):
-        namespace = {"hashlib": hashlib, "json": json, "re": re}
+        namespace = {
+            "datetime": datetime,
+            "hashlib": hashlib,
+            "json": json,
+            "re": re,
+        }
         exec(install._SUPERSEDE_READER_REWRITES[1][1], namespace)
         return namespace["_apply_supersedes"](rows)
+
+    def _rendered_supersede_namespace(self):
+        namespace = {
+            "datetime": datetime,
+            "hashlib": hashlib,
+            "json": json,
+            "re": re,
+        }
+        exec(install._SUPERSEDE_READER_REWRITES[1][1], namespace)
+        return namespace
 
     def _fixture_identity(self, fixture):
         rows = []
@@ -218,6 +248,174 @@ class InstallerTest(unittest.TestCase):
 
         compile(rendered, str(deployed), "exec")
         self.assertIn('"council-superseded"', rendered)
+
+    def test_reader_rechecks_every_current_appender_record_shape_guard(self):
+        base = self._fixture_identity("retained-row-later.jsonl")
+        valid_record = base[-1][1]
+        namespace = self._rendered_supersede_namespace()
+        record_error = namespace["_supersede_record_error"]
+
+        def drop(key):
+            return lambda row: row.pop(key)
+
+        def set_value(key, value):
+            return lambda row: row.__setitem__(key, value)
+
+        def approval_drop(key):
+            return lambda row: row["approval"].pop(key)
+
+        def approval_set(key, value):
+            return lambda row: row["approval"].__setitem__(key, value)
+
+        def reference_drop(label, key):
+            return lambda row: row[label].pop(key)
+
+        def reference_set(label, key, value):
+            return lambda row: row[label].__setitem__(key, value)
+
+        cases = {
+            "missing kind": drop("kind"),
+            "wrong kind": set_value("kind", "not-a-supersede"),
+            "missing schemaVersion": drop("schemaVersion"),
+            "boolean schemaVersion": set_value("schemaVersion", True),
+            "wrong schemaVersion": set_value("schemaVersion", 2),
+            "missing ts": drop("ts"),
+            "empty ts": set_value("ts", " "),
+            "naive ts": set_value("ts", "2030-01-01T00:02:00"),
+            "missing reason": drop("reason"),
+            "empty reason": set_value("reason", " "),
+            "non-string reason": set_value("reason", 1),
+            "missing approval": drop("approval"),
+            "non-object approval": set_value("approval", None),
+            "missing operator": approval_drop("operator"),
+            "empty operator": approval_set("operator", " "),
+            "missing approvedAt": approval_drop("approvedAt"),
+            "naive approvedAt": approval_set(
+                "approvedAt", "2030-01-01T00:02:00"
+            ),
+            "missing reference": approval_drop("reference"),
+            "empty reference": approval_set("reference", " "),
+            "extra approval field": approval_set("host", "fixture-host"),
+            "extra record field": set_value("note", "not allowed"),
+            "non-object supersedes": set_value("supersedes", None),
+            "non-object duplicateOf": set_value("duplicateOf", None),
+            "missing supersedes line": reference_drop("supersedes", "line"),
+            "missing duplicateOf line": reference_drop("duplicateOf", "line"),
+            "extra supersedes field": reference_set(
+                "supersedes", "runId", "run-extra"
+            ),
+            "extra duplicateOf field": reference_set(
+                "duplicateOf", "runId", "run-extra"
+            ),
+            "zero supersedes line": reference_set("supersedes", "line", 0),
+            "boolean duplicateOf line": reference_set(
+                "duplicateOf", "line", True
+            ),
+            "short supersedes digest": reference_set(
+                "supersedes", "rawLineSha256", "abc"
+            ),
+            "uppercase duplicateOf digest": reference_set(
+                "duplicateOf",
+                "rawLineSha256",
+                valid_record["duplicateOf"]["rawLineSha256"].upper(),
+            ),
+            "missing supersedes digest": reference_drop(
+                "supersedes", "rawLineSha256"
+            ),
+            "missing duplicateOf digest": reference_drop(
+                "duplicateOf", "rawLineSha256"
+            ),
+        }
+        for name, mutate in cases.items():
+            with self.subTest(guard=name):
+                record = copy.deepcopy(valid_record)
+                mutate(record)
+                self.assertIsNotNone(record_error(record))
+                if record.get("kind") == "council-superseded":
+                    rows = [*base[:2], (3, record, base[2][2])]
+                    kept, retired_count, errors = (
+                        self._apply_rendered_supersede_reader(rows)
+                    )
+                    self.assertEqual(retired_count, 0)
+                    self.assertEqual(
+                        [line for line, row in kept if row.get("kind") == "council"],
+                        [1, 2],
+                    )
+                    self.assertEqual(len(errors), 1, errors)
+
+    def test_reader_requires_raw_identity_and_never_skips_digest_comparison(self):
+        rows = self._fixture_identity("retained-row-later.jsonl")
+
+        kept, retired_count, errors = self._apply_rendered_supersede_reader(
+            [(line, row) for line, row, _digest in rows]
+        )
+
+        self.assertEqual(retired_count, 0)
+        self.assertEqual(
+            [line for line, row in kept if row.get("kind") == "council"],
+            [1, 2],
+        )
+        self.assertEqual(
+            len([error for error in errors if "unverifiable" in error]), 3
+        )
+
+        missing_digest_rows = [*rows[:2], (rows[2][0], rows[2][1], None)]
+        kept, retired_count, errors = self._apply_rendered_supersede_reader(
+            missing_digest_rows
+        )
+        self.assertEqual(retired_count, 0)
+        self.assertEqual(
+            [line for line, row in kept if row.get("kind") == "council"],
+            [1, 2],
+        )
+        self.assertTrue(
+            any("line 3" in error and "unverifiable" in error for error in errors)
+        )
+
+        for reference in ("supersedes", "duplicateOf"):
+            with self.subTest(bogus_digest=reference):
+                record = copy.deepcopy(rows[2][1])
+                record[reference]["rawLineSha256"] = "f" * 64
+                kept, retired_count, errors = self._apply_rendered_supersede_reader(
+                    [*rows[:2], (3, record, rows[2][2])]
+                )
+                self.assertEqual(retired_count, 0)
+                self.assertTrue(
+                    any("does not match line" in error for error in errors), errors
+                )
+
+    def test_reader_rejects_unexpected_row_identity_arity_clearly(self):
+        namespace = self._rendered_supersede_namespace()
+        apply_supersedes = namespace["_apply_supersedes"]
+        for entry in ((1,), (1, {}, "a" * 64, "extra"), object()):
+            with self.subTest(entry=entry):
+                with self.assertRaisesRegex(ValueError, "exactly three items"):
+                    apply_supersedes([entry])
+
+    def test_external_two_tuple_runtime_test_is_an_activation_precondition(self):
+        rendered_reader = install._SUPERSEDE_READER_REWRITES[1][1]
+        self.assertIn(
+            "test_blind_seat_kill_criterion.py must be updated", rendered_reader
+        )
+        self.assertIn("must not be tolerated at activation", rendered_reader)
+
+    def test_install_refuses_a_noncompiling_rendered_reader_before_backup(self):
+        criterion = (
+            self.root / ".claude/knowledge/council-eval/blind_seat_kill_criterion.py"
+        )
+        criterion.write_text(
+            criterion.read_text(encoding="utf-8") + "\ndef malformed(:\n",
+            encoding="utf-8",
+        )
+        before = {target: target.read_bytes() for target in self.targets}
+
+        with self.assertRaisesRegex(install.InstallError, "does not compile"):
+            install.install(self.root, self.backups)
+
+        self.assertEqual(
+            {target: target.read_bytes() for target in self.targets}, before
+        )
+        self.assertFalse(self.backups.exists())
 
     def test_normative_composition_fixtures_drive_independent_reader_replay(self):
         manifest = json.loads(

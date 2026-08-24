@@ -715,7 +715,7 @@ SUPERSEDE_READER_MARKER = "_apply_supersedes"
 _SUPERSEDE_READER_REWRITES = (
     (
         "import argparse\nimport json\nimport os\nimport sys\n",
-        "import argparse\nimport hashlib\nimport json\nimport os\nimport re\n"
+        "import argparse\nfrom datetime import datetime\nimport hashlib\nimport json\nimport os\nimport re\n"
         "import sys\n",
     ),
     (
@@ -752,6 +752,86 @@ def load_rows(path):
 SUPERSEDE_RECORD_KIND = "council-superseded"
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 SUPERSEDE_BRIEF_ASCII_TRIM = " \\t\\r\\n"
+SUPERSEDE_RECORD_KEYS = {
+    "schemaVersion", "kind", "ts", "supersedes", "duplicateOf", "reason", "approval"
+}
+SUPERSEDE_REFERENCE_KEYS = {"line", "rawLineSha256"}
+SUPERSEDE_APPROVAL_KEYS = {"operator", "approvedAt", "reference"}
+
+# Activation precondition outside this repository: the runtime-only
+# ~/.claude/knowledge/council-eval/test_blind_seat_kill_criterion.py must be updated
+# to pass three-item (line, row, raw_sha256) identities. The former two-item caller
+# is deliberately rejected here and must not be tolerated at activation.
+
+
+def _supersede_nonempty_text(value):
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _supersede_timestamp_is_valid(value):
+    if not _supersede_nonempty_text(value):
+        return False
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except (OverflowError, ValueError):
+        return False
+    return parsed.tzinfo is not None and parsed.utcoffset() is not None
+
+
+def _supersede_record_error(row):
+    observed = set(row)
+    if observed != SUPERSEDE_RECORD_KEYS:
+        return (
+            "council-superseded record has unexpected shape; "
+            f"missing={sorted(SUPERSEDE_RECORD_KEYS - observed)} "
+            f"extra={sorted(observed - SUPERSEDE_RECORD_KEYS)}"
+        )
+    if isinstance(row["schemaVersion"], bool) or row["schemaVersion"] != 1:
+        return "council-superseded schemaVersion must be 1"
+    if row["kind"] != SUPERSEDE_RECORD_KIND:
+        return f"supersede kind must be {SUPERSEDE_RECORD_KIND}"
+    if not _supersede_timestamp_is_valid(row["ts"]):
+        return "ts must be a timezone-aware ISO timestamp"
+    if not _supersede_nonempty_text(row["reason"]):
+        return "reason must be non-empty text"
+    approval = row["approval"]
+    if not isinstance(approval, dict):
+        return "approval must be an object"
+    observed_approval = set(approval)
+    if observed_approval != SUPERSEDE_APPROVAL_KEYS:
+        return (
+            "approval has unexpected shape; "
+            f"missing={sorted(SUPERSEDE_APPROVAL_KEYS - observed_approval)} "
+            f"extra={sorted(observed_approval - SUPERSEDE_APPROVAL_KEYS)}"
+        )
+    if not _supersede_nonempty_text(approval["operator"]):
+        return "approval.operator must be non-empty text"
+    if not _supersede_timestamp_is_valid(approval["approvedAt"]):
+        return "approval.approvedAt must be a timezone-aware ISO timestamp"
+    if not _supersede_nonempty_text(approval["reference"]):
+        return "approval.reference must be non-empty text"
+    for label in ("supersedes", "duplicateOf"):
+        spec = row[label]
+        if not isinstance(spec, dict):
+            return f"{label} must be an object"
+        observed_reference = set(spec)
+        if observed_reference != SUPERSEDE_REFERENCE_KEYS:
+            return (
+                f"{label} has unexpected shape; "
+                f"missing={sorted(SUPERSEDE_REFERENCE_KEYS - observed_reference)} "
+                f"extra={sorted(observed_reference - SUPERSEDE_REFERENCE_KEYS)}"
+            )
+        referenced_line = spec["line"]
+        if (
+            isinstance(referenced_line, bool)
+            or not isinstance(referenced_line, int)
+            or referenced_line < 1
+        ):
+            return f"{label}.line must be a positive integer"
+        digest = spec["rawLineSha256"]
+        if not isinstance(digest, str) or not SHA256_RE.fullmatch(digest):
+            return f"{label}.rawLineSha256 must be a lowercase SHA-256 digest"
+    return None
 
 
 def _normalize_supersede_brief(row):
@@ -826,18 +906,42 @@ def _apply_supersedes(rows):
     \"\"\"
 
     normalized = []
-    for entry in rows:
-        if len(entry) == 3:
-            line_number, row, raw_sha256 = entry
-        else:
+    errors = []
+    unverifiable_lines = set()
+    for entry_number, entry in enumerate(rows, 1):
+        try:
+            arity = len(entry)
+        except TypeError as exc:
+            raise ValueError(
+                f"ledger row identity entry {entry_number} must contain exactly "
+                "three items"
+            ) from exc
+        if arity == 2:
             line_number, row = entry
             raw_sha256 = None
+            errors.append(
+                f"line {line_number}: raw-line identity is missing; record is "
+                "unverifiable"
+            )
+            unverifiable_lines.add(line_number)
+        elif arity == 3:
+            line_number, row, raw_sha256 = entry
+            if not isinstance(raw_sha256, str) or not SHA256_RE.fullmatch(raw_sha256):
+                errors.append(
+                    f"line {line_number}: raw-line identity is invalid; record is "
+                    "unverifiable"
+                )
+                unverifiable_lines.add(line_number)
+        else:
+            raise ValueError(
+                f"ledger row identity entry {entry_number} must contain exactly "
+                f"three items; got {arity}"
+            )
         normalized.append((line_number, row, raw_sha256))
 
     targets = {
         line_number: (row, raw_sha256) for line_number, row, raw_sha256 in normalized
     }
-    errors = []
     retired = {}
     active = {}
     for line_number, row, _raw_sha256 in normalized:
@@ -845,6 +949,12 @@ def _apply_supersedes(rows):
             active[line_number] = row
             continue
         if row.get("kind") != SUPERSEDE_RECORD_KIND:
+            continue
+        if line_number in unverifiable_lines:
+            continue
+        record_error = _supersede_record_error(row)
+        if record_error is not None:
+            errors.append(f"line {line_number}: {record_error}")
             continue
         references = {}
         reference_error = None
@@ -876,7 +986,7 @@ def _apply_supersedes(rows):
                 )
                 break
             referenced_row, referenced_sha256 = targets[referenced_line]
-            if referenced_sha256 is not None and referenced_sha256 != digest:
+            if referenced_sha256 != digest:
                 reference_error = (
                     f"{label}.rawLineSha256 does not match line {referenced_line}"
                 )
@@ -972,6 +1082,18 @@ def _with_superseded_reader(criterion_text: str) -> str:
     return criterion_text
 
 
+def _compile_rendered_criterion(criterion_text: str) -> str:
+    """Fail before publication when the transformed runtime reader is not Python."""
+
+    try:
+        compile(criterion_text, "<rendered blind-seat kill criterion>", "exec")
+    except (SyntaxError, TypeError, ValueError) as exc:
+        raise InstallError(
+            "rendered blind-seat kill criterion does not compile"
+        ) from exc
+    return criterion_text
+
+
 def _render_with_source_custody(
     root: Path,
     *,
@@ -1006,8 +1128,10 @@ def _render_with_source_custody(
             marker="## Steps\n",
         )
 
-        criterion_text = _with_superseded_reader(
-            _with_attempt_allowlist(criterion.read_text(encoding="utf-8"))
+        criterion_text = _compile_rendered_criterion(
+            _with_superseded_reader(
+                _with_attempt_allowlist(criterion.read_text(encoding="utf-8"))
+            )
         )
 
         claude_text = claude_md.read_text(encoding="utf-8")
@@ -2694,8 +2818,10 @@ def restore(
         criterion = (
             root / ".claude/knowledge/council-eval/blind_seat_kill_criterion.py"
         )
-        payloads[criterion] = _with_superseded_reader(
-            _with_attempt_allowlist(payloads[criterion].decode("utf-8"))
+        payloads[criterion] = _compile_rendered_criterion(
+            _with_superseded_reader(
+                _with_attempt_allowlist(payloads[criterion].decode("utf-8"))
+            )
         ).encode("utf-8")
         for target in payloads:
             if not target.exists():
