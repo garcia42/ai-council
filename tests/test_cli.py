@@ -16,6 +16,11 @@ from council_tools import capture_runtime, cli
 from council_tools import safe_files
 from council_tools.artifacts import ArtifactStore
 from council_tools.forecasts import append_ledger_row, make_attempt, new_id
+from tests.test_forecasts import (
+    STRICT_JSON_ADVERSARIAL_PARITY_CASES,
+    SUPERSEDE_ADVERSARIAL_PARITY_CASES,
+    apply_supersede_adversarial_case,
+)
 
 
 def completion(attempt):
@@ -930,7 +935,7 @@ class ForecastCliTest(unittest.TestCase):
         self.assertEqual(after["nonCouncilRecords"], before["nonCouncilRecords"] + 1)
         self.assertEqual(after["legacyBlindRows"], before["legacyBlindRows"])
 
-    def test_installed_reader_refuses_unattributed_and_bogus_supersedes(self):
+    def test_installed_reader_refuses_adversarial_supersedes_without_retirement(self):
         criterion = self.installed_kill_criterion()
         seat = {
             "role": "generic",
@@ -988,12 +993,20 @@ class ForecastCliTest(unittest.TestCase):
         bogus_target["supersedes"]["rawLineSha256"] = "f" * 64
         bogus_retained = json.loads(json.dumps(valid_record))
         bogus_retained["duplicateOf"]["rawLineSha256"] = "f" * 64
-
-        for name, record, expected_error in (
+        adversarial = [
             ("unattributed", unattributed, "unexpected shape"),
             ("bogus target digest", bogus_target, "does not match line"),
             ("bogus retained digest", bogus_retained, "does not match line"),
-        ):
+        ]
+        for case in SUPERSEDE_ADVERSARIAL_PARITY_CASES:
+            record = json.loads(json.dumps(valid_record))
+            apply_supersede_adversarial_case(record, case)
+            expected_error = (
+                "schemaVersion" if "schemaVersion" in case[0] else "rawLineSha256"
+            )
+            adversarial.append((case[0], record, expected_error))
+
+        for name, record, expected_error in adversarial:
             with self.subTest(record=name):
                 self.log.write_bytes(original_raw + duplicate_raw + raw_line(record))
                 result = self.read_criterion(criterion)
@@ -1004,6 +1017,26 @@ class ForecastCliTest(unittest.TestCase):
                     any(expected_error in error for error in result["errors"]),
                     result["errors"],
                 )
+
+    def test_installed_reader_rejects_non_strict_json_before_tally(self):
+        criterion = self.installed_kill_criterion()
+        prefix = b'{"kind":"council","blindSeat":{"ran":false}}\n'
+
+        for name, payload, expected_error in STRICT_JSON_ADVERSARIAL_PARITY_CASES:
+            with self.subTest(case=name):
+                ledger = prefix + payload
+                self.log.write_bytes(ledger)
+                result = subprocess.run(
+                    [sys.executable, str(criterion), "--log", str(self.log), "--json"],
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, "")
+                self.assertEqual(result.stderr.strip(), f"line 2: {expected_error}")
+                self.assertEqual(self.log.read_bytes(), ledger)
 
     def installed_kill_criterion(self):
         """Render the deployed kill criterion the way ``install.py`` would render it."""

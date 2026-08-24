@@ -2,6 +2,7 @@ import copy
 import hashlib
 import io
 import json
+import math
 import os
 import re
 import shutil
@@ -14,6 +15,11 @@ from pathlib import Path
 from unittest import mock
 
 import install
+from tests.test_forecasts import (
+    STRICT_JSON_ADVERSARIAL_PARITY_CASES,
+    SUPERSEDE_ADVERSARIAL_PARITY_CASES,
+    apply_supersede_adversarial_case,
+)
 
 
 # The kill criterion's body is not carried in this repository, so an install fixture
@@ -141,6 +147,7 @@ class InstallerTest(unittest.TestCase):
             "datetime": datetime,
             "hashlib": hashlib,
             "json": json,
+            "math": math,
             "re": re,
         }
         exec(install._SUPERSEDE_READER_REWRITES[1][1], namespace)
@@ -151,6 +158,7 @@ class InstallerTest(unittest.TestCase):
             "datetime": datetime,
             "hashlib": hashlib,
             "json": json,
+            "math": math,
             "re": re,
         }
         exec(install._SUPERSEDE_READER_REWRITES[1][1], namespace)
@@ -342,6 +350,38 @@ class InstallerTest(unittest.TestCase):
                         [1, 2],
                     )
                     self.assertEqual(len(errors), 1, errors)
+
+    def test_shared_adversarial_parity_cases_never_retire_in_rendered_reader(self):
+        base = self._fixture_identity("retained-row-later.jsonl")
+
+        for case in SUPERSEDE_ADVERSARIAL_PARITY_CASES:
+            with self.subTest(case=case[0]):
+                record = copy.deepcopy(base[-1][1])
+                apply_supersede_adversarial_case(record, case)
+                rows = [*base[:2], (3, record, base[2][2])]
+
+                kept, retired_count, errors = (
+                    self._apply_rendered_supersede_reader(rows)
+                )
+
+                self.assertEqual(retired_count, 0)
+                self.assertEqual(
+                    [line for line, row in kept if row.get("kind") == "council"],
+                    [1, 2],
+                )
+                self.assertEqual(len(errors), 1, errors)
+
+    def test_rendered_loader_matches_strict_appender_json_before_tally(self):
+        load_rows = self._rendered_supersede_namespace()["load_rows"]
+        ledger = self.root / "strict-json-parity.jsonl"
+
+        for name, payload, expected_error in STRICT_JSON_ADVERSARIAL_PARITY_CASES:
+            with self.subTest(case=name):
+                ledger.write_bytes(b'{}\n' + payload)
+                with self.assertRaisesRegex(
+                    ValueError, rf"^line 2: {expected_error}$"
+                ):
+                    load_rows(ledger)
 
     def test_reader_requires_raw_identity_and_never_skips_digest_comparison(self):
         rows = self._fixture_identity("retained-row-later.jsonl")

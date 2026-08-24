@@ -102,6 +102,57 @@ DUPLICATE_BRIEF = "/tmp/council-briefs/duplicate-{run_id}.md"
 DUPLICATE_FIXTURE_ROOT = (
     Path(__file__).parent / "fixtures/duplicate-council-row-supersede"
 )
+SUPERSEDE_ADVERSARIAL_PARITY_CASES = (
+    ("boolean schemaVersion", ("schemaVersion",), True),
+    ("non-integer schemaVersion", ("schemaVersion",), 1.0),
+    (
+        "spaced target digest",
+        ("supersedes", "rawLineSha256"),
+        "surround-with-spaces",
+    ),
+    (
+        "spaced witness digest",
+        ("duplicateOf", "rawLineSha256"),
+        "surround-with-spaces",
+    ),
+)
+STRICT_JSON_ADVERSARIAL_PARITY_CASES = (
+    (
+        "duplicate top-level key",
+        b'{"kind":"council","kind":"council-superseded"}\n',
+        "invalid JSON",
+    ),
+    (
+        "duplicate nested key",
+        b'{"kind":"council","blindSeat":{"ran":true,"ran":false}}\n',
+        "invalid JSON",
+    ),
+    ("NaN", b'{"kind":"council","cost":NaN}\n', "invalid JSON"),
+    ("Infinity", b'{"kind":"council","cost":Infinity}\n', "invalid JSON"),
+    ("negative Infinity", b'{"kind":"council","cost":-Infinity}\n', "invalid JSON"),
+    ("overflowed float", b'{"kind":"council","cost":1e400}\n', "invalid JSON"),
+    ("non-object root", b'[]\n', "record must be an object"),
+    ("invalid UTF-8", b'{"kind":"council","value":"\xff"}\n', "invalid JSON"),
+    ("malformed JSON", b'{"kind":"council"\n', "invalid JSON"),
+    (
+        "excessive nesting",
+        b'{"kind":"council","value":' + b"[" * 2000 + b"0" + b"]" * 2000 + b"}\n",
+        "invalid JSON",
+    ),
+)
+
+
+def apply_supersede_adversarial_case(row, case):
+    """Apply one shared appender/reader parity mutation to a valid assertion."""
+
+    _name, path, replacement = case
+    parent = row
+    for component in path[:-1]:
+        parent = parent[component]
+    field = path[-1]
+    if replacement == "surround-with-spaces":
+        replacement = f" {parent[field]} "
+    parent[field] = replacement
 
 
 def hand_appended_duplicate(completion_row):
@@ -311,6 +362,21 @@ class SupersedeRecordTest(unittest.TestCase):
                 with self.assertRaises(LedgerError):
                     validate_ledger_row(row, prior, prior_identity=loaded)
 
+    def test_adversarial_parity_cases_never_append_or_retire_a_row(self):
+        line, digest = self.hand_append(hand_appended_duplicate(self.completion))
+        before = self.log.read_bytes()
+
+        for case in SUPERSEDE_ADVERSARIAL_PARITY_CASES:
+            with self.subTest(case=case[0]):
+                row = self.supersede(line, digest)
+                apply_supersede_adversarial_case(row, case)
+                with self.assertRaises(LedgerError):
+                    append_ledger_row(self.log, row)
+                self.assertEqual(self.log.read_bytes(), before)
+                self.assertEqual(
+                    superseded_lines(load_jsonl_with_raw_identity(self.log)), {}
+                )
+
     def test_superseded_lines_ignores_a_record_whose_target_drifted(self):
         line, digest = self.hand_append(hand_appended_duplicate(self.completion))
         append_ledger_row(self.log, self.supersede(line, digest))
@@ -508,15 +574,14 @@ class ForecastLedgerTest(unittest.TestCase):
         with self.assertRaisesRegex(LedgerError, "line 2"):
             audit(self.log, self.events, today=date(2026, 10, 1))
 
-    def test_duplicate_keys_and_nonfinite_json_fail_closed(self):
-        for payload in (
-            '{"kind":"council","kind":"council-attempt"}\n',
-            '{"kind":"council","cost":NaN}\n',
-            '{"kind":"council","cost":1e999}\n',
-        ):
-            with self.subTest(payload=payload):
-                self.log.write_text(payload, encoding="utf-8")
-                with self.assertRaisesRegex(LedgerError, "invalid JSON"):
+    def test_strict_json_adversarial_parity_corpus_fails_closed(self):
+        for name, payload, expected_error in STRICT_JSON_ADVERSARIAL_PARITY_CASES:
+            with self.subTest(case=name):
+                self.log.write_bytes(b'{}\n' + payload)
+                with self.assertRaisesRegex(
+                    LedgerError,
+                    rf"^{self.log.name} line 2: {expected_error}$",
+                ):
                     forecasts.load_jsonl(self.log)
 
     def test_excessively_nested_jsonl_is_one_generic_ledger_parse_error(self):

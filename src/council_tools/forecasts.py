@@ -711,8 +711,7 @@ def _require_exact_keys(value: Any, expected: set[str], label: str) -> dict[str,
 
 
 def _require_sha256(value: Any, field: str) -> str:
-    value = _require_text(value, field)
-    if not SHA256_RE.fullmatch(value):
+    if not isinstance(value, str) or not SHA256_RE.fullmatch(value):
         raise LedgerError(f"{field} must be a lowercase SHA-256 digest")
     return value
 
@@ -818,7 +817,11 @@ def _validate_supersede_against_active_prefix(
         },
         "council-superseded record",
     )
-    if row["schemaVersion"] != SCHEMA_VERSION:
+    if (
+        isinstance(row["schemaVersion"], bool)
+        or not isinstance(row["schemaVersion"], int)
+        or row["schemaVersion"] != SCHEMA_VERSION
+    ):
         raise LedgerError("council-superseded schemaVersion must be 1")
     if row["kind"] != SUPERSEDE_KIND:
         raise LedgerError(f"supersede kind must be {SUPERSEDE_KIND}")

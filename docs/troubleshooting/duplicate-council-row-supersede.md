@@ -123,8 +123,8 @@ The appender pins both the target (`supersedes`) and its retained witness (`dupl
 by line and raw-line digest. It re-derives the design's duplicate predicate, uniqueness
 rule, and prefix state. The no-forecast check remains a necessary evidence-preservation
 guard on the target, but it is not evidence of duplication and is never sufficient. The
-reader independently replays the same duplicate and composition rules. Issue #34 owns
-the remaining record-attribution and missing-raw-identity fail-closed checks.
+reader independently replays the same shape, identity, duplicate, and composition checks;
+any record or raw JSON it cannot verify retires nothing.
 
 **4. Re-run the gate.** It should reach exit 0 with `superseded_rows=<n>`.
 

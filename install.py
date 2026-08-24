@@ -715,7 +715,7 @@ SUPERSEDE_READER_MARKER = "_apply_supersedes"
 _SUPERSEDE_READER_REWRITES = (
     (
         "import argparse\nimport json\nimport os\nimport sys\n",
-        "import argparse\nfrom datetime import datetime\nimport hashlib\nimport json\nimport os\nimport re\n"
+        "import argparse\nfrom datetime import datetime\nimport hashlib\nimport json\nimport math\nimport os\nimport re\n"
         "import sys\n",
     ),
     (
@@ -742,11 +742,47 @@ def load_rows(path):
             if not raw.strip():
                 continue
             try:
-                row = json.loads(raw.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                raise ValueError(f"line {line_number}: invalid JSON: {exc}") from exc
+                row = json.loads(
+                    raw.decode("utf-8"),
+                    object_pairs_hook=_strict_json_object,
+                    parse_constant=_reject_json_constant,
+                )
+                _reject_nonfinite_json_numbers(row)
+            except (
+                UnicodeDecodeError,
+                json.JSONDecodeError,
+                RecursionError,
+                ValueError,
+            ) as exc:
+                raise ValueError(f"line {line_number}: invalid JSON") from exc
+            if not isinstance(row, dict):
+                raise ValueError(f"line {line_number}: record must be an object")
             rows.append((line_number, row, hashlib.sha256(raw).hexdigest()))
     return rows
+
+
+def _strict_json_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("invalid JSON: duplicate key")
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(_value):
+    raise ValueError("invalid JSON: non-finite number")
+
+
+def _reject_nonfinite_json_numbers(value):
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError("invalid JSON: non-finite number")
+    if isinstance(value, dict):
+        for nested in value.values():
+            _reject_nonfinite_json_numbers(nested)
+    elif isinstance(value, list):
+        for nested in value:
+            _reject_nonfinite_json_numbers(nested)
 
 
 SUPERSEDE_RECORD_KIND = "council-superseded"
@@ -786,7 +822,11 @@ def _supersede_record_error(row):
             f"missing={sorted(SUPERSEDE_RECORD_KEYS - observed)} "
             f"extra={sorted(observed - SUPERSEDE_RECORD_KEYS)}"
         )
-    if isinstance(row["schemaVersion"], bool) or row["schemaVersion"] != 1:
+    if (
+        isinstance(row["schemaVersion"], bool)
+        or not isinstance(row["schemaVersion"], int)
+        or row["schemaVersion"] != 1
+    ):
         return "council-superseded schemaVersion must be 1"
     if row["kind"] != SUPERSEDE_RECORD_KIND:
         return f"supersede kind must be {SUPERSEDE_RECORD_KIND}"
