@@ -11,7 +11,7 @@ being adopted* -- and nothing else.  It reads the ledger and classifies each
 council row's ``commits`` field by shape.  It never invokes git, never
 classifies a commit, and never says a change went unreviewed.  That is the
 point: the reader that did join against git had to work from a key present in
-16% of rows, and inherited a false-accusation rate to match.
+a quarter of rows, and inherited a false-accusation rate to match.
 
 Deliberately not a gate.  Adoption is a number that starts low and improves, so
 an exit code that goes red until it is perfect would be red for months and would
@@ -23,7 +23,6 @@ shipped unreviewed.
 
 from __future__ import annotations
 
-import json
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
@@ -39,6 +38,7 @@ COUNCIL_ROW_KINDS = frozenset({"council"})
 ARRAY_FULL_SHAS = "array-full-shas"
 ARRAY_ABBREVIATED = "array-abbreviated"
 ARRAY_EMPTY = "array-empty"
+OBJECT_NAMES_CANDIDATE = "object-names-candidate-commit"
 OBJECT_PRECOMMIT = "object-precommit-review"
 OBJECT_BASE_ONLY = "object-base-pointer-only"
 FIELD_NULL = "field-null"
@@ -49,6 +49,7 @@ SHAPES = (
     ARRAY_FULL_SHAS,
     ARRAY_ABBREVIATED,
     ARRAY_EMPTY,
+    OBJECT_NAMES_CANDIDATE,
     OBJECT_PRECOMMIT,
     OBJECT_BASE_ONLY,
     FIELD_NULL,
@@ -58,14 +59,17 @@ SHAPES = (
 
 #: Shapes that state which commits were read, so a later reconciler could join
 #: on them.  Only these count toward adoption.
-NAMES_COMMITS = frozenset({ARRAY_FULL_SHAS, ARRAY_ABBREVIATED})
+NAMES_COMMITS = frozenset(
+    {ARRAY_FULL_SHAS, ARRAY_ABBREVIATED, OBJECT_NAMES_CANDIDATE}
+)
 
 SHAPE_DESCRIPTIONS = {
     ARRAY_FULL_SHAS: "array of full 40-character SHAs (the convention)",
     ARRAY_ABBREVIATED: "array of object names, at least one abbreviated",
     ARRAY_EMPTY: "empty array; indistinguishable from an unpopulated field",
+    OBJECT_NAMES_CANDIDATE: "object naming the reviewed tip commit alongside its base",
     OBJECT_PRECOMMIT: "object recording a review of a staged or uncommitted tree",
-    OBJECT_BASE_ONLY: "object naming a branch point, not what was read",
+    OBJECT_BASE_ONLY: "object naming only a branch point or production head, not what was read",
     FIELD_NULL: "field present and null",
     FIELD_ABSENT: "field absent",
     OTHER: "some other shape",
@@ -73,8 +77,29 @@ SHAPE_DESCRIPTIONS = {
 
 #: Keys and values that mark a row as having reviewed content that was not yet a
 #: commit.  Those reviews were real; there was simply nothing to name.
-_PRECOMMIT_KEYS = frozenset({"stagedTree", "candidate_tree", "candidateTree"})
+_TREE_KEYS = frozenset({"stagedTree", "candidate_tree", "candidateTree"})
 _PRECOMMIT_VALUE_PREFIX = "uncommitted"
+
+#: Keys whose value names the reviewed *tip*. A reconciler can join on these:
+#: with the row's base they bound exactly what was read. ``base`` is excluded --
+#: it names the branch point, which is what the review started from, not what it
+#: covered -- and so is ``prodHead``, which names production's HEAD and was never
+#: a review boundary at all.
+_REVIEWED_TIP_KEYS = ("candidate_commit", "candidateCommit", "candidate")
+
+_HEX = frozenset("0123456789abcdef")
+
+
+def _is_object_name(value: object, *, exact: int | None = None) -> bool:
+    """True when a value is lowercase hex of a plausible object-name length."""
+
+    if not isinstance(value, str):
+        return False
+    if exact is not None and len(value) != exact:
+        return False
+    if exact is None and not 7 <= len(value) <= 40:
+        return False
+    return bool(value) and set(value) <= _HEX
 
 
 class RecordingCoverageError(ValueError):
@@ -97,11 +122,28 @@ def parse_timestamp(value: str, *, field: str) -> datetime:
         ) from exc
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
+    try:
+        return parsed.astimezone(timezone.utc)
+    except (OverflowError, OSError, ValueError) as exc:
+        # A timestamp at the datetime range boundary overflows on conversion.
+        # OverflowError is not a ValueError, so without this it escapes every
+        # handler in this module and cli.main alike, and surfaces as a traceback
+        # with exit 1 -- the one exit code this tool promises never to return.
+        raise RecordingCoverageError(
+            f"{field} cannot be converted to UTC: {text}"
+        ) from exc
 
 
 def classify_shape(row: Mapping[str, Any]) -> str:
-    """Return the shape of one council row's ``commits`` field."""
+    """Return the shape of one council row's ``commits`` field.
+
+    The object branch inspects **values**, not key presence.  A row such as
+    ``{"base": B, "candidate_commit": C, "candidate_tree": null}`` carries a
+    tree key whose value is null and a candidate whose value is a real commit;
+    keying off presence alone filed it as a tree review and dropped it from the
+    adoption numerator.  On the live ledger that mis-scored six rows, understated
+    adoption by a third and overstated tree reviews by three quarters.
+    """
 
     if "commits" not in row:
         return FIELD_ABSENT
@@ -111,17 +153,30 @@ def classify_shape(row: Mapping[str, Any]) -> str:
     if isinstance(commits, list):
         if not commits:
             return ARRAY_EMPTY
-        if not all(isinstance(item, str) and item for item in commits):
+        if not all(_is_object_name(item) for item in commits):
+            # Not object names at all -- free text, numbers, nested structures.
+            # The convention count is the headline number on a hand-typed field,
+            # so anything that is not plausibly an object name is OTHER.
             return OTHER
-        if all(len(item) == 40 for item in commits):
+        if all(_is_object_name(item, exact=40) for item in commits):
             return ARRAY_FULL_SHAS
         return ARRAY_ABBREVIATED
     if isinstance(commits, Mapping):
-        if _PRECOMMIT_KEYS & set(commits):
+        # Naming the reviewed tip is the stronger, joinable fact, so it is
+        # tested before the tree keys: a row may carry both when a staged tree
+        # was reviewed and then committed.
+        if any(_is_object_name(commits.get(key)) for key in _REVIEWED_TIP_KEYS):
+            return OBJECT_NAMES_CANDIDATE
+        if any(
+            isinstance(commits.get(key), str) and commits.get(key)
+            for key in _TREE_KEYS
+        ):
             return OBJECT_PRECOMMIT
         for value in commits.values():
             if isinstance(value, str) and value.startswith(_PRECOMMIT_VALUE_PREFIX):
                 return OBJECT_PRECOMMIT
+        if not commits:
+            return OTHER
         return OBJECT_BASE_ONLY
     return OTHER
 
@@ -179,17 +234,27 @@ def report_recording_coverage(
 
     counts = {shape: 0 for shape in SHAPES}
     unreadable_ts = 0
+    excluded_for_ts = 0
+    unrecognised_kind = 0
     considered = 0
     for _line_number, row in rows:
         if row.get("kind") not in COUNCIL_ROW_KINDS:
+            # The ledger's first rows predate the `kind` field entirely. They
+            # are excluded from the denominator, and counted for the same reason
+            # the unreadable timestamps are: a denominator must not shrink
+            # without saying so.
+            if row.get("kind") is None:
+                unrecognised_kind += 1
             continue
+        row_ts = _row_timestamp(row)
+        if row_ts is None:
+            # Counted unconditionally, not only when a window is given. The
+            # default invocation is the one anything automated runs, and it must
+            # not report zero unreadable timestamps for a ledger that has them.
+            unreadable_ts += 1
         if since is not None or until is not None:
-            row_ts = _row_timestamp(row)
             if row_ts is None:
-                # Counted, never silently dropped: a row that cannot be placed
-                # in time is a gap in the record, and the window's denominator
-                # would otherwise shrink without saying so.
-                unreadable_ts += 1
+                excluded_for_ts += 1
                 continue
             if since is not None and row_ts < since:
                 continue
@@ -202,13 +267,16 @@ def report_recording_coverage(
         return refuse(
             "no-council-rows",
             "no council rows in the window, so there is no adoption denominator"
-            f" (rows with an unreadable ts: {unreadable_ts})",
+            f" (council rows excluded for an unreadable ts: {excluded_for_ts};"
+            f" rows with no kind field: {unrecognised_kind})",
         )
 
     naming = sum(counts[shape] for shape in NAMES_COMMITS)
     result["determined"] = True
     result["councilRows"] = considered
     result["rowsWithUnreadableTs"] = unreadable_ts
+    result["rowsExcludedForUnreadableTs"] = excluded_for_ts
+    result["rowsWithNoKindField"] = unrecognised_kind
     result["shapes"] = {
         shape: {
             "rows": counts[shape],
@@ -222,7 +290,11 @@ def report_recording_coverage(
         "rowsNamingCommits": naming,
         "rowsUnableToNameCommits": considered - naming,
         "share": naming / considered,
-        "basis": "council rows recording an array of object names / all council rows",
+        "basis": (
+            "council rows naming the commits they read (an array of object "
+            "names, or an object naming the reviewed tip) / all rows with "
+            "kind=council in the window"
+        ),
     }
     result["precommitReviews"] = counts[OBJECT_PRECOMMIT]
     return result
@@ -259,6 +331,8 @@ def format_recording_coverage(result: Mapping[str, Any]) -> str:
     lines.append(
         f"council_rows={result['councilRows']} "
         f"rows_with_unreadable_ts={result['rowsWithUnreadableTs']} "
+        f"excluded_for_unreadable_ts={result['rowsExcludedForUnreadableTs']} "
+        f"rows_with_no_kind_field={result['rowsWithNoKindField']} "
         f"precommit_reviews={result['precommitReviews']}"
     )
     lines.append(

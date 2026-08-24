@@ -218,24 +218,27 @@ so nothing says how often a change shipped with no council at all. Closing that 
 from version control to what each council row says it reviewed — and that turns out to be blocked
 on a prior question: **is what a council reviewed recorded in a form anything can read?**
 
-Today, mostly not. Measured over the live ledger's 69 council rows:
+Today, mostly not. Run it yourself for the current figure — these are append-only records and any
+number written here is stale the moment another council lands. As of 2026-08-24 the live ledger held
+72 council rows:
 
-| rows | share | shape of `commits` |
-|---:|---:|---|
-| 19 | 27.5% | field absent |
-| 18 | 26.1% | object — base pointer only |
-| 14 | 20.3% | object — reviewed an uncommitted or staged tree |
-| 10 | 14.5% | array of full SHAs |
-| 7 | 10.1% | empty array |
-| 1 | 1.4% | array, abbreviated |
+| rows | share | shape of `commits` | names commits? |
+|---:|---:|---|:--:|
+| 19 | 26.4% | field absent | |
+| 18 | 25.0% | object — only a branch point or production head | |
+| 11 | 15.3% | array of full SHAs (the convention) | yes |
+| 9 | 12.5% | object — reviewed an uncommitted or staged tree | |
+| 7 | 9.7% | object — names the reviewed tip alongside its base | yes |
+| 7 | 9.7% | empty array | |
+| 1 | 1.4% | array, abbreviated | yes |
 
-**11 of 69 rows name actual commits.** The field has no producer — it is typed by hand by the same
-session that ran the council — so it records format adoption, not review.
+**19 of 72 rows name the commits they read.** The field has no producer — it is typed by hand by the
+same session that ran the council — so it records format adoption, not review.
 
 `recording-coverage` reports exactly that, and nothing else:
 
 ```sh
-python -m council_tools.cli recording-coverage --log ./council.jsonl --since 2026-09-01
+python -m council_tools.cli recording-coverage --log ./council.jsonl
 ```
 
 It reads the ledger only. It never invokes git, never classifies a commit, and never reports that a
@@ -243,9 +246,12 @@ change went unreviewed. That restraint is the design: a reader that *did* join a
 control had to work from a key present in a sixth of rows, and inherited a false-accusation rate to
 match.
 
-The 14 pre-commit rows are called out separately rather than counted as failures. Those reviews were
-real; there was simply no commit in existence to name. Any design that assumes "a review names
-commits" is wrong for a fifth of actual reviews.
+Rows that reviewed a staged or uncommitted tree are called out separately rather than counted as
+failures. Those reviews were real; there was simply no commit in existence to name. Any design that
+assumes "a review names commits" is wrong for them by construction.
+
+Rows whose `ts` cannot be read, and the ledger's original rows that predate the `kind` field, are
+counted and reported rather than dropped — a denominator must not shrink without saying so.
 
 ### Exit codes
 

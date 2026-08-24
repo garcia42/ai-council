@@ -990,9 +990,15 @@ def command_recording_coverage(args: argparse.Namespace) -> int:
     if args.since and args.until and args.since >= args.until:
         print("--since must be strictly before --until", file=sys.stderr)
         return 2
-    result = report_recording_coverage(
-        log_path=args.log, since=args.since, until=args.until
-    )
+    try:
+        result = report_recording_coverage(
+            log_path=args.log, since=args.since, until=args.until
+        )
+    except RecordingCoverageError as exc:
+        # Makes "there is no exit 1" hold by construction rather than by the
+        # duplicated precondition above happening to agree with the module's.
+        print(str(exc), file=sys.stderr)
+        return 2
     rendered = json.dumps(result, sort_keys=True) if args.json else (
         format_recording_coverage(result)
     )

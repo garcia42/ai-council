@@ -1,3 +1,4 @@
+import ast
 import json
 import os
 import subprocess
@@ -9,6 +10,8 @@ from pathlib import Path
 
 from council_tools.recording_coverage import (
     ARRAY_ABBREVIATED,
+    SHAPES,
+    OBJECT_NAMES_CANDIDATE,
     ARRAY_EMPTY,
     ARRAY_FULL_SHAS,
     FIELD_ABSENT,
@@ -66,9 +69,63 @@ class ShapeTest(unittest.TestCase):
 
     def test_a_bare_base_pointer_names_the_branch_point_only(self):
         self.assertEqual(self.shape({"base": SHA}), OBJECT_BASE_ONLY)
+        # prodHead names production's HEAD; it was never a review boundary.
         self.assertEqual(
-            self.shape({"base": SHA, "candidate": OTHER_SHA}), OBJECT_BASE_ONLY
+            self.shape({"base": SHA[:7], "prodHead": OTHER_SHA}), OBJECT_BASE_ONLY
         )
+
+    def test_an_object_naming_the_reviewed_tip_names_commits(self):
+        for commits in (
+            {"base": SHA, "candidate": OTHER_SHA},
+            {"base": SHA, "candidate_commit": OTHER_SHA},
+            {"base": SHA[:7], "candidate": OTHER_SHA[:7]},
+        ):
+            with self.subTest(commits=commits):
+                self.assertEqual(self.shape(commits), OBJECT_NAMES_CANDIDATE)
+
+    def test_a_null_tree_key_does_not_make_it_a_tree_review(self):
+        # Verbatim from the live ledger. Keying off presence rather than value
+        # filed this as a tree review and dropped it from the numerator.
+        self.assertEqual(
+            self.shape({
+                "base": "11bd467d",
+                "candidate_commit": "bfd0ee91caff0ffc374de61ba65b32fc15f310b9",
+                "candidate_tree": None,
+            }),
+            OBJECT_NAMES_CANDIDATE,
+        )
+        self.assertEqual(
+            self.shape({
+                "base": "11bd467d",
+                "candidate_commit": None,
+                "candidate_tree": None,
+            }),
+            OBJECT_BASE_ONLY,
+        )
+
+    def test_a_populated_tree_key_still_reads_as_a_tree_review(self):
+        self.assertEqual(
+            self.shape({"base": SHA, "stagedTree": OTHER_SHA}), OBJECT_PRECOMMIT
+        )
+
+    def test_the_reviewed_tip_outranks_a_tree_key_when_both_are_real(self):
+        # Naming the commit is the stronger, joinable fact.
+        self.assertEqual(
+            self.shape({"base": SHA, "candidate_commit": OTHER_SHA,
+                        "stagedTree": "c" * 40}),
+            OBJECT_NAMES_CANDIDATE,
+        )
+
+    def test_non_hex_is_not_the_convention(self):
+        for commits in (["z" * 40], ["   "], [SHA, "not a sha at all!!!!"], ["A" * 40]):
+            with self.subTest(commits=commits):
+                self.assertEqual(self.shape(commits), OTHER)
+
+    def test_an_empty_object_names_nothing(self):
+        self.assertEqual(self.shape({}), OTHER)
+
+    def test_an_overlong_string_is_not_an_abbreviation(self):
+        self.assertEqual(self.shape(["a" * 41]), OTHER)
 
     def test_null_and_absent_are_distinguished(self):
         self.assertEqual(self.shape(None), FIELD_NULL)
@@ -140,9 +197,7 @@ class AdoptionTest(ReportTestBase):
             self.council_row(stamp(3)),
         )
         result = self.run_report()
-        self.assertEqual(set(result["shapes"]), set(
-            [ARRAY_FULL_SHAS, ARRAY_ABBREVIATED, ARRAY_EMPTY, OBJECT_PRECOMMIT,
-             OBJECT_BASE_ONLY, FIELD_NULL, FIELD_ABSENT, OTHER]))
+        self.assertEqual(set(result["shapes"]), set(SHAPES))
         self.assertAlmostEqual(
             sum(entry["share"] for entry in result["shapes"].values()), 1.0
         )
@@ -227,14 +282,105 @@ class ExitCodeTest(ReportTestBase):
         # ignore it.
         self.assertEqual(recording_exit_code(result), 0)
 
-    def test_there_is_no_exit_one(self):
-        self.write_ledger(self.council_row(stamp(1), {"base": SHA}))
-        determined = self.run_report()
-        self.write_ledger("{not json")
-        refused = self.run_report()
-        self.assertEqual(
-            {recording_exit_code(determined), recording_exit_code(refused)}, {0, 3}
+    def test_no_ledger_content_can_make_the_process_exit_one(self):
+        """The docstring promises no exit 1; pin it at the process boundary.
+
+        A timestamp at the datetime range boundary raises OverflowError, which is
+        not a ValueError, so it escaped every handler in the module and in
+        cli.main alike and surfaced as a traceback with exit 1.
+        """
+
+        env = dict(os.environ)
+        env["PYTHONPATH"] = str(Path(__file__).parents[1] / "src")
+        adversarial = [
+            '{"kind":"council","ts":"9999-12-31T23:59:59-14:00","commits":["' + SHA + '"]}',
+            '{"kind":"council","ts":"0001-01-01T00:00:00+14:00","commits":[]}',
+            '{"kind":"council","ts":123,"commits":{"base":"' + SHA + '"}}',
+            "{not json",
+            '"a bare string"',
+            "",
+        ]
+        for line in adversarial:
+            with self.subTest(line=line[:40]):
+                self.write_ledger(line)
+                for arguments in (
+                    ["--log", str(self.log)],
+                    ["--log", str(self.log), "--since", "2026-01-01"],
+                    ["--log", str(self.log), "--json"],
+                ):
+                    result = subprocess.run(
+                        [sys.executable, "-m", "council_tools.cli",
+                         "recording-coverage", *arguments],
+                        text=True, capture_output=True, env=env, check=False,
+                    )
+                    self.assertIn(result.returncode, (0, 2, 3),
+                                  f"{arguments} -> {result.returncode}\n{result.stderr}")
+                    self.assertNotIn("Traceback", result.stderr)
+
+
+class DenominatorHonestyTest(ReportTestBase):
+    """A denominator must never shrink without saying so."""
+
+    def test_unreadable_timestamps_are_reported_without_a_window(self):
+        self.write_ledger(
+            self.council_row(stamp(1), [SHA]),
+            {"kind": "council", "ts": "nope", "commits": [SHA]},
         )
+        result = self.run_report()
+        self.assertEqual(result["councilRows"], 2)
+        self.assertEqual(result["rowsWithUnreadableTs"], 1)
+        self.assertEqual(result["rowsExcludedForUnreadableTs"], 0)
+
+    def test_rows_predating_the_kind_field_are_counted_not_dropped(self):
+        self.write_ledger(
+            self.council_row(stamp(1), [SHA]),
+            {"question": "an original panel row", "ts": text(stamp(2))},
+        )
+        result = self.run_report()
+        self.assertEqual(result["councilRows"], 1)
+        self.assertEqual(result["rowsWithNoKindField"], 1)
+
+    def test_the_basis_string_states_the_exact_filter(self):
+        self.write_ledger(self.council_row(stamp(1), [SHA]))
+        basis = self.run_report()["adoption"]["basis"]
+        self.assertIn("kind=council", basis)
+        self.assertIn("reviewed tip", basis)
+
+
+class NoGitTest(unittest.TestCase):
+    """The whole premise: removing the git join removed the fail-open surface.
+
+    Checked against the parsed module rather than its text, so the word "git"
+    in the docstring that explains the design cannot fail its own test.
+    """
+
+    MODULE = Path(__file__).parents[1] / "src/council_tools/recording_coverage.py"
+
+    def test_the_module_imports_no_subprocess_machinery(self):
+        tree = ast.parse(self.MODULE.read_text(encoding="utf-8"))
+        imported = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported.update(alias.name.split(".")[0] for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                imported.add(node.module.split(".")[0])
+        self.assertEqual(imported & {"subprocess", "shutil", "os", "shlex", "pty"}, set())
+
+    def test_no_string_literal_in_the_module_invokes_git(self):
+        tree = ast.parse(self.MODULE.read_text(encoding="utf-8"))
+        docstrings = set()
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef)):
+                continue
+            body = getattr(node, "body", None)
+            if (body and isinstance(body[0], ast.Expr)
+                    and isinstance(body[0].value, ast.Constant)
+                    and isinstance(body[0].value.value, str)):
+                docstrings.add(id(body[0].value))
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Constant) and isinstance(node.value, str)
+                    and id(node) not in docstrings):
+                self.assertNotIn("git", node.value.lower())
 
 
 class RenderingTest(ReportTestBase):
