@@ -678,6 +678,7 @@ def _with_attempt_allowlist(criterion_text: str) -> str:
         "council-attempt-v2",
         "council-seats-finished",
         "capture-invalidation",
+        "council-superseded",
     )
     old_allowlist = (
         'NON_COUNCIL_RECORD_KINDS = {"pre-mortem-calibration", "council-calibration"}'
@@ -707,6 +708,194 @@ def _with_attempt_allowlist(criterion_text: str) -> str:
         if f'"{kind}"' not in criterion_text[start:finish]
     )
     return criterion_text[: finish + 1] + missing + criterion_text[finish + 1 :]
+
+
+SUPERSEDE_READER_MARKER = "_apply_supersedes"
+
+_SUPERSEDE_READER_REWRITES = (
+    (
+        "import argparse\nimport json\nimport os\nimport sys\n",
+        "import argparse\nimport hashlib\nimport json\nimport os\nimport re\n"
+        "import sys\n",
+    ),
+    (
+        """\
+def load_rows(path):
+    rows = []
+    with open(path, encoding="utf-8") as handle:
+        for line_number, raw in enumerate(handle, 1):
+            if not raw.strip():
+                continue
+            try:
+                rows.append((line_number, json.loads(raw)))
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"line {line_number}: invalid JSON: {exc}") from exc
+    return rows
+
+
+""",
+        """\
+def load_rows(path):
+    rows = []
+    with open(path, "rb") as handle:
+        for line_number, raw in enumerate(handle, 1):
+            if not raw.strip():
+                continue
+            try:
+                row = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ValueError(f"line {line_number}: invalid JSON: {exc}") from exc
+            rows.append((line_number, row, hashlib.sha256(raw).hexdigest()))
+    return rows
+
+
+SUPERSEDE_RECORD_KIND = "council-superseded"
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _apply_supersedes(rows):
+    \"\"\"Drop ledger rows retired by a council-superseded record.
+
+    An append-only store cannot delete a row that should never have been written, so
+    it says so by appending: the record pins one target by line number and raw-line
+    digest, and this tally then reads as though the target were absent.  Every guard
+    the appender applies is re-checked here rather than assumed, because a record
+    this reader cannot verify must not be able to hide a row -- an unverifiable
+    supersede is an error and retires nothing.
+
+    Refusing to retire a row carrying predictions or a forecastState is the guard that
+    matters: that row is the evidence the kill criterion is scored on, and no approval
+    turns erasing it into a correction.
+    \"\"\"
+
+    normalized = []
+    for entry in rows:
+        if len(entry) == 3:
+            line_number, row, raw_sha256 = entry
+        else:
+            line_number, row = entry
+            raw_sha256 = None
+        normalized.append((line_number, row, raw_sha256))
+
+    targets = {
+        line_number: (row, raw_sha256) for line_number, row, raw_sha256 in normalized
+    }
+    errors = []
+    retired = {}
+    for line_number, row, _raw_sha256 in normalized:
+        if row.get("kind") != SUPERSEDE_RECORD_KIND:
+            continue
+        target = row.get("supersedes")
+        if not isinstance(target, dict):
+            errors.append(f"line {line_number}: supersedes must be an object")
+            continue
+        target_line = target.get("line")
+        digest = target.get("rawLineSha256")
+        if isinstance(target_line, bool) or not isinstance(target_line, int) or target_line < 1:
+            errors.append(
+                f"line {line_number}: supersedes.line must be a positive integer"
+            )
+            continue
+        if not isinstance(digest, str) or not SHA256_RE.fullmatch(digest):
+            errors.append(
+                f"line {line_number}: supersedes.rawLineSha256 must be a lowercase "
+                "SHA-256 digest"
+            )
+            continue
+        if target_line >= line_number:
+            errors.append(
+                f"line {line_number}: supersedes.line must name an earlier row"
+            )
+            continue
+        if target_line not in targets:
+            errors.append(
+                f"line {line_number}: supersedes.line names no ledger row: {target_line}"
+            )
+            continue
+        target_row, target_sha256 = targets[target_line]
+        if target_sha256 is not None and target_sha256 != digest:
+            errors.append(
+                f"line {line_number}: supersedes.rawLineSha256 does not match line "
+                f"{target_line}"
+            )
+            continue
+        if target_row.get("kind") != "council":
+            errors.append(
+                f"line {line_number}: only a council row can be superseded"
+            )
+            continue
+        if target_row.get("forecastState") is not None:
+            errors.append(
+                f"line {line_number}: line {target_line} carries a forecastState and "
+                "cannot be superseded"
+            )
+            continue
+        predictions = target_row.get("predictions")
+        if isinstance(predictions, list) and predictions:
+            errors.append(
+                f"line {line_number}: line {target_line} carries predictions and "
+                "cannot be superseded"
+            )
+            continue
+        if target_line in retired:
+            errors.append(
+                f"line {line_number}: line {target_line} is already superseded by "
+                f"line {retired[target_line]}"
+            )
+            continue
+        retired[target_line] = line_number
+    kept = [
+        (line_number, row)
+        for line_number, row, _raw_sha256 in normalized
+        if line_number not in retired
+    ]
+    return kept, len(retired), errors
+
+""",
+    ),
+    (
+        "def tally(rows):\n    completed = []\n",
+        "def tally(rows):\n"
+        "    rows, superseded_rows, errors = _apply_supersedes(rows)\n"
+        "    completed = []\n",
+    ),
+    (
+        "    non_council = []\n    errors = []\n",
+        "    non_council = []\n",
+    ),
+    (
+        '        "legacyBlindRows": len(legacy_blind),\n',
+        '        "legacyBlindRows": len(legacy_blind),\n'
+        '        "supersededRows": superseded_rows,\n',
+    ),
+    (
+        '            "legacy_blind_rows={legacyBlindRows} "\n',
+        '            "legacy_blind_rows={legacyBlindRows} "\n'
+        '            "superseded_rows={supersededRows} "\n',
+    ),
+)
+
+
+def _with_superseded_reader(criterion_text: str) -> str:
+    """Teach the deployed kill criterion to honour council-superseded records.
+
+    The criterion's body is not carried in this repository, so the reader change
+    that must ship with the appender travels as an idempotent, preimage-anchored
+    rewrite -- the same shape as the record-kind allowlist above.  A preimage that
+    no longer matches fails the install rather than producing a reader that admits
+    the record kind while still counting the rows it retires.
+    """
+
+    if SUPERSEDE_READER_MARKER in criterion_text:
+        return criterion_text
+    for preimage, image in _SUPERSEDE_READER_REWRITES:
+        if criterion_text.count(preimage) != 1:
+            raise InstallError(
+                "blind-seat superseded-reader preimage is not unique: "
+                + preimage.splitlines()[0]
+            )
+        criterion_text = criterion_text.replace(preimage, image, 1)
+    return criterion_text
 
 
 def _render_with_source_custody(
@@ -743,8 +932,8 @@ def _render_with_source_custody(
             marker="## Steps\n",
         )
 
-        criterion_text = _with_attempt_allowlist(
-            criterion.read_text(encoding="utf-8")
+        criterion_text = _with_superseded_reader(
+            _with_attempt_allowlist(criterion.read_text(encoding="utf-8"))
         )
 
         claude_text = claude_md.read_text(encoding="utf-8")
@@ -2431,8 +2620,8 @@ def restore(
         criterion = (
             root / ".claude/knowledge/council-eval/blind_seat_kill_criterion.py"
         )
-        payloads[criterion] = _with_attempt_allowlist(
-            payloads[criterion].decode("utf-8")
+        payloads[criterion] = _with_superseded_reader(
+            _with_attempt_allowlist(payloads[criterion].decode("utf-8"))
         ).encode("utf-8")
         for target in payloads:
             if not target.exists():

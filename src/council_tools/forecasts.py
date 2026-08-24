@@ -55,6 +55,8 @@ ID_RE = re.compile(
 )
 LOCK_TIMEOUT_SECONDS = 10.0
 OUTCOME_FINGERPRINT_RE = re.compile(r"^[0-9a-f]{64}$")
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+SUPERSEDE_KIND = "council-superseded"
 
 
 class LedgerError(ValueError):
@@ -661,12 +663,181 @@ def validate_blind_brief_identity(
             )
 
 
-def validate_ledger_row(row: dict[str, Any], prior_rows: Iterable[dict[str, Any]]) -> None:
+def make_supersede(
+    *,
+    line: int,
+    raw_line_sha256: str,
+    reason: str,
+    operator: str,
+    approved_at: str,
+    reference: str,
+    ts: str,
+) -> dict[str, Any]:
+    """Build one record retiring a ledger row that should never have been written.
+
+    An append-only store cannot express "this row does not count" by editing, and it
+    must not try: a row is not wrong in a field, it is wrong in existing. Saying so by
+    appending keeps the original bytes readable, names an operator and a reason, and
+    leaves the correction itself auditable.
+    """
+
+    return {
+        "schemaVersion": SCHEMA_VERSION,
+        "kind": SUPERSEDE_KIND,
+        "ts": ts,
+        "supersedes": {
+            "line": line,
+            "rawLineSha256": raw_line_sha256,
+        },
+        "reason": reason,
+        "approval": {
+            "operator": operator,
+            "approvedAt": approved_at,
+            "reference": reference,
+        },
+    }
+
+
+def _require_exact_keys(value: Any, expected: set[str], label: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise LedgerError(f"{label} must be an object")
+    observed = set(value)
+    if observed != expected:
+        raise LedgerError(
+            f"{label} has unexpected shape; missing={sorted(expected - observed)} "
+            f"extra={sorted(observed - expected)}"
+        )
+    return value
+
+
+def _require_sha256(value: Any, field: str) -> str:
+    value = _require_text(value, field)
+    if not SHA256_RE.fullmatch(value):
+        raise LedgerError(f"{field} must be a lowercase SHA-256 digest")
+    return value
+
+
+def _require_line_number(value: Any, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise LedgerError(f"{field} must be a positive integer")
+    return value
+
+
+def superseded_lines(
+    prior_identity: Iterable[tuple[int, dict[str, Any], str]],
+) -> dict[int, int]:
+    """Map every retired line number to the supersede record that retired it.
+
+    Only records whose target still verifies retire anything.  A supersede record
+    that cannot be trusted must not be able to hide a row, so an unverifiable one
+    is ignored here and reported by :func:`validate_supersede` when it is appended
+    and by the deployed kill criterion when it is read.
+    """
+
+    prior_identity = list(prior_identity)
+    digests = {
+        line_number: raw_sha256 for line_number, _row, raw_sha256 in prior_identity
+    }
+    retired: dict[int, int] = {}
+    for line_number, row, _raw_sha256 in prior_identity:
+        if row.get("kind") != SUPERSEDE_KIND:
+            continue
+        target = row.get("supersedes")
+        if not isinstance(target, dict):
+            continue
+        target_line = target.get("line")
+        if isinstance(target_line, bool) or not isinstance(target_line, int):
+            continue
+        if digests.get(target_line) != target.get("rawLineSha256"):
+            continue
+        if target_line in retired:
+            continue
+        retired[target_line] = line_number
+    return retired
+
+
+def validate_supersede(
+    row: dict[str, Any],
+    prior_identity: Iterable[tuple[int, dict[str, Any], str]],
+) -> None:
+    """Admit a supersede only when it names one exact, retirable ledger row.
+
+    The dangerous direction is superseding an *original*: a row carrying sealed
+    forecasts is the evidence the kill criterion is scored on, and no approval makes
+    retiring it a correction.  Refusing predictions and ``forecastState`` here is the
+    guard that keeps this record a way to retire a duplicate and not a way to erase a
+    council.  The target is pinned by its raw-line digest as well as its line number
+    so the record names one row and cannot drift onto another.
+    """
+
+    _require_exact_keys(
+        row,
+        {"schemaVersion", "kind", "ts", "supersedes", "reason", "approval"},
+        "council-superseded record",
+    )
+    if row["schemaVersion"] != SCHEMA_VERSION:
+        raise LedgerError("council-superseded schemaVersion must be 1")
+    if row["kind"] != SUPERSEDE_KIND:
+        raise LedgerError(f"supersede kind must be {SUPERSEDE_KIND}")
+    _parse_timestamp(row["ts"], "ts")
+    _require_text(row["reason"], "reason")
+    approval = _require_exact_keys(
+        row["approval"], {"operator", "approvedAt", "reference"}, "approval"
+    )
+    _require_text(approval["operator"], "approval.operator")
+    _parse_timestamp(approval["approvedAt"], "approval.approvedAt")
+    _require_text(approval["reference"], "approval.reference")
+    target_spec = _require_exact_keys(
+        row["supersedes"], {"line", "rawLineSha256"}, "supersedes"
+    )
+    target_line = _require_line_number(target_spec["line"], "supersedes.line")
+    digest = _require_sha256(target_spec["rawLineSha256"], "supersedes.rawLineSha256")
+
+    prior_identity = list(prior_identity)
+    targets = {
+        line_number: (target_row, raw_sha256)
+        for line_number, target_row, raw_sha256 in prior_identity
+    }
+    if target_line not in targets:
+        raise LedgerError(f"supersedes.line names no ledger row: {target_line}")
+    target_row, raw_sha256 = targets[target_line]
+    if raw_sha256 != digest:
+        raise LedgerError(
+            f"supersedes.rawLineSha256 does not match line {target_line}"
+        )
+    if target_row.get("kind") != "council":
+        raise LedgerError(
+            f"only a council row can be superseded; line {target_line} is "
+            f"kind {target_row.get('kind')!r}"
+        )
+    if target_row.get("forecastState") is not None:
+        raise LedgerError(
+            f"line {target_line} carries a forecastState and cannot be superseded"
+        )
+    predictions = target_row.get("predictions")
+    if isinstance(predictions, list) and predictions:
+        raise LedgerError(
+            f"line {target_line} carries predictions and cannot be superseded"
+        )
+    already = superseded_lines(prior_identity)
+    if target_line in already:
+        raise LedgerError(
+            f"line {target_line} is already superseded by line {already[target_line]}"
+        )
+
+
+def validate_ledger_row(
+    row: dict[str, Any],
+    prior_rows: Iterable[dict[str, Any]],
+    *,
+    prior_identity: Iterable[tuple[int, dict[str, Any], str]] | None = None,
+) -> None:
     # This is also the CLI's check-only boundary. Serializing here prevents
     # otherwise unvalidated nested council metadata from poisoning the ledger
     # with Python's non-standard NaN/Infinity tokens.
     _canonical_json_line(row)
     prior_rows = list(prior_rows)
+    prior_identity = None if prior_identity is None else list(prior_identity)
     kind = row.get("kind")
     if kind == "council-attempt":
         validate_attempt(row)
@@ -692,6 +863,13 @@ def validate_ledger_row(row: dict[str, Any], prior_rows: Iterable[dict[str, Any]
                     "outcome fingerprint already exists; link it in relatedOutcomeIds"
                 )
     elif kind == "council":
+        # Completion and brief identity both stay deliberately unfiltered by
+        # supersedes. The kill criterion stops counting a retired row, which makes the
+        # reader the looser of the two; leaving the appender strict keeps it stricter
+        # than or equal to the reader in every field, which is the only safe direction.
+        # Retiring a duplicate must never make room for a second completion of the same
+        # run, and a brief path carries its own runId, so no legitimate append is
+        # blocked by a row that has been retired.
         validate_completion(row, prior_rows)
         validate_blind_brief_identity(row, prior_rows)
         existing_prediction_ids = {
@@ -705,6 +883,13 @@ def validate_ledger_row(row: dict[str, Any], prior_rows: Iterable[dict[str, Any]
                 raise LedgerError(
                     f"duplicate predictionId: {prediction['predictionId']}"
                 )
+    elif kind == SUPERSEDE_KIND:
+        if prior_identity is None:
+            raise LedgerError(
+                "superseding a ledger row requires the raw line identity of the "
+                "store it names"
+            )
+        validate_supersede(row, prior_identity)
     else:
         raise LedgerError(f"record command does not accept kind: {kind}")
 
@@ -718,10 +903,9 @@ def append_ledger_row(
     path = Path(path)
     with evidence_write_lock(coordination_lock):
         with ledger_write_transaction(path) as transaction:
-            prior = [
-                row_value for _, row_value in load_transaction_jsonl(transaction)
-            ]
-            validate_ledger_row(row, prior)
+            prior_identity = load_transaction_jsonl_with_raw_identity(transaction)
+            prior = [row_value for _, row_value, _raw in prior_identity]
+            validate_ledger_row(row, prior, prior_identity=prior_identity)
             _append_jsonl_line(transaction, row)
 
 

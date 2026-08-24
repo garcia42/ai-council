@@ -12,6 +12,17 @@ from unittest import mock
 import install
 
 
+# The kill criterion's body is not carried in this repository, so an install fixture
+# cannot be a copy of it without drifting from it. Building the fixture out of the
+# transform's own preimages keeps the two in step by construction; that the deployed
+# file still matches those preimages is asserted separately, and again by rehearse.py
+# against a copy of the real runtime.
+CRITERION_FIXTURE = (
+    'NON_COUNCIL_RECORD_KINDS = {"pre-mortem-calibration", "council-calibration"}\n'
+    + "".join(preimage for preimage, _image in install._SUPERSEDE_READER_REWRITES)
+)
+
+
 class InstallerTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -25,8 +36,7 @@ class InstallerTest(unittest.TestCase):
             "# Council\n\n## Steps\n\nOld steps\n", encoding="utf-8"
         )
         (self.root / ".claude/knowledge/council-eval/blind_seat_kill_criterion.py").write_text(
-            'NON_COUNCIL_RECORD_KINDS = {"pre-mortem-calibration", "council-calibration"}\n',
-            encoding="utf-8",
+            CRITERION_FIXTURE, encoding="utf-8"
         )
         (self.root / "CLAUDE.md").write_text(
             "# Rules\n\n## SLO/SLI changes require a full council review\n",
@@ -146,13 +156,44 @@ class InstallerTest(unittest.TestCase):
             "council-attempt-v2",
             "council-seats-finished",
             "capture-invalidation",
+            "council-superseded",
         ):
             self.assertIn(f'"{kind}"', criterion)
+        self.assertIn(install.SUPERSEDE_READER_MARKER, criterion)
         reporter = (
             self.root / ".claude/knowledge/council-eval/predictions_report.py"
         ).read_text(encoding="utf-8")
         self.assertNotIn("@@COUNCIL_TOOLS_", reporter)
         self.assertIn(install._repository_identity(install.REPO, require_clean=False)[0], reporter)
+
+    def test_superseded_reader_transform_is_idempotent(self):
+        once = install._with_superseded_reader(CRITERION_FIXTURE)
+        twice = install._with_superseded_reader(once)
+
+        self.assertNotEqual(once, CRITERION_FIXTURE)
+        self.assertEqual(once, twice)
+        self.assertIn(install.SUPERSEDE_READER_MARKER, once)
+
+    def test_superseded_reader_transform_fails_closed_on_a_drifted_criterion(self):
+        drifted = CRITERION_FIXTURE.replace("def tally(rows):", "def tally(records):")
+
+        with self.assertRaisesRegex(install.InstallError, "preimage is not unique"):
+            install._with_superseded_reader(drifted)
+
+    def test_superseded_reader_transform_still_matches_the_deployed_criterion(self):
+        deployed = Path(
+            "/home/trader/.claude/knowledge/council-eval/blind_seat_kill_criterion.py"
+        )
+        if not deployed.is_file():
+            self.skipTest("deployed blind-seat kill criterion is not present")
+        text = deployed.read_text(encoding="utf-8")
+        if install.SUPERSEDE_READER_MARKER in text:
+            self.skipTest("deployed kill criterion already carries the reader change")
+
+        rendered = install._with_superseded_reader(install._with_attempt_allowlist(text))
+
+        compile(rendered, str(deployed), "exec")
+        self.assertIn('"council-superseded"', rendered)
 
     def test_retained_report_create_failure_reports_committed_custody(self):
         self._assert_committed_runtime_report_failure("create")

@@ -159,11 +159,15 @@ class RuntimeContractTest(unittest.TestCase):
         ):
             self.assertIn(required, text)
 
-    def test_blind_tally_allows_non_completion_capture_records(self):
+    def _installed_criterion(self):
         path = RUNTIME_ROOT / "knowledge/council-eval/blind_seat_kill_criterion.py"
         spec = importlib.util.spec_from_file_location("blind_criterion_runtime", path)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
+        return module
+
+    def test_blind_tally_allows_non_completion_capture_records(self):
+        module = self._installed_criterion()
         kinds = ["council-attempt"]
         if os.environ.get("COUNCIL_RUNTIME_ROOT"):
             kinds.extend(
@@ -173,6 +177,7 @@ class RuntimeContractTest(unittest.TestCase):
                     "council-attempt-v2",
                     "council-seats-finished",
                     "capture-invalidation",
+                    "council-superseded",
                 )
             )
         result = module.tally(
@@ -181,6 +186,78 @@ class RuntimeContractTest(unittest.TestCase):
         )
         self.assertEqual(result["legacyBlindRows"], 0)
         self.assertEqual(result["nonCouncilRecords"], len(kinds))
+
+    def test_installed_tally_retires_only_a_verified_superseded_row(self):
+        if not os.environ.get("COUNCIL_RUNTIME_ROOT"):
+            self.skipTest("installed reader is only asserted against a staged runtime")
+        module = self._installed_criterion()
+        seat = {
+            "role": "generic",
+            "required": True,
+            "ran": True,
+            "changedDecision": True,
+            "agreedWithPanel": True,
+            "blockedReason": None,
+        }
+        original = {
+            "kind": "council",
+            "runId": "run-original",
+            "blindSeat": {**seat, "brief": "/tmp/brief-original.md"},
+            "forecastState": {"sealed": True, "seats": {"code": "submitted"}},
+            "predictions": [{"seat": "code", "probability": 60}],
+        }
+        duplicate = {
+            "kind": "council",
+            "runId": "run-original",
+            "blindSeat": {**seat, "brief": "/tmp/brief-original.md"},
+        }
+        record = {
+            "schemaVersion": 1,
+            "kind": "council-superseded",
+            "ts": "2026-08-24T00:00:00Z",
+            "supersedes": {"line": 2, "rawLineSha256": "b" * 64},
+            "reason": "hand-appended duplicate",
+            "approval": {
+                "operator": "operator",
+                "approvedAt": "2026-08-24T00:00:00Z",
+                "reference": "https://github.com/garcia42/ai-council/issues/25",
+            },
+        }
+        rows = [
+            (1, original, "a" * 64),
+            (2, duplicate, "b" * 64),
+            (3, record, "c" * 64),
+        ]
+
+        retired = module.tally(rows)
+
+        self.assertEqual(retired["errors"], [])
+        self.assertEqual(retired["supersededRows"], 1)
+        self.assertEqual(retired["completedRuns"], 1)
+        self.assertEqual(retired["changedDecisionRuns"], 1)
+
+        drifted = module.tally(
+            [(1, original, "a" * 64), (2, duplicate, "z" * 64), (3, record, "c" * 64)]
+        )
+
+        self.assertEqual(drifted["supersededRows"], 0)
+        self.assertEqual(drifted["completedRuns"], 2)
+        self.assertTrue(
+            any("does not match line" in error for error in drifted["errors"]),
+            drifted["errors"],
+        )
+
+        forged = dict(record, supersedes={"line": 1, "rawLineSha256": "a" * 64})
+        protected = module.tally(
+            [(1, original, "a" * 64), (2, duplicate, "b" * 64), (3, forged, "c" * 64)]
+        )
+
+        self.assertEqual(protected["supersededRows"], 0)
+        self.assertEqual(protected["completedRuns"], 2)
+        self.assertTrue(
+            any("forecastState" in error for error in protected["errors"]),
+            protected["errors"],
+        )
 
     def test_compatibility_wrapper_preserves_explicit_environment_ledgers(self):
         reporter = RUNTIME_ROOT / "knowledge/council-eval/predictions_report.py"

@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import subprocess
@@ -8,6 +9,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
+
+import install
 
 from council_tools import capture_runtime, cli
 from council_tools import safe_files
@@ -818,6 +821,130 @@ class ForecastCliTest(unittest.TestCase):
         with mock.patch.object(cli, "_require_ledger_write_authority") as authority:
             self.assertEqual(cli.command_complete(args), 0)
         authority.assert_not_called()
+
+    def test_supersede_and_the_installed_reader_agree_on_a_retired_row(self):
+        """Append a supersede through the CLI, then read it with the shipped reader.
+
+        The reader is the deployed kill criterion with the install transform applied,
+        which is the copy this change ships.  Testing against the pre-activation file
+        on disk would only prove the old reader ignores the record; the seam that can
+        strand a line is the appender against the reader it ships with.
+        """
+
+        criterion = self.installed_kill_criterion()
+        seeded = make_attempt(
+            question="Does a superseded duplicate leave the denominator alone?",
+            expected_seats=["code"],
+            claim="The kill criterion stops counting a retired duplicate",
+            resolution_date="2026-09-30",
+            resolved_by="Run the blind-seat kill criterion",
+            decision_link="Supersede appender and reader seam",
+            materiality="A double-counted council inflates the kill-criterion denominator",
+            action_if_true="Keep the supersede record",
+            action_if_false="Stop and repair the reader seam",
+            evidence_cutoff_at="2026-07-01T00:00:00Z",
+            ts="2026-07-01T00:00:00Z",
+        )
+        append_ledger_row(self.log, seeded)
+        original = completion(seeded)
+        original["blindSeat"]["ran"] = True
+        original["blindSeat"]["role"] = "allocator"
+        original["blindSeat"]["required"] = True
+        original["blindSeat"]["changedDecision"] = True
+        original["blindSeat"]["blockedReason"] = None
+        original["blindSeat"].pop("notRequiredReason", None)
+        append_ledger_row(self.log, original)
+        duplicate = {
+            "kind": "council",
+            "runId": seeded["runId"],
+            "ts": "2026-07-01T00:10:17Z",
+            "question": seeded["question"],
+            "verdicts": {"code": "APPROVE"},
+            "blindSeat": dict(original["blindSeat"]),
+        }
+        with self.log.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(duplicate, sort_keys=True, separators=(",", ":")) + "\n")
+        raw_lines = self.log.read_bytes().splitlines(keepends=True)
+        duplicate_line = len(raw_lines)
+        digest = hashlib.sha256(raw_lines[-1]).hexdigest()
+
+        before = self.read_criterion(criterion)
+        self.assertEqual(before["completedRuns"], 2)
+        self.assertEqual(before["changedDecisionRuns"], 2)
+        self.assertEqual(len(before["errors"]), 1)
+
+        refused = self.run_cli(
+            "supersede",
+            "--log",
+            str(self.log),
+            "--line",
+            str(duplicate_line - 1),
+            "--confirm-raw-line-sha256",
+            hashlib.sha256(raw_lines[-2]).hexdigest(),
+            "--reason",
+            "Superseding the original is the dangerous direction",
+            "--operator",
+            "operator",
+            "--reference",
+            "https://github.com/garcia42/ai-council/issues/25",
+            "--check-only",
+        )
+        self.assertNotEqual(refused.returncode, 0, refused.stdout)
+        self.assertIn("forecastState", refused.stderr)
+
+        recorded = self.run_cli(
+            "supersede",
+            "--log",
+            str(self.log),
+            "--line",
+            str(duplicate_line),
+            "--confirm-raw-line-sha256",
+            digest,
+            "--reason",
+            "Hand-appended duplicate of the preceding council row",
+            "--operator",
+            "operator",
+            "--reference",
+            "https://github.com/garcia42/ai-council/issues/25",
+        )
+        self.assertEqual(recorded.returncode, 0, recorded.stderr)
+
+        after = self.read_criterion(criterion)
+        self.assertEqual(after["errors"], [])
+        self.assertEqual(after["supersededRows"], 1)
+        self.assertEqual(after["completedRuns"], 1)
+        self.assertEqual(after["changedDecisionRuns"], 1)
+        self.assertEqual(after["nonCouncilRecords"], before["nonCouncilRecords"] + 1)
+        self.assertEqual(after["legacyBlindRows"], before["legacyBlindRows"])
+
+    def installed_kill_criterion(self):
+        """Render the deployed kill criterion the way ``install.py`` would render it."""
+
+        deployed = Path(
+            "/home/trader/.claude/knowledge/council-eval/blind_seat_kill_criterion.py"
+        )
+        if not deployed.is_file():
+            self.skipTest("deployed blind-seat kill criterion is not present")
+        rendered = self.root / "blind_seat_kill_criterion.py"
+        rendered.write_text(
+            install._with_superseded_reader(
+                install._with_attempt_allowlist(
+                    deployed.read_text(encoding="utf-8")
+                )
+            ),
+            encoding="utf-8",
+        )
+        return rendered
+
+    def read_criterion(self, criterion):
+        result = subprocess.run(
+            [sys.executable, str(criterion), "--log", str(self.log), "--json"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertIn(result.returncode, (0, 1), result.stderr)
+        return json.loads(result.stdout)
 
     def test_live_write_authority_ignores_caller_environment_override(self):
         with (

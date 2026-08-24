@@ -16,6 +16,13 @@ process contract stops any further council until the state is valid again.
 The rows themselves are well-formed JSON. `repair-tail` does **not** apply: its
 contract covers exactly one malformed final line, and neither of these rows is torn.
 
+**First check which problem you have.** The same error is raised when one council was
+simply written down twice — a hand-appended duplicate with no `forecastState` and no
+predictions. That is a different root cause with a different cure; see
+[duplicate-council-row-supersede.md](duplicate-council-row-supersede.md). This playbook is
+for two genuinely distinct councils that collided on one brief path, which you can tell
+because both rows carry sealed forecasts.
+
 ## Root cause
 
 The blind brief was written to a path derived from the date and the topic, e.g.

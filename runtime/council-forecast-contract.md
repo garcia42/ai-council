@@ -174,6 +174,37 @@ re-entered with `--resume`, which refuses to start a new recovery and verifies e
 finds against the same spec. Reconstructing the replacement brief is evidence work, not a command:
 identify the bytes that seat actually read before planning anything.
 
+### Retiring a duplicate council row
+
+`complete` writes the panel-log row itself. A row appended by hand on top of it is a duplicate
+that the reader counts as a second completed council, inflating the denominator the blind seat's
+retire/keep decision rests on. The row is not wrong in a field, so nothing that edits a field can
+cure it, and an append-only ledger must not grow a delete.
+
+Say it by appending. On the ledger authority host, with explicit principal approval, name the exact
+row by both its line number and the SHA-256 of its complete physical line:
+
+```
+sed -n '<line>p' <ledger> | sha256sum
+
+python3 /home/trader/.claude/knowledge/council-eval/predictions_report.py \
+  supersede --log <ledger> --line <line> \
+  --confirm-raw-line-sha256 <digest of that exact line> \
+  --reason <why this row should not exist> \
+  --operator <name> --reference <where approval was given> --check-only
+```
+
+Drop `--check-only` to append. The appender refuses a digest that does not match the named line, a
+line that is not a `council` row, a line already superseded, and — the guard that matters — any row
+carrying `predictions` or a `forecastState`. That row holds the sealed forecasts the criterion is
+scored on; retiring it would be erasing a council, not correcting one, and no approval changes that.
+
+The kill criterion re-checks every one of those guards when it reads the record, and a supersede it
+cannot verify is an error that retires nothing. It therefore only works against a reader that has
+the change: activate the runtime first, then append. Never point a supersede at a row a seat
+actually answered, and never repair a duplicate by rewriting its brief — that would assert the seat
+read a brief it never read.
+
 ### V2 usefulness capture activation gate
 
 V2 is additive and capture-only. It records durable initiation before work begins, exact input
