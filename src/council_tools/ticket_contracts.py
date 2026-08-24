@@ -5,8 +5,10 @@ reference names these exact contract fields.  It is not authorization and does
 not prove that a council or human actually approved the ticket.  Later adapters
 must verify that trust decision against their own protected evidence source.
 
-This module validates already-parsed JSON-like mappings.  A later loader is
-responsible for rejecting duplicate keys in JSON text before calling it.
+Use :func:`load_ticket_envelope_json` at JSON-text boundaries.  It rejects
+duplicate keys and non-strict encodings before calling the mapping validator.
+Call :func:`validate_ticket_envelope` directly only for already-parsed trusted
+objects whose parser applied equivalent duplicate-key controls.
 """
 
 from __future__ import annotations
@@ -22,6 +24,7 @@ from typing import Any, Mapping
 SCHEMA_VERSION = 1
 MAX_ISSUE_NUMBER = 2**63 - 1
 MAX_CONTRACT_BYTES = 65_536
+MAX_TICKET_JSON_BYTES = 2 * MAX_CONTRACT_BYTES
 MAX_LIST_ITEMS = 64
 MAX_PATH_LENGTH = 1_024
 MAX_REPOSITORY_LENGTH = 256
@@ -194,6 +197,19 @@ def contract_sha256(contract: Mapping[str, Any]) -> str:
     """Return the lowercase SHA-256 digest of canonical raw contract bytes."""
 
     return hashlib.sha256(canonical_contract_bytes(contract)).hexdigest()
+
+
+def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise TicketContractError("duplicate-json-key", "$")
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(_name: str) -> None:
+    raise TicketContractError("non-finite-json-number", "$")
 
 
 def _mapping_with_exact_keys(
@@ -510,6 +526,53 @@ def validate_ticket_envelope(value: Mapping[str, Any]) -> TicketEnvelope:
     )
 
 
+def load_ticket_envelope_json(document: Any) -> TicketEnvelope:
+    """Strictly decode and validate one v1 ticket-envelope JSON document.
+
+    Bytes are decoded as plain strict UTF-8 before JSON parsing, so Python's
+    more permissive bytes autodetection cannot admit BOM-stripped UTF-16/32 or
+    surrogate-pass input.  Loader failures use fixed non-reflective codes at
+    ``$``; field-specific contract errors pass through unchanged.
+    """
+
+    if type(document) is str:
+        if len(document) > MAX_TICKET_JSON_BYTES:
+            raise TicketContractError("ticket-json-too-large", "$")
+        try:
+            encoded_length = len(document.encode("utf-8"))
+        except UnicodeEncodeError:
+            raise TicketContractError("invalid-json-encoding", "$") from None
+        if encoded_length > MAX_TICKET_JSON_BYTES:
+            raise TicketContractError("ticket-json-too-large", "$")
+        text = document
+    elif type(document) is bytes or type(document) is bytearray:
+        if len(document) > MAX_TICKET_JSON_BYTES:
+            raise TicketContractError("ticket-json-too-large", "$")
+        try:
+            text = bytes(document).decode("utf-8")
+        except UnicodeDecodeError:
+            raise TicketContractError("invalid-json-encoding", "$") from None
+    else:
+        raise TicketContractError("invalid-json-type", "$")
+
+    try:
+        parsed = json.loads(
+            text,
+            object_pairs_hook=_reject_duplicate_json_keys,
+            parse_constant=_reject_json_constant,
+        )
+    except TicketContractError:
+        raise
+    except RecursionError:
+        raise TicketContractError("ticket-json-too-deep", "$") from None
+    except ValueError:
+        raise TicketContractError("invalid-json", "$") from None
+
+    if type(parsed) is not dict:
+        raise TicketContractError("invalid-json-top-level", "$")
+    return validate_ticket_envelope(parsed)
+
+
 __all__ = [
     "AllowedPath",
     "MAX_CONTRACT_BYTES",
@@ -519,6 +582,7 @@ __all__ = [
     "MAX_REPOSITORY_LENGTH",
     "MAX_RUN_ID_LENGTH",
     "MAX_TARGET_BRANCH_LENGTH",
+    "MAX_TICKET_JSON_BYTES",
     "MAX_TEST_COMMAND_LENGTH",
     "MAX_TEXT_LENGTH",
     "TicketContract",
@@ -527,5 +591,6 @@ __all__ = [
     "TicketReviewRef",
     "canonical_contract_bytes",
     "contract_sha256",
+    "load_ticket_envelope_json",
     "validate_ticket_envelope",
 ]

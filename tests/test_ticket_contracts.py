@@ -8,9 +8,11 @@ from enum import IntEnum
 import council_tools.ticket_contracts as ticket_contracts
 from council_tools.ticket_contracts import (
     AllowedPath,
+    MAX_TICKET_JSON_BYTES,
     TicketContractError,
     canonical_contract_bytes,
     contract_sha256,
+    load_ticket_envelope_json,
     validate_ticket_envelope,
 )
 
@@ -70,6 +72,18 @@ class IntegerEnum(IntEnum):
     TWO = 2
 
 
+class TextSubclass(str):
+    pass
+
+
+class BytesSubclass(bytes):
+    pass
+
+
+class BytearraySubclass(bytearray):
+    pass
+
+
 class TicketContractTest(unittest.TestCase):
     def assertContractError(self, payload, code, field):
         with self.assertRaises(TicketContractError) as caught:
@@ -79,6 +93,13 @@ class TicketContractTest(unittest.TestCase):
         self.assertEqual(
             str(caught.exception), f"ticket contract {code} at {field}"
         )
+
+    def assertJsonError(self, document, code):
+        with self.assertRaises(TicketContractError) as caught:
+            load_ticket_envelope_json(document)
+        self.assertEqual(caught.exception.code, code)
+        self.assertEqual(caught.exception.field, "$")
+        self.assertEqual(str(caught.exception), f"ticket contract {code} at $")
 
     def test_golden_non_ascii_contract_pins_canonical_bytes_and_digest(self):
         contract = golden_contract()
@@ -541,6 +562,179 @@ class TicketContractTest(unittest.TestCase):
                 self.assertEqual(caught.exception.code, "non-canonical-json")
                 self.assertEqual(caught.exception.field, "contract")
 
+    def test_strict_json_loader_accepts_golden_text_bytes_and_bytearray(self):
+        payload = envelope()
+        compact = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        pretty = json.dumps(payload, ensure_ascii=False, indent=2)
+        expected = validate_ticket_envelope(payload)
+
+        for document in (
+            compact,
+            compact.encode("utf-8"),
+            bytearray(compact, "utf-8"),
+            pretty,
+        ):
+            with self.subTest(document_type=type(document).__name__):
+                self.assertEqual(load_ticket_envelope_json(document), expected)
+
+        expanded = None
+        for indent in range(128, 2_049, 128):
+            candidate = json.dumps(payload, ensure_ascii=False, indent=indent)
+            size = len(candidate.encode("utf-8"))
+            if ticket_contracts.MAX_CONTRACT_BYTES < size <= MAX_TICKET_JSON_BYTES:
+                expanded = candidate
+                break
+        self.assertIsNotNone(expanded)
+        self.assertEqual(load_ticket_envelope_json(expanded), expected)
+
+    def test_strict_json_loader_calls_the_v1_validator_once_without_bypass(self):
+        payload = envelope()
+        document = json.dumps(payload, ensure_ascii=False)
+        sentinel = object()
+        original = ticket_contracts.validate_ticket_envelope
+        calls = []
+
+        def spy(candidate):
+            calls.append(candidate)
+            return sentinel
+
+        ticket_contracts.validate_ticket_envelope = spy
+        try:
+            self.assertIs(load_ticket_envelope_json(document), sentinel)
+        finally:
+            ticket_contracts.validate_ticket_envelope = original
+
+        self.assertEqual(len(calls), 1)
+        self.assertIs(type(calls[0]), dict)
+
+    def test_strict_json_loader_rejects_non_exact_input_types(self):
+        for document in (
+            None,
+            1,
+            {},
+            memoryview(b"{}"),
+            TextSubclass("{}"),
+            BytesSubclass(b"{}"),
+            BytearraySubclass(b"{}"),
+        ):
+            with self.subTest(document_type=type(document).__name__):
+                self.assertJsonError(document, "invalid-json-type")
+
+    def test_strict_json_loader_enforces_plain_strict_utf8(self):
+        for document in (
+            b"\xed\xa0\x80",
+            b"\xc0\x80",
+            "{}".encode("utf-16"),
+            "\ud800",
+        ):
+            with self.subTest(document=repr(document)):
+                self.assertJsonError(document, "invalid-json-encoding")
+
+        valid = json.dumps(envelope(), ensure_ascii=False)
+        for document in ("\ufeff" + valid, b"\xef\xbb\xbf" + valid.encode("utf-8")):
+            with self.subTest(document_type=type(document).__name__):
+                self.assertJsonError(document, "invalid-json")
+
+    def test_strict_json_loader_rejects_duplicate_keys_at_every_depth(self):
+        payload = envelope()
+        contract_text = json.dumps(
+            payload["contract"], ensure_ascii=False, separators=(",", ":")
+        )
+        review_text = json.dumps(
+            payload["reviewRef"], ensure_ascii=False, separators=(",", ":")
+        )
+        path_text = json.dumps(
+            payload["contract"]["allowedPaths"][0],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+        duplicate_contract = '{"issueNumber":99,' + contract_text[1:]
+        duplicate_review = '{"runId":"first",' + review_text[1:]
+        escaped_duplicate_path = path_text.replace(
+            '"path":', '"\\u006bind":"directory","path":', 1
+        )
+        duplicate_path_contract = contract_text.replace(
+            path_text, escaped_duplicate_path, 1
+        )
+        cases = (
+            (
+                '{"contract":'
+                + contract_text
+                + ',"contract":'
+                + contract_text
+                + ',"reviewRef":'
+                + review_text
+                + "}"
+            ),
+            (
+                '{"contract":'
+                + duplicate_contract
+                + ',"reviewRef":'
+                + review_text
+                + "}"
+            ),
+            (
+                '{"contract":'
+                + contract_text
+                + ',"reviewRef":'
+                + duplicate_review
+                + "}"
+            ),
+            (
+                '{"contract":'
+                + duplicate_path_contract
+                + ',"reviewRef":'
+                + review_text
+                + "}"
+            ),
+            '[{"nested":{"a":1,"a":2}}]',
+        )
+
+        for document in cases:
+            with self.subTest(document=document[:80]):
+                self.assertJsonError(document, "duplicate-json-key")
+
+    def test_strict_json_loader_rejects_constants_and_malformed_json(self):
+        compact = json.dumps(envelope(), ensure_ascii=False, separators=(",", ":"))
+        for constant in ("NaN", "Infinity", "-Infinity"):
+            for document in (
+                constant,
+                compact.replace('"issueNumber":2', f'"issueNumber":{constant}', 1),
+            ):
+                with self.subTest(constant=constant, root=document == constant):
+                    self.assertJsonError(document, "non-finite-json-number")
+
+        overflow = compact.replace('"issueNumber":2', '"issueNumber":1e1000', 1)
+        with self.assertRaises(TicketContractError) as caught:
+            load_ticket_envelope_json(overflow)
+        self.assertEqual(caught.exception.code, "invalid-issue-number")
+        self.assertEqual(caught.exception.field, "contract.issueNumber")
+
+        for document in ("", " ", "{", '{"a":1} {"b":2}', "{'a':1}"):
+            with self.subTest(document=repr(document)):
+                self.assertJsonError(document, "invalid-json")
+
+    def test_strict_json_loader_rejects_non_object_roots_after_parse_hooks(self):
+        for document in ("[]", "1", "true", "null", '"text"'):
+            with self.subTest(document=document):
+                self.assertJsonError(document, "invalid-json-top-level")
+
+        self.assertJsonError('[{"a":1,"a":2}]', "duplicate-json-key")
+
+    def test_strict_json_loader_bounds_bytes_and_recursion(self):
+        self.assertJsonError(
+            "x" * (MAX_TICKET_JSON_BYTES + 1), "ticket-json-too-large"
+        )
+        multibyte = "é" * (MAX_TICKET_JSON_BYTES // 2 + 1)
+        self.assertLess(len(multibyte), MAX_TICKET_JSON_BYTES)
+        self.assertJsonError(multibyte, "ticket-json-too-large")
+
+        nested = "[" * 1_100 + "0" + "]" * 1_100
+        self.assertJsonError(nested, "ticket-json-too-deep")
+
+        self.assertJsonError("9" * 5_000, "invalid-json")
+
     def test_validator_module_has_no_external_io_dependencies(self):
         for forbidden in (
             "os",
@@ -552,6 +746,8 @@ class TicketContractTest(unittest.TestCase):
             "requests",
         ):
             self.assertFalse(hasattr(ticket_contracts, forbidden), forbidden)
+        self.assertIn("load_ticket_envelope_json", ticket_contracts.__all__)
+        self.assertIn("MAX_TICKET_JSON_BYTES", ticket_contracts.__all__)
 
 
 if __name__ == "__main__":
