@@ -7,6 +7,9 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from unittest import mock
+
+from council_tools import council_coverage
 from council_tools.council_coverage import (
     COVERED,
     EXEMPT,
@@ -80,6 +83,10 @@ class CoverageTestBase(unittest.TestCase):
         self.repo_path.mkdir()
         self.repo = Repository(self.repo_path)
         self.log = self.root / "council.jsonl"
+        # The instrumentation epoch must be attributable to THIS repository, so
+        # the anchor row has to name an object that resolves here. The anchor
+        # commit sits before the default window so it never perturbs counts.
+        self.anchor_sha = self.repo.commit("instrumentation anchor", at=stamp(-60))
 
     def tearDown(self):
         self.temp.cleanup()
@@ -97,13 +104,14 @@ class CoverageTestBase(unittest.TestCase):
         """Write a ledger, by default opening it with an instrumentation anchor.
 
         Most fixtures are about classification, not about the instrumentation
-        gate, so they need one conforming row at or before the window start.
-        Tests that exercise the gate itself pass ``anchor=False``.
+        gate, so they need one convention row, naming a resolvable object, at or
+        before the window start. Tests that exercise the gate pass
+        ``anchor=False``.
         """
 
         entries = list(rows)
         if anchor:
-            entries.insert(0, self.council_row(stamp(0), []))
+            entries.insert(0, self.council_row(stamp(-30), [self.anchor_sha]))
         with self.log.open("w", encoding="utf-8") as handle:
             for row in entries:
                 if isinstance(row, str):
@@ -153,8 +161,10 @@ class ClassificationTest(CoverageTestBase):
         self.assertEqual(result["counts"]["exempt"], 1)
         self.assertEqual(result["counts"]["eligible"], 0)
         self.assertIsNone(result["rate"])
-        self.assertEqual(result["rateNote"], "no eligible commits in window")
-        self.assertEqual(coverage_exit_code(result), 0)
+        self.assertIn("author-exempted", result["rateNote"])
+        # Every commit exempted by its own author is not a clean window; it is a
+        # window with no eligible population, which is cannot-determine.
+        self.assertEqual(coverage_exit_code(result), 3)
 
     def test_exempt_trailer_without_a_reason_fails_closed(self):
         sha = self.repo.commit("fix typo\n\nCouncil-Exempt:   ", at=stamp(10))
@@ -235,7 +245,9 @@ class AmbiguityTest(CoverageTestBase):
         self.write_ledger(self.council_row(stamp(20), ["a" * 40]))
         result = self.run_coverage()
         self.assertEqual(self.states(result), {sha: UNCOVERED})
-        self.assertEqual(result["ledger"]["reviewedShas"], 1)
+        # The tripwire for a window measured against the wrong repository.
+        self.assertEqual(result["ledger"]["reviewedNamesSeen"], 2)
+        self.assertEqual(result["ledger"]["reviewedNamesResolvedInRepo"], 1)
 
     def test_an_ambiguous_row_without_a_readable_timestamp_stays_ambiguous(self):
         base = self.repo.commit("base", at=stamp(5))
@@ -248,13 +260,17 @@ class AmbiguityTest(CoverageTestBase):
 
 
 class LedgerShapeTest(CoverageTestBase):
-    def test_an_empty_array_establishes_instrumentation_but_covers_nothing(self):
-        sha = self.repo.commit("shipped", at=stamp(10))
+    def test_an_empty_array_is_convention_but_attributes_to_no_repository(self):
+        self.repo.commit("shipped", at=stamp(10))
         self.write_ledger(self.council_row(stamp(1), []), anchor=False)
         result = self.run_coverage(since=stamp(1))
-        self.assertTrue(result["determined"], result)
-        self.assertEqual(result["instrumentation"]["epoch"], text(stamp(1)))
-        self.assertEqual(self.states(result), {sha: UNCOVERED})
+        # An empty array proves the writer used the convention, but it names no
+        # object, so it cannot prove the convention was in force for THIS repo.
+        self.assertFalse(result["determined"], result)
+        self.assertEqual(
+            result["refusals"][0]["code"], "no-repo-attributable-instrumentation"
+        )
+        self.assertEqual(result["ledger"]["conventionCouncilRows"], 1)
 
     def test_an_attempt_row_never_counts_as_a_review(self):
         sha = self.repo.commit("shipped", at=stamp(10))
@@ -269,16 +285,20 @@ class LedgerShapeTest(CoverageTestBase):
         )
         result = self.run_coverage()
         self.assertEqual(self.states(result), {sha: UNCOVERED})
-        self.assertEqual(result["ledger"]["conformingCouncilRows"], 1)
+        self.assertEqual(result["ledger"]["conventionCouncilRows"], 1)
         self.assertEqual(result["ledger"]["ambiguousCommitRows"], 1)
 
-    def test_an_abbreviated_sha_in_an_array_is_not_the_convention(self):
+    def test_an_abbreviated_array_covers_but_does_not_set_the_convention(self):
         sha = self.repo.commit("shipped", at=stamp(10))
         self.write_ledger(self.council_row(stamp(20), [sha[:7]]))
         result = self.run_coverage()
-        self.assertEqual(result["ledger"]["conformingCouncilRows"], 1)
-        self.assertEqual(result["ledger"]["ambiguousCommitRows"], 1)
-        self.assertEqual(result["ledger"]["reviewedShas"], 0)
+        # An array is a statement of what was read, so it covers even when it
+        # is spelled short -- it is simply not evidence the convention was in
+        # force, and it is never reinterpreted as an ancestry base.
+        self.assertEqual(self.states(result), {sha: COVERED})
+        self.assertEqual(result["ledger"]["conventionCouncilRows"], 1)
+        self.assertEqual(result["ledger"]["councilRowsNamingCommits"], 2)
+        self.assertEqual(result["ledger"]["ambiguousCommitRows"], 0)
 
     def test_evidence_reader_counts_rows_without_a_commits_field(self):
         self.write_ledger(
@@ -288,8 +308,9 @@ class LedgerShapeTest(CoverageTestBase):
         )
         evidence = read_ledger_evidence(self.log)
         self.assertEqual(evidence.rows_read, 2)
-        self.assertEqual(evidence.conforming_rows, 1)
+        self.assertEqual(len(evidence.convention_rows), 1)
         self.assertEqual(evidence.ambiguous_rows, 0)
+        self.assertEqual(evidence.council_rows_without_commits, 1)
 
 
 class RefusalTest(CoverageTestBase):
@@ -325,14 +346,20 @@ class RefusalTest(CoverageTestBase):
 
     def test_a_window_before_the_convention_is_unrecoverable(self):
         self.repo.commit("shipped", at=stamp(10))
-        self.write_ledger(self.council_row(stamp(5), []), anchor=False)
+        self.write_ledger(
+            self.council_row(stamp(5), [self.anchor_sha]), anchor=False
+        )
         result = self.run_coverage(since=stamp(0))
         self.assert_refused(result, "window-predates-commit-instrumentation")
         self.assertIn("unrecoverable", result["refusals"][0]["detail"])
+        # A refusal must tell the operator what to run instead.
+        self.assertIn(f"--since {text(stamp(5))}", result["refusals"][0]["detail"])
 
     def test_a_window_starting_exactly_at_the_epoch_is_allowed(self):
         self.repo.commit("shipped", at=stamp(10))
-        self.write_ledger(self.council_row(stamp(5), []), anchor=False)
+        self.write_ledger(
+            self.council_row(stamp(5), [self.anchor_sha]), anchor=False
+        )
         result = self.run_coverage(since=stamp(5))
         self.assertTrue(result["determined"], result)
 
@@ -357,9 +384,13 @@ class RefusalTest(CoverageTestBase):
             self.run_coverage(ref="refs/heads/does-not-exist"), "git-unavailable"
         )
 
-    def test_a_missing_ledger_has_no_instrumentation_rather_than_a_rate(self):
+    def test_a_missing_ledger_reads_as_a_path_problem_not_a_convention_gap(self):
         self.repo.commit("shipped", at=stamp(10))
-        self.assert_refused(self.run_coverage(), "no-commit-instrumentation")
+        result = self.run_coverage()
+        self.assert_refused(result, "ledger-unreadable")
+        # At 3am "unrecoverable from this ledger" would send the operator
+        # hunting for a convention gap instead of a typo.
+        self.assertIn("does not exist", result["refusals"][0]["detail"])
 
 
 class RateTest(CoverageTestBase):
@@ -441,6 +472,229 @@ class WindowTest(CoverageTestBase):
         self.write_ledger()
         with self.assertRaises(CoverageError):
             self.run_coverage(since=stamp(10), until=stamp(10))
+
+
+class CouncilFindingRegressionTest(CoverageTestBase):
+    """One test per defect the 2026-08-24 review council found.
+
+    A green suite did not catch any of these, so each is pinned by the exact
+    scenario a seat reproduced.
+    """
+
+    # --- fail-open: exemption scanned outside the trailer block -------------
+
+    def test_a_message_documenting_the_convention_does_not_exempt_itself(self):
+        sha = self.repo.commit(
+            "Rewrite the live order sizing path\n"
+            "\n"
+            "The exemption trailer is spelled:\n"
+            "\n"
+            "Council-Exempt: mechanical rename\n"
+            "\n"
+            "and an empty reason fails closed. This commit changes live\n"
+            "behaviour and nobody reviewed it.\n",
+            at=stamp(10),
+        )
+        self.write_ledger()
+        result = self.run_coverage()
+        self.assertEqual(self.states(result), {sha: UNCOVERED})
+        self.assertEqual(coverage_exit_code(result), 1)
+
+    def test_a_placeholder_reason_does_not_exempt(self):
+        sha = self.repo.commit("Do a thing\n\nCouncil-Exempt: <reason>", at=stamp(10))
+        self.write_ledger()
+        result = self.run_coverage()
+        self.assertEqual(self.states(result), {sha: UNCOVERED})
+
+    def test_an_indented_trailer_is_quoted_prose_not_an_exemption(self):
+        sha = self.repo.commit(
+            "Do a thing\n\n    Council-Exempt: mechanical", at=stamp(10)
+        )
+        self.write_ledger()
+        result = self.run_coverage()
+        self.assertEqual(self.states(result), {sha: UNCOVERED})
+
+    def test_a_real_trailer_in_the_final_block_still_exempts(self):
+        sha = self.repo.commit(
+            "Fix a typo in a comment\n"
+            "\n"
+            "No behaviour changes at all.\n"
+            "\n"
+            "Council-Exempt: comment-only edit\n",
+            at=stamp(10),
+        )
+        self.write_ledger()
+        result = self.run_coverage()
+        self.assertEqual(self.states(result), {sha: EXEMPT})
+
+    # --- fail-open: git log --since prunes traversal ------------------------
+
+    def test_a_backdated_tip_cannot_empty_the_denominator(self):
+        first = self.repo.commit("c1", at=stamp(10))
+        second = self.repo.commit("c2", at=stamp(20))
+        third = self.repo.commit("c3", at=stamp(30))
+        # `git log --since` marks this uninteresting and prunes its parents, so
+        # a pre-filtered walk returns nothing at all for the window below.
+        self.repo.commit("backdated tip", at=stamp(-600))
+        self.write_ledger()
+        result = self.run_coverage(since=stamp(5), until=stamp(40))
+        self.assertEqual(
+            sorted(self.states(result)), sorted([first, second, third])
+        )
+        self.assertEqual(result["counts"]["uncovered"], 3)
+        self.assertEqual(coverage_exit_code(result), 1)
+
+    # --- fail-open: measuring nothing reported as clean ---------------------
+
+    def test_an_empty_window_refuses_rather_than_reporting_clean(self):
+        self.repo.commit("outside the window", at=stamp(500))
+        self.write_ledger()
+        result = self.run_coverage(since=stamp(0), until=stamp(100))
+        self.assertFalse(result["determined"], result)
+        self.assertEqual(result["refusals"][0]["code"], "empty-window")
+        self.assertIn("measuring nothing", result["refusals"][0]["detail"])
+        self.assertEqual(coverage_exit_code(result), 3)
+
+    # --- fail-open: a swallowed git failure downgraded UNKNOWN to UNCOVERED --
+
+    def test_a_git_failure_refuses_instead_of_accusing(self):
+        base = self.repo.commit("base", at=stamp(5))
+        self.repo.commit("descendant", at=stamp(10))
+        self.write_ledger(self.council_row(stamp(20), {"base": base}))
+        real_git = council_coverage._git
+
+        def fail_rev_list(repo, *arguments, **kwargs):
+            if arguments and arguments[0] == "rev-list":
+                raise council_coverage.GitError("injected rev-list failure")
+            return real_git(repo, *arguments, **kwargs)
+
+        with mock.patch.object(council_coverage, "_git", side_effect=fail_rev_list):
+            result = self.run_coverage()
+        self.assertFalse(result["determined"], result)
+        self.assertEqual(result["refusals"][0]["code"], "git-unavailable")
+        self.assertEqual(coverage_exit_code(result), 3)
+
+    # --- refusal gaps -------------------------------------------------------
+
+    def test_a_shallow_clone_refuses(self):
+        for index in range(4):
+            self.repo.commit(f"c{index}", at=stamp(10 + index))
+        shallow_path = self.root / "shallow"
+        subprocess.run(
+            ["git", "clone", "-q", "--depth", "1", f"file://{self.repo_path}",
+             str(shallow_path)],
+            check=True, capture_output=True, text=True, env=self.repo.env,
+        )
+        self.write_ledger()
+        result = self.run_coverage(repo=shallow_path)
+        self.assertFalse(result["determined"], result)
+        self.assertEqual(result["refusals"][0]["code"], "shallow-repository")
+        self.assertEqual(coverage_exit_code(result), 3)
+
+    def test_a_convention_row_about_another_repository_does_not_open_the_gate(self):
+        self.repo.commit("shipped", at=stamp(10))
+        self.write_ledger(self.council_row(stamp(1), ["b" * 40]), anchor=False)
+        result = self.run_coverage(since=stamp(1))
+        self.assertFalse(result["determined"], result)
+        self.assertEqual(
+            result["refusals"][0]["code"], "no-repo-attributable-instrumentation"
+        )
+        self.assertIn("shared across repositories", result["refusals"][0]["detail"])
+
+    def test_a_naive_timestamp_on_a_convention_row_is_unreadable(self):
+        self.repo.commit("shipped", at=stamp(10))
+        self.write_ledger(
+            {
+                "kind": "council",
+                "ts": "2026-09-01T00:20:00",
+                "question": "q",
+                "commits": [self.anchor_sha],
+            },
+            anchor=False,
+        )
+        result = self.run_coverage()
+        self.assertFalse(result["determined"], result)
+        self.assertEqual(result["refusals"][0]["code"], "ledger-unreadable")
+        self.assertIn("timezone", result["refusals"][0]["detail"])
+
+    # --- identity: patch-id fallback ---------------------------------------
+
+    def test_a_cherry_picked_copy_of_a_reviewed_commit_is_covered(self):
+        base = self.repo.commit("base", at=stamp(5))
+        self.repo.git("checkout", "-q", "-b", "side", base)
+        (self.repo_path / "feature.txt").write_text("feature\n", encoding="utf-8")
+        self.repo.git("add", "feature.txt")
+        self.repo.git("commit", "-q", "-m", "add the feature", at=stamp(10))
+        reviewed = self.repo.git("rev-parse", "HEAD").strip()
+        self.repo.git("checkout", "-q", "main")
+        self.repo.git("cherry-pick", reviewed, at=stamp(20))
+        shipped = self.repo.git("rev-parse", "HEAD").strip()
+        self.assertNotEqual(reviewed, shipped)
+
+        self.write_ledger(self.council_row(stamp(15), [reviewed]))
+        result = self.run_coverage(ref="main")
+        self.assertEqual(self.states(result)[shipped], COVERED)
+        self.assertIn(
+            "patch-identical",
+            [c["reason"] for c in result["commits"] if c["sha"] == shipped][0],
+        )
+
+    def test_patch_identity_does_not_cover_different_content(self):
+        base = self.repo.commit("base", at=stamp(5))
+        self.repo.git("checkout", "-q", "-b", "side", base)
+        (self.repo_path / "feature.txt").write_text("one\n", encoding="utf-8")
+        self.repo.git("add", "feature.txt")
+        self.repo.git("commit", "-q", "-m", "add the feature", at=stamp(10))
+        reviewed = self.repo.git("rev-parse", "HEAD").strip()
+        self.repo.git("checkout", "-q", "main")
+        (self.repo_path / "feature.txt").write_text("something else\n", encoding="utf-8")
+        self.repo.git("add", "feature.txt")
+        self.repo.git("commit", "-q", "-m", "add the feature", at=stamp(20))
+        shipped = self.repo.git("rev-parse", "HEAD").strip()
+
+        self.write_ledger(self.council_row(stamp(15), [reviewed]))
+        result = self.run_coverage(ref="main")
+        self.assertEqual(self.states(result)[shipped], UNCOVERED)
+
+    # --- visibility ---------------------------------------------------------
+
+    def test_council_rows_that_cannot_name_anything_are_counted(self):
+        self.repo.commit("shipped", at=stamp(10))
+        self.write_ledger(
+            {"kind": "council", "ts": text(stamp(20)), "question": "reviewed a tree"}
+        )
+        result = self.run_coverage()
+        # 19 such rows exist in the live ledger; without this count their false
+        # UNCOVERED results look like findings.
+        self.assertEqual(result["ledger"]["councilRowsWithoutCommits"], 1)
+
+    def test_a_covered_commit_reports_when_its_row_was_written(self):
+        sha = self.repo.commit("shipped", at=stamp(10))
+        self.write_ledger(self.council_row(stamp(20), [sha]))
+        result = self.run_coverage()
+        entry = result["commits"][0]
+        self.assertEqual(entry["state"], COVERED)
+        self.assertEqual(entry["namedByRowAt"], text(stamp(20)))
+        # COVERED does not establish review-before-merge; this makes the lag
+        # visible rather than inventing a merge clock.
+        self.assertEqual(result["counts"]["coveredWithRowAfterCommit"], 1)
+
+    def test_uncovered_sorts_before_unknown_in_the_rendering(self):
+        base = self.repo.commit("base", at=stamp(5))
+        self.repo.commit("maybe reviewed", at=stamp(10))
+        self.repo.commit("definitely not", at=stamp(40))
+        self.write_ledger(self.council_row(stamp(20), {"base": base}))
+        rendered = format_coverage(self.run_coverage())
+        states = [
+            line.split()[0]
+            for line in rendered.splitlines()
+            if line.startswith(("UNCOVERED", "UNKNOWN"))
+        ]
+        self.assertEqual(states[: states.count("UNCOVERED")], ["UNCOVERED"] * 2)
+
+    def test_git_error_shares_the_package_value_error_base(self):
+        self.assertTrue(issubclass(council_coverage.GitError, CoverageError))
+        self.assertTrue(issubclass(council_coverage.GitError, ValueError))
 
 
 class TimestampTest(unittest.TestCase):

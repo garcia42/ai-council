@@ -1005,7 +1005,11 @@ def command_coverage(args: argparse.Namespace) -> int:
     if args.json:
         print(json.dumps(result, sort_keys=True))
     else:
-        print(format_coverage(result))
+        rendered = format_coverage(result)
+        # A refusal is an alarm, not a result. Sending it to stderr gives a cron
+        # wrapper something to route to a sink, instead of burying it in stdout
+        # with the ordinary report.
+        print(rendered, file=sys.stderr if not result["determined"] else sys.stdout)
     return coverage_exit_code(result)
 
 
@@ -1035,15 +1039,55 @@ def build_parser() -> argparse.ArgumentParser:
     coverage = sub.add_parser(
         "coverage",
         help="reconcile shipped commits against council rows over a window",
+        epilog=(
+            "Exit codes: 0 every eligible commit is covered; 1 something shipped "
+            "unreviewed; 3 cannot determine (refused, measured nothing, or "
+            "ambiguous). 2 is a usage error only, never a coverage verdict. "
+            "COVERED means a council row names the commit; it does not establish "
+            "that the review preceded the merge."
+        ),
     )
-    coverage.add_argument("--repo", required=True)
-    coverage.add_argument("--log", default=DEFAULT_LOG)
-    coverage.add_argument("--since", required=True, type=_coverage_timestamp)
-    coverage.add_argument("--until", type=_coverage_timestamp)
-    coverage.add_argument("--ref", default="HEAD")
-    coverage.add_argument("--instrumented-since", type=_coverage_timestamp)
-    coverage.add_argument("--include-merges", action="store_true")
-    coverage.add_argument("--json", action="store_true")
+    coverage.add_argument(
+        "--repo", required=True, help="path to the git work tree to measure"
+    )
+    coverage.add_argument(
+        "--log",
+        default=DEFAULT_LOG,
+        help="council ledger to join against (default: the live ledger)",
+    )
+    coverage.add_argument(
+        "--since",
+        required=True,
+        type=_coverage_timestamp,
+        help="window start, inclusive; ISO-8601, or a bare date read as UTC midnight",
+    )
+    coverage.add_argument(
+        "--until",
+        type=_coverage_timestamp,
+        help="window end, exclusive; ISO-8601 or bare date (default: now, UTC)",
+    )
+    coverage.add_argument(
+        "--ref",
+        default="HEAD",
+        help="revision whose reachable history is measured (default: HEAD; pass "
+        "the default branch when running from a session worktree)",
+    )
+    coverage.add_argument(
+        "--instrumented-since",
+        type=_coverage_timestamp,
+        help="override the derived instrumentation epoch. This VOIDS the refusal "
+        "that protects against measuring a window the commits-array convention "
+        "was not in force for; only pass it with evidence for the date",
+    )
+    coverage.add_argument(
+        "--include-merges",
+        action="store_true",
+        help="classify merge commits too (default: excluded and counted, since a "
+        "merge introduces no content of its own)",
+    )
+    coverage.add_argument(
+        "--json", action="store_true", help="emit the full result as JSON on stdout"
+    )
     coverage.set_defaults(func=command_coverage)
 
     record = sub.add_parser("record")

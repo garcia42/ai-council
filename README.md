@@ -216,50 +216,90 @@ A skipped review writes nothing. Every V1 and V2 report is therefore a rate over
 *happened*, and says nothing about changes that shipped with no council at all. More seats cannot
 fix that: more analysis inside an unobserved optional path cannot establish effectiveness.
 
-`coverage` closes the gap by joining `git log` over an explicit window to the `commits` array of
-council rows:
+`coverage` narrows the gap by joining `git log` over an explicit UTC window to the `commits` array
+of council rows:
 
 ```sh
 python -m council_tools.cli coverage \
-  --repo /path/to/repo --log ./council.jsonl \
+  --repo /path/to/repo --ref main --log ./council.jsonl \
   --since 2026-09-01T00:00:00Z --until 2026-10-01T00:00:00Z
 ```
 
-Every commit in the window gets exactly one state:
+### What it does not measure
+
+Three limits are structural, and the tool states them rather than papering over them:
+
+- **The unit is commits, not decisions.** A commit count moves with branch and squash conventions,
+  which have nothing to do with review. The rate is not directly substitutable into the kill
+  criterion's denominator.
+- **`COVERED` does not establish review-*before*-merge.** It means a council row names the commit.
+  Git does not durably record merge time and this tool does not invent one; instead every covered
+  commit reports `namedByRowAt`, and `coveredWithRowAfterCommit` counts the ones whose row was
+  written after the commit, so an after-the-fact recording is visible.
+- **`COVERED` is an upper bound on reviewed.** The `commits` array is written by hand by the same
+  session that ran the council; nothing in this repository produces it. The tool can prove
+  under-review. It cannot prove review.
+
+### Four states
 
 | State | Definition |
 | --- | --- |
-| `COVERED` | Its full SHA appears in the `commits` array of a `council` row |
-| `EXEMPT` | Its message carries a `Council-Exempt: <reason>` trailer with a non-empty reason |
-| `UNKNOWN` | A pre-convention row names an ancestor of it, written after it, but does not say which commits were read |
-| `UNCOVERED` | Nothing above; it shipped and no row claims it |
+| `COVERED` | A `council` row's `commits` array names it — by object name (full or abbreviated, resolved against the repo), or by `git patch-id`, so a reviewed commit later rebased or cherry-picked still counts |
+| `EXEMPT` | The message's **trailer block** carries `Council-Exempt: <reason>` with a real reason |
+| `UNKNOWN` | A pre-convention row names an ancestor of it, written after it existed, but does not say what was read |
+| `UNCOVERED` | Nothing above |
 
-There is no presumed exemption. A commit is never excused for looking mechanical, and an exemption
-trailer with an empty reason fails closed to `UNCOVERED` rather than silently leaving the
-denominator.
+There is no presumed exemption. A commit is never excused for looking mechanical; only the final
+paragraph is scanned, so a message that merely quotes the convention does not exempt itself; an
+indented trailer is prose; and an empty or `<placeholder>` reason fails closed to `UNCOVERED`.
 
-Exit codes are `0` clean, `1` something shipped unreviewed, and `3` cannot determine. `2` is
-deliberately unused, because argparse and the interpreter both exit 2 and a coverage rate must never
-be confusable with a command that did not run. A malformed or inverted window is a usage error and
-exits 2 without reporting anything.
+`UNKNOWN` handles the inconsistent historical rows without guessing. A row like `{"base": "<sha>"}`
+names the branch point, not what was read. An **array**, by contrast, is always a statement of what
+was read and is never reinterpreted as an ancestry base, even when it is spelled with abbreviations.
+`council-attempt` rows never count — they are written before the seats run.
 
-A wrong denominator is worse than none, so the reconciler prints no rate at all — and no counts and
-no per-commit classification — when:
+### It refuses rather than estimate
 
-- any ledger line is unparseable, or a council row records `commits` without a readable `ts`;
-- no row has ever recorded `commits` as an array of full 40-character SHAs;
-- the window starts before the first row that did.
+A wrong denominator is worse than none. No rate, **no counts, and no per-commit classification**
+when:
 
-The instrumentation epoch is derived from the ledger as the timestamp of the earliest conforming
-row, and `--instrumented-since` overrides it. The skip rate before that convention is **not
-recoverable** from this evidence and is never estimated. Existing rows are inconsistent — an object
-such as `{"base": "<sha>"}` names the branch point, not what was read — so those rows produce
-`UNKNOWN`, not a guess.
+- the ledger file is missing, has an unparseable line, or a `council` row records `commits` without
+  a readable timezone-qualified `ts`;
+- the repository is a **shallow clone**, whose truncated history would silently omit commits;
+- git cannot answer any query in full — a failure is never downgraded into an accusation;
+- no `council` row using the array convention names an object that resolves in **this** repository
+  (the ledger is shared across repositories and carries no repo field, so another project's
+  councils must not open the gate here);
+- the window starts before the first row that did — the refusal names the sub-window to re-run with;
+- the window contains no commits at all. Measuring nothing is not the same as measuring full
+  coverage.
 
-When any commit is `UNKNOWN`, the rate is reported as a band rather than a point: its lower bound
-counts every unknown as uncovered, its upper bound counts every unknown as covered, and the band
-width *is* the ambiguity. Merge commits are excluded by default, `--include-merges` keeps them, and
-the number excluded is always reported.
+The coverage rate before the convention was adopted is **not recoverable** from this evidence and is
+never estimated.
+
+Where `UNKNOWN` commits survive, the rate is a band, not a point: the lower bound counts them as
+uncovered, the upper as covered, and the band width *is* the ambiguity. **Read the lower bound**,
+not the midpoint — for an assurance measure, over-claiming coverage is the expensive error.
+
+### Exit codes
+
+`0` every eligible commit is covered; `1` something shipped unreviewed; `3` cannot determine.
+Nothing returns `0` unless an eligible population was actually measured, so an empty window and a
+window where every commit was author-exempted both return `3`. `2` is reserved for usage errors —
+argparse, and an inverted window — so a rate can never be confused with a command that did not run.
+Refusals are written to stderr so a scheduled caller has something to route to an alert sink.
+
+Merge commits are excluded by default (`--include-merges` keeps them) and the number excluded is
+always reported. `--instrumented-since` overrides the derived epoch and **voids** the refusal that
+protects against measuring an uninstrumented window; pass it only with evidence for the date.
+`reviewed_names_resolved_in_repo` is the wrong-repository tripwire: a low ratio means the ledger's
+councils were about some other project.
+
+### Installation
+
+The module lives in `src/council_tools/`, which `install.py` already pins by source digest, so it
+reaches `council-eval` through the existing source-pinned entry point rather than as a loose script.
+`tests/test_install.py` asserts that custody directly.
 
 Blocking a deployment on an uncovered commit is deliberately out of scope. That is a live policy
 decision, not a reporting one.

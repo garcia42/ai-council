@@ -3,37 +3,59 @@
 The forecast ledger can say how often a seated council changed a decision.  It
 cannot say how often a change shipped with no council at all, because a skipped
 review writes nothing.  That makes the kill criterion a rate over councils that
-happened rather than over decisions that were made, which is the gap this
-module closes: it joins ``git log`` over an explicit window to the ``commits``
-field of council rows and classifies every commit in that window.
+happened rather than over decisions that were made.  This module narrows that
+gap: it joins ``git log`` over an explicit window to the ``commits`` field of
+council rows and classifies every commit in that window.
+
+It narrows the gap rather than closing it, and the difference matters:
+
+* The unit is **commits**, not decisions.  A commit count moves with branch and
+  squash conventions, which have nothing to do with review.
+* ``COVERED`` means a council row *names* the commit.  Nothing in this evidence
+  establishes that the review happened **before** the commit reached the branch
+  being measured.  Per-commit ``namedByRowAt`` and the ``coveredWithRowAfterCommit``
+  count expose the lag so an after-the-fact recording is visible, but git does
+  not durably record merge time and this module does not invent one.
+* The ``commits`` field is written by hand by the same session that runs the
+  council.  ``COVERED`` is therefore an **upper bound** on reviewed: the tool can
+  prove under-review, it cannot prove review.
 
 Four states, each defined:
 
 ``COVERED``
-    The commit's full SHA appears in the ``commits`` array of a ``council`` row.
+    A ``council`` row's ``commits`` array names this commit -- by object name
+    (full or abbreviated, resolved against this repository), or by patch
+    identity, so that a reviewed commit which was later rebased or cherry-picked
+    still counts.
 
 ``EXEMPT``
-    The commit message carries a ``Council-Exempt: <reason>`` trailer with a
-    non-empty reason.  Only an explicit, author-written exemption counts.  There
-    is no presumed exemption: a commit is never excused for looking mechanical.
+    The commit message's **trailer block** carries ``Council-Exempt: <reason>``
+    with a real reason.  Only an explicit, author-written exemption counts.
+    There is no presumed exemption: a commit is never excused for looking
+    mechanical, and a message that merely quotes the convention in its body does
+    not exempt itself.
 
 ``UNKNOWN``
     A council row plausibly reviewed the commit but does not say so.  Rows
     written before the array convention recorded shapes such as
     ``{"base": "<sha>"}``, which names the branch point and not the reviewed
-    commits.  When such a row names an object name that resolves in this
-    repository, is an ancestor of the commit, and was written after the commit
-    was made, the commit could have been reviewed by that council or could have
-    been appended afterwards.  The record cannot distinguish the two.
+    commits.  When such a row names an object that resolves here, is an ancestor
+    of the commit, and was written after the commit existed, the record cannot
+    distinguish "reviewed" from "appended afterwards".
 
 ``UNCOVERED``
     None of the above.  The commit shipped and no row claims it.
 
 A wrong denominator is worse than none, so the reconciler refuses to print a
-rate at all when the ledger cannot be read, when no row has ever used the array
-convention, or when the requested window starts before the first row that did.
-The skip rate before that convention is not recoverable from this evidence and
-is reported as such rather than estimated.
+rate at all -- and no counts, and no classification -- when the ledger cannot be
+read in full, when git cannot answer in full, when no row attributable to *this*
+repository has used the array convention, or when the window starts before the
+first row that did.  The skip rate before that convention is not recoverable
+from this evidence and is reported as such rather than estimated.
+
+Every refusal path, and every path that measures nothing, is reported as
+"cannot determine".  This tool must never say "clean" because it looked at
+nothing: that is the single failure mode it exists to prevent.
 
 Exit codes belong to the caller, but the mapping this module is written for is
 0 clean, 1 something shipped unreviewed, and 3 cannot determine.  2 is
@@ -47,7 +69,7 @@ import re
 import subprocess
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -71,16 +93,28 @@ STATE_PRECEDENCE = (COVERED, EXEMPT, UNKNOWN, UNCOVERED)
 EXEMPT_TRAILER = "Council-Exempt:"
 
 _FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
-#: An abbreviated object name in a pre-convention row.  Seven hex characters is
-#: git's own default abbreviation floor; requiring it keeps branch names and
-#: free text such as ``uncommitted-untracked`` out of the ambiguity join.
-_ABBREV_SHA = re.compile(r"^[0-9a-f]{7,40}$")
+#: An object name as a council row may spell it.  Seven hex characters is git's
+#: own default abbreviation floor; requiring it keeps branch names and free text
+#: such as ``uncommitted-untracked`` out of the join entirely.
+_OBJECT_NAME = re.compile(r"^[0-9a-f]{7,40}$")
+#: A documentation placeholder such as ``<reason>`` is not a reason.
+_PLACEHOLDER = re.compile(r"^<[^>]*>$")
 
 _GIT_TIMEOUT_SECONDS = 120
 
 
 class CoverageError(ValueError):
     """The reconciler was asked for something it cannot compute."""
+
+
+class GitError(CoverageError):
+    """Git could not answer a question about the repository under review.
+
+    Derived from :class:`CoverageError` so it shares the package-wide
+    ``ValueError`` base.  Every other error class in ``council_tools`` does, and
+    ``cli.main`` catches that base; a bare ``RuntimeError`` escaping any call
+    site would produce a traceback instead of a stable exit code.
+    """
 
 
 @dataclass(frozen=True)
@@ -100,30 +134,44 @@ class Commit:
     committed_at: datetime
     subject: str
     exempt_reason: str | None
+    is_merge: bool
 
 
 @dataclass(frozen=True)
 class LedgerEvidence:
     rows_read: int
-    conforming_rows: int
-    ambiguous_rows: int
-    reviewed_shas: frozenset[str]
-    #: ``(row timestamp or None, object names named by the row)`` for every row
-    #: that carries ``commits`` in a shape the convention does not define.
+    #: ``(ts, object names)`` for each council row whose ``commits`` is an array
+    #: of full 40-character SHAs.  Only these establish that the convention was
+    #: in force, which is what the instrumentation epoch means.
+    convention_rows: tuple[tuple[datetime, tuple[str, ...]], ...]
+    #: ``(ts, object names)`` for every council row whose ``commits`` is an
+    #: array, including arrays spelled with abbreviations.  An array is always a
+    #: statement of what was read, whether or not it obeys the convention.
+    named_rows: tuple[tuple[datetime | None, tuple[str, ...]], ...]
+    #: ``(ts, object names)`` for rows whose ``commits`` is present but is not
+    #: an array -- the pre-convention ``{"base": ...}`` shape.
     ambiguous_bases: tuple[tuple[datetime | None, tuple[str, ...]], ...]
-    epoch: datetime | None
+    ambiguous_rows: int
+    council_rows_without_commits: int
 
 
 def _text_timestamp(value: datetime) -> str:
     return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def parse_timestamp(value: str, *, field: str) -> datetime:
+def parse_timestamp(
+    value: str, *, field: str, require_timezone: bool = False
+) -> datetime:
     """Parse an ISO-8601 instant, or a bare date read as UTC midnight.
 
     Window bounds are deliberately UTC rather than America/New_York.  Git
     records an explicit offset per commit, so normalizing both sides to UTC
     keeps the join independent of the operator's local zone.
+
+    ``require_timezone`` is used when reading a ledger row's ``ts``.  The other
+    modules that read that same field (``forecasts``, ``capture_schema``) reject
+    a naive timestamp, and a row those refuse to read must not be able to
+    silently establish this tool's instrumentation epoch.
     """
 
     if not isinstance(value, str) or not value.strip():
@@ -141,122 +189,97 @@ def parse_timestamp(value: str, *, field: str) -> datetime:
             f"{field} is not an ISO-8601 date or timestamp: {text}"
         ) from exc
     if parsed.tzinfo is None:
+        if require_timezone:
+            raise CoverageError(f"{field} must include a timezone")
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
 
 
-def _row_timestamp(row: Mapping[str, Any]) -> datetime | None:
-    """Parse a row's ``ts``, or None when the row does not carry a usable one.
-
-    Callers decide what None means.  For a conforming row it is fatal, because
-    the instrumentation epoch is derived from those timestamps.  For a
-    pre-convention row it means the ambiguity it creates is unbounded in time.
-    """
-
-    raw = row.get("ts")
-    if not isinstance(raw, str):
-        return None
-    try:
-        return parse_timestamp(raw, field="ts")
-    except CoverageError:
-        return None
-
-
-def _conforming_commits(row: Mapping[str, Any]) -> list[str] | None:
-    """Return the reviewed SHAs when the row states them in the defined shape.
-
-    The shape is a JSON array of full 40-character SHAs.  An empty array is
-    conforming: it is how a council that reviewed a decision with no diff
-    records that it read no commits, and it still proves the writer was using
-    the convention.  Anything else -- an object, a null, a bare string, an
-    array carrying an abbreviation -- is not conforming, because it does not
-    say which commits were read.
-    """
-
-    if row.get("kind") not in COUNCIL_ROW_KINDS:
-        return None
-    commits = row.get("commits")
-    if not isinstance(commits, list):
-        return None
-    if not all(isinstance(item, str) and _FULL_SHA.match(item) for item in commits):
-        return None
-    return list(commits)
-
-
-def _named_object_names(value: Any) -> tuple[str, ...]:
-    """Collect the object-name-shaped strings a non-conforming row mentions."""
+def _object_names(value: Any) -> tuple[str, ...]:
+    """Collect the object-name-shaped strings a value mentions, in order."""
 
     if isinstance(value, str):
         candidates: list[str] = [value]
     elif isinstance(value, Mapping):
         candidates = [item for item in value.values() if isinstance(item, str)]
-    elif isinstance(value, Sequence):
+    elif isinstance(value, (list, tuple)):
         candidates = [item for item in value if isinstance(item, str)]
     else:
         return ()
-    return tuple(
-        dict.fromkeys(item for item in candidates if _ABBREV_SHA.match(item))
-    )
+    return tuple(dict.fromkeys(item for item in candidates if _OBJECT_NAME.match(item)))
 
 
 def read_ledger_evidence(log_path: str | Path) -> LedgerEvidence:
     """Summarize what the ledger claims about reviewed commits.
 
     Raises :class:`~council_tools.forecasts.LedgerError` when any line is
-    unparseable.  The caller turns that into a refusal rather than a rate: a
-    ledger that cannot be read in full has an unknown numerator.
+    unparseable, or when a council row records ``commits`` without a readable
+    timezone-qualified ``ts``.  The caller turns that into a refusal rather than
+    a rate: a ledger that cannot be read in full has an unknown numerator, and
+    dropping a row whose ``ts`` cannot be read would move the epoch later and
+    hide exactly the window this tool exists to measure.
     """
 
     rows = load_jsonl(log_path)
-    reviewed: set[str] = set()
+    label = Path(log_path).name
+    convention: list[tuple[datetime, tuple[str, ...]]] = []
+    named: list[tuple[datetime | None, tuple[str, ...]]] = []
     ambiguous: list[tuple[datetime | None, tuple[str, ...]]] = []
-    conforming_rows = 0
     ambiguous_rows = 0
-    epoch: datetime | None = None
-    for _line_number, row in rows:
-        conforming = _conforming_commits(row)
-        if conforming is not None:
-            conforming_rows += 1
-            reviewed.update(conforming)
-            row_ts = _row_timestamp(row)
-            if row_ts is None:
-                # The epoch is derived from these timestamps.  Dropping a row
-                # whose ts cannot be read would move the epoch later and hide
-                # exactly the window this tool exists to measure.
-                raise LedgerError(
-                    f"{Path(log_path).name} line {_line_number}: council row "
-                    "records commits but has no readable ts"
-                )
-            if epoch is None or row_ts < epoch:
-                epoch = row_ts
-            continue
+    without_commits = 0
+
+    for line_number, row in rows:
+        is_council = row.get("kind") in COUNCIL_ROW_KINDS
         if "commits" not in row:
+            if is_council:
+                without_commits += 1
             continue
+        commits = row.get("commits")
+        raw_ts = row.get("ts")
+        row_ts: datetime | None = None
+        if isinstance(raw_ts, str):
+            try:
+                row_ts = parse_timestamp(raw_ts, field="ts", require_timezone=True)
+            except CoverageError:
+                row_ts = None
+
+        if is_council and isinstance(commits, list):
+            # An array is a statement of what was read, whether or not it obeys
+            # the full-SHA convention.  Abbreviations are resolved later against
+            # the repository; they must not be mistaken for ancestry bases.
+            named.append((row_ts, _object_names(commits)))
+            if all(isinstance(item, str) and _FULL_SHA.match(item) for item in commits):
+                if row_ts is None:
+                    raise LedgerError(
+                        f"{label} line {line_number}: council row records commits "
+                        "but has no readable timezone-qualified ts"
+                    )
+                convention.append((row_ts, tuple(commits)))
+            continue
+
         ambiguous_rows += 1
-        names = _named_object_names(row.get("commits"))
+        names = _object_names(commits)
         if names:
-            ambiguous.append((_row_timestamp(row), names))
+            ambiguous.append((row_ts, names))
+
     return LedgerEvidence(
         rows_read=len(rows),
-        conforming_rows=conforming_rows,
-        ambiguous_rows=ambiguous_rows,
-        reviewed_shas=frozenset(reviewed),
+        convention_rows=tuple(convention),
+        named_rows=tuple(named),
         ambiguous_bases=tuple(ambiguous),
-        epoch=epoch,
+        ambiguous_rows=ambiguous_rows,
+        council_rows_without_commits=without_commits,
     )
 
 
-class GitError(RuntimeError):
-    """Git could not answer a question about the repository under review."""
-
-
-def _git(repo: Path, *arguments: str) -> str:
+def _git(repo: Path, *arguments: str, stdin: str | None = None) -> str:
     try:
         completed = subprocess.run(
             ["git", "-C", str(repo), *arguments],
             text=True,
             capture_output=True,
             check=False,
+            input=stdin,
             timeout=_GIT_TIMEOUT_SECONDS,
         )
     except (OSError, subprocess.SubprocessError) as exc:
@@ -271,7 +294,9 @@ def _resolve_object(repo: Path, name: str) -> str | None:
     """Return the full SHA a name resolves to, or None when it does not.
 
     ``--end-of-options`` keeps a caller-supplied name that begins with a dash
-    from being read as a git option.
+    from being read as a git option.  A name that is ambiguous between several
+    objects does not resolve, which fails toward UNCOVERED -- loud -- rather
+    than toward COVERED.
     """
 
     try:
@@ -289,47 +314,54 @@ def _resolve_object(repo: Path, name: str) -> str | None:
     return resolved if _FULL_SHA.match(resolved) else None
 
 
-def _exempt_reason(message: str) -> str | None:
-    """Return the reason from a ``Council-Exempt:`` trailer, if it has one.
+def _trailer_block(message: str) -> list[str]:
+    """Return the lines of the message's final paragraph.
 
-    An exemption with an empty reason is not an exemption.  Failing closed here
-    means a malformed trailer surfaces as UNCOVERED rather than silently
-    removing the commit from the denominator.
+    Git defines trailers as living in the last paragraph, so that is the only
+    place this looks.  Scanning the whole message would let a commit that merely
+    documents the convention -- or a revert quoting the original message, or a
+    squash concatenating one exempt body -- exempt itself, which is fail-open
+    inside a design whose stated principle is fail-closed.
     """
 
-    for line in message.splitlines():
-        stripped = line.strip()
-        if not stripped.lower().startswith(EXEMPT_TRAILER.lower()):
+    paragraphs = [block for block in re.split(r"\n[ \t]*\n", message) if block.strip()]
+    if not paragraphs:
+        return []
+    return paragraphs[-1].splitlines()
+
+
+def _exempt_reason(message: str) -> str | None:
+    """Return the reason from a ``Council-Exempt:`` trailer, if it has a real one.
+
+    An exemption with an empty reason, or with a bare ``<placeholder>``, is not
+    an exemption.  Failing closed here means a malformed trailer surfaces as
+    UNCOVERED rather than silently removing the commit from the denominator.
+    """
+
+    for line in _trailer_block(message):
+        # A trailer is not indented; an indented line is quoted prose.
+        if line != line.lstrip():
             continue
-        reason = stripped[len(EXEMPT_TRAILER) :].strip()
-        if reason:
+        if not line.lower().startswith(EXEMPT_TRAILER.lower()):
+            continue
+        reason = line[len(EXEMPT_TRAILER) :].strip()
+        if reason and not _PLACEHOLDER.match(reason):
             return reason
     return None
 
 
-def _read_commits(
-    repo: Path,
-    *,
-    ref: str,
-    since: datetime,
-    until: datetime,
-    include_merges: bool,
-) -> tuple[list[Commit], int]:
-    """List commits reachable from ``ref`` whose committer date is in-window.
+def _read_commits(repo: Path, *, ref: str) -> list[Commit]:
+    """List every commit reachable from ``ref``, with the fields the join needs.
 
-    Git's own ``--since``/``--until`` are used only as a loose pre-filter, wide
-    by a day on each side, and the window is then re-applied here against the
-    parsed ``%cI``.  The reported bounds therefore mean exactly one thing --
-    half-open ``[since, until)`` on committer date in UTC -- rather than
-    whatever a given git version makes of a date string at the boundary.
-
-    Merge commits are read in the same pass and partitioned here, so the count
-    of what a ``--no-merges`` run left out is exact and always reported.  A
-    merge introduces no content of its own; the commits it brings in are
-    classified on their own SHAs.
+    The window is applied in Python, never by ``git log --since``.  That option
+    is a *traversal cutoff*, not a filter: a commit older than the bound is
+    marked uninteresting and its parents are pruned, so a single backdated
+    commit anywhere in the walk silently drops in-window ancestors.  A slack
+    margin does not bound that, because committer-date skew is unbounded.  A
+    full walk costs milliseconds even on a few thousand commits, and a
+    denominator that can silently empty itself is not worth the saving.
     """
 
-    slack = timedelta(days=1)
     arguments = [
         # One NUL terminates each record and the first three newline-separated
         # lines are the structured fields.  A commit message cannot contain a
@@ -338,8 +370,6 @@ def _read_commits(
         # empty %P, which would collide with any multi-NUL record separator.
         "log",
         "--format=%H%n%cI%n%P%n%B%x00",
-        f"--since={_text_timestamp(since - slack)}",
-        f"--until={_text_timestamp(until + slack)}",
         "--end-of-options",
         ref,
         "--",
@@ -347,7 +377,6 @@ def _read_commits(
     raw = _git(repo, *arguments)
 
     commits: list[Commit] = []
-    merges_excluded = 0
     for record in raw.split("\x00"):
         if not record.strip("\n"):
             continue
@@ -357,22 +386,71 @@ def _read_commits(
         sha, committed_raw, parents, message = fields
         if not _FULL_SHA.match(sha):
             raise GitError(f"git log returned a malformed object name: {sha!r}")
-        committed_at = parse_timestamp(committed_raw, field="committer date")
-        if not since <= committed_at < until:
-            continue
-        if len(parents.split()) > 1 and not include_merges:
-            merges_excluded += 1
-            continue
         subject = message.strip().splitlines()[0].strip() if message.strip() else ""
         commits.append(
             Commit(
                 sha=sha,
-                committed_at=committed_at,
+                committed_at=parse_timestamp(committed_raw, field="committer date"),
                 subject=subject,
                 exempt_reason=_exempt_reason(message),
+                is_merge=len(parents.split()) > 1,
             )
         )
-    return commits, merges_excluded
+    return commits
+
+
+def _patch_ids(repo: Path, shas: Sequence[str]) -> dict[str, str]:
+    """Map commit SHA to stable patch id, for the SHAs that have one.
+
+    Batched through ``diff-tree --stdin`` so the cost is two git invocations
+    regardless of how many commits are compared.  A commit with no diff -- an
+    empty commit, or a merge under default diff rules -- produces no patch and
+    is simply absent from the result, so it can never match anything.
+    """
+
+    if not shas:
+        return {}
+    # The trailing newline is required: `diff-tree --stdin` silently drops a
+    # final line that is not terminated, which would omit one commit's patch
+    # and make a genuine cherry-pick read as UNCOVERED.
+    stdin = "".join(f"{sha}\n" for sha in shas)
+    diffs = _git(repo, "diff-tree", "-p", "--no-color", "--stdin", stdin=stdin)
+    if not diffs.strip():
+        return {}
+    output = _git(repo, "patch-id", "--stable", stdin=diffs)
+    mapping: dict[str, str] = {}
+    for line in output.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and _FULL_SHA.match(parts[1]):
+            mapping[parts[1]] = parts[0]
+    return mapping
+
+
+def _reviewed_index(
+    repo: Path, evidence: LedgerEvidence
+) -> tuple[dict[str, datetime | None], int, int]:
+    """Resolve every object a council row named into ``sha -> earliest row ts``.
+
+    Returns the index, the number of distinct names seen, and the number that
+    resolved here.  The two counts are the wrong-repository tripwire: a window
+    measured against a repository the councils were not about shows names seen
+    but few or none resolved.
+    """
+
+    resolved: dict[str, str | None] = {}
+    index: dict[str, datetime | None] = {}
+    for row_ts, names in evidence.named_rows:
+        for name in names:
+            if name not in resolved:
+                resolved[name] = _resolve_object(repo, name)
+            sha = resolved[name]
+            if sha is None:
+                continue
+            if sha not in index:
+                index[sha] = row_ts
+            elif row_ts is not None and (index[sha] is None or row_ts < index[sha]):
+                index[sha] = row_ts
+    return index, len(resolved), len({v for v in resolved.values() if v is not None})
 
 
 def _ambiguously_covered(
@@ -394,6 +472,10 @@ def _ambiguously_covered(
     ``C``, and this treats every descendant of ``B`` up to ``T`` as possibly
     reviewed.  Over-reporting UNKNOWN keeps ambiguity visible; under-reporting
     it would quietly convert a guess into a rate.
+
+    A git failure here is **not** swallowed.  Dropping a base would move its
+    commits from UNKNOWN to UNCOVERED and turn "cannot determine" into a
+    positive accusation, which is the opposite of this module's contract.
     """
 
     if not commits:
@@ -410,24 +492,14 @@ def _ambiguously_covered(
             if base is None:
                 continue
             if base not in descendants:
-                try:
-                    # Both revisions are full SHAs validated above, so no
-                    # caller-controlled text reaches git's option parser here;
-                    # `--end-of-options` cannot be used because `--not` must
-                    # still be read as an option.
-                    reachable = _git(
-                        repo,
-                        "rev-list",
-                        "--ancestry-path",
-                        ref_sha,
-                        "--not",
-                        base,
-                        "--",
-                    )
-                except GitError:
-                    descendants[base] = set()
-                else:
-                    descendants[base] = set(reachable.split())
+                # Both revisions are full SHAs validated above, so no
+                # caller-controlled text reaches git's option parser here;
+                # `--end-of-options` cannot be used because `--not` must
+                # still be read as an option.
+                reachable = _git(
+                    repo, "rev-list", "--ancestry-path", ref_sha, "--not", base, "--"
+                )
+                descendants[base] = set(reachable.split())
             for sha in descendants[base] & by_sha.keys():
                 # A council cannot have read a commit that did not exist yet.
                 # A row with an unreadable timestamp is treated as unbounded,
@@ -440,19 +512,27 @@ def _ambiguously_covered(
 def _classify(
     commit: Commit,
     *,
-    reviewed: frozenset[str],
+    reviewed: Mapping[str, datetime | None],
+    patch_matched: Mapping[str, datetime | None],
     ambiguous: set[str],
-) -> tuple[str, str]:
+) -> tuple[str, str, datetime | None]:
     if commit.sha in reviewed:
-        return COVERED, "named in a council row commits array"
+        return COVERED, "named in a council row commits array", reviewed[commit.sha]
+    if commit.sha in patch_matched:
+        return (
+            COVERED,
+            "patch-identical to a commit named in a council row",
+            patch_matched[commit.sha],
+        )
     if commit.exempt_reason:
-        return EXEMPT, f"{EXEMPT_TRAILER} {commit.exempt_reason}"
+        return EXEMPT, f"{EXEMPT_TRAILER} {commit.exempt_reason}", None
     if commit.sha in ambiguous:
         return (
             UNKNOWN,
             "a pre-convention council row names an ancestor but not this commit",
+            None,
         )
-    return UNCOVERED, "no council row names this commit"
+    return UNCOVERED, "no council row names this commit", None
 
 
 def reconcile_coverage(
@@ -474,20 +554,20 @@ def reconcile_coverage(
     if since >= until:
         raise CoverageError("window --since must be strictly before --until")
 
-    repo_path = Path(repo)
-    window = {
-        "repo": str(repo_path),
-        "ref": ref,
-        "since": _text_timestamp(since),
-        "until": _text_timestamp(until),
-        "timezone": "UTC",
-        "includesMerges": include_merges,
-    }
+    repo_path = Path(repo).resolve()
     result: dict[str, Any] = {
         "tool": "council-coverage",
         "determined": False,
         "refusals": [],
-        "window": window,
+        "window": {
+            "repo": str(repo_path),
+            "ref": ref,
+            "refSha": None,
+            "since": _text_timestamp(since),
+            "until": _text_timestamp(until),
+            "timezone": "UTC",
+            "includesMerges": include_merges,
+        },
         "instrumentation": {
             "ledgerPath": str(log_path),
             "epoch": None,
@@ -500,6 +580,12 @@ def reconcile_coverage(
         result["refusals"] = [Refusal(code, detail).as_dict()]
         return result
 
+    if not Path(log_path).exists():
+        return refuse(
+            "ledger-unreadable",
+            f"ledger file does not exist: {log_path}; this is a path problem, "
+            "not a missing convention",
+        )
     try:
         evidence = read_ledger_evidence(log_path)
     except LedgerError as exc:
@@ -509,73 +595,146 @@ def reconcile_coverage(
 
     result["ledger"] = {
         "rowsRead": evidence.rows_read,
-        "conformingCouncilRows": evidence.conforming_rows,
+        "conventionCouncilRows": len(evidence.convention_rows),
+        "councilRowsNamingCommits": len(evidence.named_rows),
+        "councilRowsWithoutCommits": evidence.council_rows_without_commits,
         "ambiguousCommitRows": evidence.ambiguous_rows,
-        "reviewedShas": len(evidence.reviewed_shas),
     }
-
-    epoch = instrumented_since or evidence.epoch
-    result["instrumentation"]["epoch"] = (
-        _text_timestamp(epoch) if epoch is not None else None
-    )
-    if epoch is None:
-        return refuse(
-            "no-commit-instrumentation",
-            "no council row records commits as an array of full SHAs, so no "
-            "window has a known denominator; the historical skip rate is "
-            "unrecoverable from this ledger",
-        )
-    if since < epoch:
-        return refuse(
-            "window-predates-commit-instrumentation",
-            f"window starts {_text_timestamp(since)} but the first council row "
-            f"using the commits-array convention is {_text_timestamp(epoch)}; "
-            "the skip rate before that convention is unrecoverable and is not "
-            "estimated",
-        )
 
     try:
         if _git(repo_path, "rev-parse", "--is-inside-work-tree").strip() != "true":
             return refuse(
                 "git-unavailable", f"{repo_path} is not inside a git work tree"
             )
+        if _git(repo_path, "rev-parse", "--is-shallow-repository").strip() == "true":
+            # Truncated history is the git-side equivalent of a ledger that
+            # cannot be read in full: the denominator is missing commits and
+            # nothing in the output would say so.
+            return refuse(
+                "shallow-repository",
+                f"{repo_path} is a shallow clone, so its history is truncated and "
+                "the denominator would silently omit commits; fetch full history",
+            )
         ref_sha = _resolve_object(repo_path, ref)
         if ref_sha is None:
             return refuse("git-unavailable", f"ref does not resolve to a commit: {ref}")
-        commits, merges_excluded = _read_commits(
-            repo_path,
-            ref=ref,
-            since=since,
-            until=until,
-            include_merges=include_merges,
+        result["window"]["refSha"] = ref_sha
+
+        reviewed, names_seen, names_resolved = _reviewed_index(repo_path, evidence)
+        result["ledger"]["reviewedNamesSeen"] = names_seen
+        result["ledger"]["reviewedNamesResolvedInRepo"] = names_resolved
+
+        # The epoch must be attributable to the repository under review.  The
+        # shared ledger carries no repo key, so a council about a *different*
+        # repository would otherwise open the gate here: the earliest convention
+        # row in the live ledger is a Truth-and-Reconciliation council, and
+        # accepting it would assert instrumentation this repository never had.
+        attributable = [
+            row_ts
+            for row_ts, names in evidence.convention_rows
+            if any(_resolve_object(repo_path, name) is not None for name in names)
+        ]
+        epoch = instrumented_since or (min(attributable) if attributable else None)
+        result["instrumentation"]["epoch"] = (
+            _text_timestamp(epoch) if epoch is not None else None
         )
+        result["instrumentation"]["attributableConventionRows"] = len(attributable)
+        if epoch is None:
+            if evidence.convention_rows:
+                return refuse(
+                    "no-repo-attributable-instrumentation",
+                    "no council row using the commits-array convention names any "
+                    f"object that resolves in {repo_path}; the ledger is shared "
+                    "across repositories and carries no repo field, so this "
+                    "repository has no known denominator",
+                )
+            return refuse(
+                "no-commit-instrumentation",
+                "no council row records commits as an array of full SHAs, so no "
+                "window has a known denominator; the historical skip rate is "
+                "unrecoverable from this ledger",
+            )
+        if since < epoch:
+            return refuse(
+                "window-predates-commit-instrumentation",
+                f"window starts {_text_timestamp(since)} but the first council row "
+                f"using the commits-array convention for this repository is "
+                f"{_text_timestamp(epoch)}; the skip rate before that convention "
+                "is unrecoverable and is not estimated. Re-run with "
+                f"--since {_text_timestamp(epoch)} for the measurable sub-window",
+            )
+
+        reachable = _read_commits(repo_path, ref=ref)
+        in_window = [
+            commit for commit in reachable if since <= commit.committed_at < until
+        ]
+        merges_excluded = 0
+        if not include_merges:
+            merges_excluded = sum(1 for commit in in_window if commit.is_merge)
+            in_window = [commit for commit in in_window if not commit.is_merge]
+
+        if not in_window:
+            return refuse(
+                "empty-window",
+                f"no commits in {_text_timestamp(since)}..{_text_timestamp(until)} "
+                f"on {ref} in {repo_path} (merge commits excluded: {merges_excluded}); "
+                "measuring nothing is not the same as measuring full coverage",
+            )
+
+        # Patch identity, only for what object identity could not settle. A
+        # reviewed commit that was rebased or cherry-picked onto the measured
+        # ref is a different object with the same patch; recorded SHAs that
+        # matched nothing are exactly the candidates.
+        patch_matched: dict[str, datetime | None] = {}
+        unmatched_commits = [c.sha for c in in_window if c.sha not in reviewed]
+        unmatched_reviewed = [sha for sha in reviewed if sha not in {c.sha for c in in_window}]
+        if unmatched_commits and unmatched_reviewed:
+            reviewed_patches = _patch_ids(repo_path, unmatched_reviewed)
+            by_patch: dict[str, datetime | None] = {}
+            for sha, patch in reviewed_patches.items():
+                row_ts = reviewed[sha]
+                if patch not in by_patch or (
+                    row_ts is not None
+                    and (by_patch[patch] is None or row_ts < by_patch[patch])
+                ):
+                    by_patch[patch] = row_ts
+            for sha, patch in _patch_ids(repo_path, unmatched_commits).items():
+                if patch in by_patch:
+                    patch_matched[sha] = by_patch[patch]
+
         ambiguous, resolved_bases = _ambiguously_covered(
-            repo_path, evidence=evidence, commits=commits, ref_sha=ref_sha
+            repo_path, evidence=evidence, commits=in_window, ref_sha=ref_sha
         )
     except (GitError, CoverageError) as exc:
-        # CoverageError here means git answered with something this tool cannot
-        # read (a committer date it cannot parse).  That is "cannot determine",
-        # not "shipped unreviewed".
+        # A git failure means this tool cannot answer, never that a commit is
+        # unreviewed.  Swallowing one would convert UNKNOWN into UNCOVERED and
+        # exit 3 into exit 1 -- a false alarm dressed as a finding.
         return refuse("git-unavailable", str(exc))
 
     result["ledger"]["ambiguousBasesResolvedInRepo"] = resolved_bases
 
     classified = []
     counts = {state: 0 for state in STATE_PRECEDENCE}
-    for commit in sorted(commits, key=lambda item: (item.committed_at, item.sha)):
-        state, reason = _classify(
-            commit, reviewed=evidence.reviewed_shas, ambiguous=ambiguous
+    recorded_after = 0
+    for commit in sorted(in_window, key=lambda item: (item.committed_at, item.sha)):
+        state, reason, row_ts = _classify(
+            commit,
+            reviewed=reviewed,
+            patch_matched=patch_matched,
+            ambiguous=ambiguous,
         )
         counts[state] += 1
-        classified.append(
-            {
-                "sha": commit.sha,
-                "committedAt": _text_timestamp(commit.committed_at),
-                "subject": commit.subject,
-                "state": state,
-                "reason": reason,
-            }
-        )
+        entry = {
+            "sha": commit.sha,
+            "committedAt": _text_timestamp(commit.committed_at),
+            "subject": commit.subject,
+            "state": state,
+            "reason": reason,
+            "namedByRowAt": _text_timestamp(row_ts) if row_ts is not None else None,
+        }
+        if state == COVERED and row_ts is not None and row_ts > commit.committed_at:
+            recorded_after += 1
+        classified.append(entry)
 
     total = len(classified)
     eligible = total - counts[EXEMPT]
@@ -588,10 +747,20 @@ def reconcile_coverage(
         "uncovered": counts[UNCOVERED],
         "eligible": eligible,
         "mergeCommitsExcluded": merges_excluded,
+        "coveredWithRowAfterCommit": recorded_after,
     }
-    result["commits"] = classified
+    # Ordered so the actionable states are read first, not buried among a long
+    # chronological run of UNKNOWNs.
+    order = {state: index for index, state in enumerate(STATE_PRECEDENCE)}
+    result["commits"] = sorted(
+        classified,
+        key=lambda item: (-order[item["state"]], item["committedAt"], item["sha"]),
+    )
     if eligible <= 0:
-        result["rateNote"] = "no eligible commits in window"
+        result["rateNote"] = (
+            "every commit in the window is author-exempted; there is no eligible "
+            "population and no rate"
+        )
     else:
         # The band, not a point estimate: every UNKNOWN commit is a commit this
         # evidence cannot place on either side, so the true covered fraction
@@ -606,7 +775,12 @@ def reconcile_coverage(
 
 
 def coverage_exit_code(result: Mapping[str, Any]) -> int:
-    """0 clean, 1 something shipped unreviewed, 3 cannot determine."""
+    """0 clean, 1 something shipped unreviewed, 3 cannot determine.
+
+    Nothing returns 0 unless an eligible population was actually measured and
+    every commit in it was placed.  "I looked at nothing" and "everything was
+    exempted by its own author" are both cannot-determine, never clean.
+    """
 
     if not result.get("determined"):
         return 3
@@ -614,6 +788,8 @@ def coverage_exit_code(result: Mapping[str, Any]) -> int:
     if counts.get("uncovered", 0) > 0:
         return 1
     if counts.get("unknown", 0) > 0:
+        return 3
+    if counts.get("eligible", 0) <= 0:
         return 3
     return 0
 
@@ -624,7 +800,8 @@ def format_coverage(result: Mapping[str, Any]) -> str:
     window = result["window"]
     instrumentation = result["instrumentation"]
     lines = [
-        f"repo={window['repo']} ref={window['ref']}",
+        f"repo={window['repo']} ref={window['ref']} "
+        f"ref_sha={(window.get('refSha') or 'unresolved')[:12]}",
         f"window={window['since']}..{window['until']} timezone={window['timezone']} "
         f"includes_merges={str(window['includesMerges']).lower()}",
         f"ledger={instrumentation['ledgerPath']} "
@@ -635,14 +812,21 @@ def format_coverage(result: Mapping[str, Any]) -> str:
     if ledger:
         lines.append(
             f"rows_read={ledger['rowsRead']} "
-            f"conforming_council_rows={ledger['conformingCouncilRows']} "
-            f"ambiguous_commit_rows={ledger['ambiguousCommitRows']} "
-            f"reviewed_shas={ledger['reviewedShas']}"
+            f"convention_rows={ledger['conventionCouncilRows']} "
+            f"rows_naming_commits={ledger['councilRowsNamingCommits']} "
+            f"council_rows_without_commits={ledger['councilRowsWithoutCommits']} "
+            f"ambiguous_commit_rows={ledger['ambiguousCommitRows']}"
         )
+        if "reviewedNamesResolvedInRepo" in ledger:
+            lines.append(
+                f"reviewed_names_resolved_in_repo="
+                f"{ledger['reviewedNamesResolvedInRepo']}/{ledger['reviewedNamesSeen']}"
+                "  (a low ratio means this ledger's councils were about another repo)"
+            )
     if not result["determined"]:
         for refusal in result["refusals"]:
             lines.append(f"REFUSED code={refusal['code']} detail={refusal['detail']}")
-        lines.append("rate=UNAVAILABLE")
+        lines.append("rate=UNAVAILABLE  (cannot determine; exit 3)")
         return "\n".join(lines)
 
     counts = result["counts"]
@@ -650,7 +834,8 @@ def format_coverage(result: Mapping[str, Any]) -> str:
         f"commits={counts['total']} covered={counts['covered']} "
         f"exempt={counts['exempt']} unknown={counts['unknown']} "
         f"uncovered={counts['uncovered']} eligible={counts['eligible']} "
-        f"merge_commits_excluded={counts['mergeCommitsExcluded']}"
+        f"merge_commits_excluded={counts['mergeCommitsExcluded']} "
+        f"covered_with_row_after_commit={counts['coveredWithRowAfterCommit']}"
     )
     rate = result.get("rate")
     if rate is None:
@@ -660,7 +845,8 @@ def format_coverage(result: Mapping[str, Any]) -> str:
     else:
         lines.append(
             f"covered_rate_band={rate['lower']:.4f}..{rate['upper']:.4f} "
-            f"basis={rate['basis']} (band width is the UNKNOWN commits)"
+            f"basis={rate['basis']} (band width is the UNKNOWN commits; "
+            "read the lower bound, not the midpoint)"
         )
     for commit in result["commits"]:
         if commit["state"] == COVERED:
