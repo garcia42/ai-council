@@ -900,9 +900,9 @@ def _apply_supersedes(rows):
     this reader cannot verify must not be able to hide a row -- an unverifiable
     supersede is an error and retires nothing.
 
-    Refusing to retire a row carrying predictions or a forecastState is the guard that
-    matters: that row is the evidence the kill criterion is scored on, and no approval
-    turns erasing it into a correction.
+    Refusing to retire a row carrying predictions or a forecastState preserves sealed
+    evidence, but it does not prove duplication. The target and retained witness must
+    also share every comparable identifier and have one unique active retained owner.
     \"\"\"
 
     normalized = []

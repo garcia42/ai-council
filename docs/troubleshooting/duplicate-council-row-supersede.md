@@ -1,11 +1,11 @@
 # A council row that should not exist
 
-> **STOP — not approved for activation.** Issue #33 implements the duplicate predicate
-> and append-time composition rules in
-> [the issue #32 design](../../design/2026-08-24-duplicate-council-row-supersede.md),
-> but PR #29 still must not be activated or used on the live ledger until its remaining
-> blocking review work, including #34's reader-verification hardening, lands and the
-> resulting commit is separately approved.
+> **STOP — not approved for activation.** Issues #33 and #34 implement the duplicate
+> predicate, append-time composition, and fail-closed reader rules in
+> [the issue #32 design](../../design/2026-08-24-duplicate-council-row-supersede.md).
+> A merge council governs repository merge only: merging the code does not activate it
+> or authorize a live supersede. Runtime activation and any live-ledger record each
+> require their own explicit approval.
 
 ## Problem
 
@@ -77,9 +77,9 @@ forecasts, this playbook does not apply — you have two councils, not one writt
 
 ## Target-state solution
 
-The procedure below describes the operational sequence only after #33 and #34 have
-implemented the design and the resulting runtime has separately been approved for
-activation. It is not executable against PR #29 as reviewed.
+The procedure below describes the operational sequence only after the corrected code has
+merged and its resulting runtime has separately been approved, rehearsed, activated, and
+verified. Do not execute it merely because the repository contains the implementation.
 
 **Nothing else can cure this.** `repair-tail` removes only a line that fails JSON parsing,
 and these parse. `recover-brief` rewrites `blindSeat.brief`; pointing a duplicate at a
@@ -139,11 +139,11 @@ append any bytes to the ledger, and no in-tool mechanism can prevent it. What th
 record adds is that the correction is now itself append-only, attributed, and re-derivable
 — an operator, a reason, an approval reference, and a digest that pins one exact row.
 
-Known gaps, deliberately not closed here:
+Known gaps and activation prerequisites:
 
-- Until #34 lands, the rendered reader does not re-check every attribution/record-shape
-  guard and retains a two-tuple compatibility path without raw identities. It is unsafe
-  to activate or use this mechanism while that blocker remains.
+- Activation must confirm the runtime-only `test_blind_seat_kill_criterion.py` supplies
+  raw-line SHA-256 triples. If it still supplies two-item identities, update it first;
+  the corrected reader deliberately fails those identities closed.
 - The record retires a row from the tally; it does not mark the retired row itself. A
   reader that does not implement supersedes still counts it, which is why activation
   order matters.

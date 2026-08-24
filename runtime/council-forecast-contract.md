@@ -181,8 +181,8 @@ that the reader counts as a second completed council, inflating the denominator 
 retire/keep decision rests on. The row is not wrong in a field, so nothing that edits a field can
 cure it, and an append-only ledger must not grow a delete.
 
-Say it by appending. On the ledger authority host, with explicit principal approval, name the exact
-row by both its line number and the SHA-256 of its complete physical line:
+Say it by appending. On the ledger authority host, with explicit principal approval, name both the
+target and the retained original by line number and the SHA-256 of each complete physical line:
 
 ```
 sed -n '<line>p' <ledger> | sha256sum
@@ -190,20 +190,34 @@ sed -n '<line>p' <ledger> | sha256sum
 python3 /home/trader/.claude/knowledge/council-eval/predictions_report.py \
   supersede --log <ledger> --line <line> \
   --confirm-raw-line-sha256 <digest of that exact line> \
+  --duplicate-of-line <retained-line> \
+  --confirm-duplicate-of-raw-line-sha256 <digest of retained exact line> \
   --reason <why this row should not exist> \
   --operator <name> --reference <where approval was given> --check-only
 ```
 
-Drop `--check-only` to append. The appender refuses a digest that does not match the named line, a
-line that is not a `council` row, a line already superseded, and — the guard that matters — any row
-carrying `predictions` or a `forecastState`. That row holds the sealed forecasts the criterion is
-scored on; retiring it would be erasing a council, not correcting one, and no approval changes that.
+Drop `--check-only` to append. A supersede asserts that the pinned target duplicates the pinned
+retained row; it does not merely assert that the target should not count. The appender requires at
+least one comparable `runId` or lexically normalized absolute-POSIX `blindSeat.brief`, requires every
+comparable identifier to agree, and requires the retained row to be its one unique active owner.
+The target and witness must be distinct, earlier, active `council` rows with matching raw-line
+digests. The target must also carry no non-null `forecastState` and no predictions other than exactly
+`[]`. That last check preserves sealed evidence, but is necessary rather than sufficient: many
+genuine legacy councils also carry no sealed forecasts.
 
-The kill criterion re-checks every one of those guards when it reads the record, and a supersede it
-cannot verify is an error that retires nothing. It therefore only works against a reader that has
-the change: activate the runtime first, then append. Never point a supersede at a row a seat
-actually answered, and never repair a duplicate by rewriting its brief — that would assert the seat
-read a brief it never read.
+Validity is fixed against the physical prefix at append time. Accepted retirements are never
+reconsidered against final ledger state: later identifier collisions cannot revoke an earlier edge,
+and a later supersede may retire the retained row without reactivating its duplicate. Final-state
+validity would make an immutable audit fact change retroactively and make appender/reader agreement
+depend on future rows.
+
+The kill criterion independently replays every shape, identity, ordering, composition, approval,
+timestamp, and digest guard. A row without raw-line identity, or any supersede it cannot verify, is
+an error that retires nothing. Activation must first confirm that the runtime-only
+`test_blind_seat_kill_criterion.py` caller provides `(line, row, raw_sha256)` triples; the reader
+does not accept two-item identities. Activate and verify the reader before appending any supersede.
+Never point one at a row a seat actually answered, and never repair a duplicate by rewriting its
+brief — that would assert the seat read a brief it never read.
 
 ### V2 usefulness capture activation gate
 
