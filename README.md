@@ -22,6 +22,7 @@ problems—or are they correlated copies producing expensive reassurance?
 | Off-host durability age and verified-restore evidence | Implemented and evidence-gated |
 | Content-manifested local snapshot and clean restore | Rehearsal-only |
 | Live V2 capture activation | Evidence-gated; not activated by install or this release |
+| Review-coverage reconciliation over a commit window | Implemented and tested |
 | Seat ranking, weighting, admission, or retirement | Deliberately not implemented |
 
 Installing this repository does not activate V2 on a live ledger. The first prospective cohort is
@@ -209,6 +210,60 @@ observation time.
 For a binary outcome, Brier is `(forecast probability - observed outcome)^2`. Lower is better:
 `0` is perfect, `0.25` is the score from always forecasting 50%, and `1` is a fully confident miss.
 
+## Review coverage: the denominator the forecasts do not have
+
+A skipped review writes nothing. Every V1 and V2 report is therefore a rate over councils that
+*happened*, and says nothing about changes that shipped with no council at all. More seats cannot
+fix that: more analysis inside an unobserved optional path cannot establish effectiveness.
+
+`coverage` closes the gap by joining `git log` over an explicit window to the `commits` array of
+council rows:
+
+```sh
+python -m council_tools.cli coverage \
+  --repo /path/to/repo --log ./council.jsonl \
+  --since 2026-09-01T00:00:00Z --until 2026-10-01T00:00:00Z
+```
+
+Every commit in the window gets exactly one state:
+
+| State | Definition |
+| --- | --- |
+| `COVERED` | Its full SHA appears in the `commits` array of a `council` row |
+| `EXEMPT` | Its message carries a `Council-Exempt: <reason>` trailer with a non-empty reason |
+| `UNKNOWN` | A pre-convention row names an ancestor of it, written after it, but does not say which commits were read |
+| `UNCOVERED` | Nothing above; it shipped and no row claims it |
+
+There is no presumed exemption. A commit is never excused for looking mechanical, and an exemption
+trailer with an empty reason fails closed to `UNCOVERED` rather than silently leaving the
+denominator.
+
+Exit codes are `0` clean, `1` something shipped unreviewed, and `3` cannot determine. `2` is
+deliberately unused, because argparse and the interpreter both exit 2 and a coverage rate must never
+be confusable with a command that did not run. A malformed or inverted window is a usage error and
+exits 2 without reporting anything.
+
+A wrong denominator is worse than none, so the reconciler prints no rate at all — and no counts and
+no per-commit classification — when:
+
+- any ledger line is unparseable, or a council row records `commits` without a readable `ts`;
+- no row has ever recorded `commits` as an array of full 40-character SHAs;
+- the window starts before the first row that did.
+
+The instrumentation epoch is derived from the ledger as the timestamp of the earliest conforming
+row, and `--instrumented-since` overrides it. The skip rate before that convention is **not
+recoverable** from this evidence and is never estimated. Existing rows are inconsistent — an object
+such as `{"base": "<sha>"}` names the branch point, not what was read — so those rows produce
+`UNKNOWN`, not a guess.
+
+When any commit is `UNKNOWN`, the rate is reported as a band rather than a point: its lower bound
+counts every unknown as uncovered, its upper bound counts every unknown as covered, and the band
+width *is* the ambiguity. Merge commits are excluded by default, `--include-merges` keeps them, and
+the number excluded is always reported.
+
+Blocking a deployment on an uncovered commit is deliberately out of scope. That is a live policy
+decision, not a reporting one.
+
 ## V2 workflow
 
 V2 is intentionally more demanding because it is preserving evidence, not just a score. The
@@ -333,6 +388,7 @@ adjudication and statistical rules.
 | `src/council_tools/gcs_durability.py` | Narrow create-only Google Cloud Storage adapter |
 | `src/council_tools/activation_evidence.py` | Source-bound manifest validation and activation readiness evaluation |
 | `src/council_tools/capture_runtime.py` | Cross-module atomic integration and uniform-binding preflight |
+| `src/council_tools/council_coverage.py` | Review-coverage reconciler: joins `git log` to council rows over a window |
 | `src/council_tools/cli.py` | Standalone and deployment command-line interface |
 | `runtime/` | Pinned Claude-based runtime adapter and operating contract |
 | `install.py` | Checked, backed-up, reversible local runtime installer |

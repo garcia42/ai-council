@@ -12,6 +12,36 @@ from unittest import mock
 import install
 
 
+class InstalledSourceCustodyTest(unittest.TestCase):
+    """The reconciler must reach council-eval from a tracked source.
+
+    The gap issue 24 records is a tool that existed only in an install
+    directory, untracked by any repository.  Nothing prevents that recurring
+    unless the installed pin actually covers the file, so assert it here rather
+    than trusting the glob to keep matching.
+    """
+
+    def test_pin_covers_every_package_module_including_the_reconciler(self):
+        relatives = install._installed_source_relatives(install.REPO)
+        self.assertIn(Path("src/council_tools/council_coverage.py"), relatives)
+        self.assertIn(Path("src/council_tools/cli.py"), relatives)
+
+    def test_source_digest_changes_when_the_reconciler_changes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            copy = Path(temporary) / "repo"
+            shutil.copytree(
+                install.REPO,
+                copy,
+                ignore=shutil.ignore_patterns("__pycache__", ".git", "*.pyc"),
+            )
+            before = install._source_digest(copy)
+            module = copy / "src/council_tools/council_coverage.py"
+            module.write_text(
+                module.read_text(encoding="utf-8") + "\n# drift\n", encoding="utf-8"
+            )
+            self.assertNotEqual(install._source_digest(copy), before)
+
+
 class InstallerTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

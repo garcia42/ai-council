@@ -29,6 +29,13 @@ from .capture_runtime import (
     validate_capture_ledger,
 )
 from .capture_schema import strict_json_loads
+from .council_coverage import (
+    CoverageError,
+    coverage_exit_code,
+    format_coverage,
+    parse_timestamp,
+    reconcile_coverage,
+)
 from .evidence_backup import (
     create_evidence_snapshot,
     restore_evidence_snapshot,
@@ -970,6 +977,38 @@ def command_plan_brief_recovery(args: argparse.Namespace) -> int:
     return 0
 
 
+def _coverage_timestamp(value: str) -> datetime:
+    """argparse converter, so a malformed window is a usage error (exit 2)."""
+
+    try:
+        return parse_timestamp(value, field="window bound")
+    except CoverageError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+def command_coverage(args: argparse.Namespace) -> int:
+    until = args.until or datetime.now(timezone.utc)
+    if args.since >= until:
+        # A usage error must not be reportable as a coverage verdict, so this
+        # exits 2 like argparse rather than 1 or 3.
+        print("--since must be strictly before --until", file=sys.stderr)
+        return 2
+    result = reconcile_coverage(
+        repo=args.repo,
+        log_path=args.log,
+        since=args.since,
+        until=until,
+        ref=args.ref,
+        include_merges=args.include_merges,
+        instrumented_since=args.instrumented_since,
+    )
+    if args.json:
+        print(json.dumps(result, sort_keys=True))
+    else:
+        print(format_coverage(result))
+    return coverage_exit_code(result)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -992,6 +1031,20 @@ def build_parser() -> argparse.ArgumentParser:
     report.add_argument("--today")
     report.add_argument("--json", action="store_true")
     report.set_defaults(func=command_report)
+
+    coverage = sub.add_parser(
+        "coverage",
+        help="reconcile shipped commits against council rows over a window",
+    )
+    coverage.add_argument("--repo", required=True)
+    coverage.add_argument("--log", default=DEFAULT_LOG)
+    coverage.add_argument("--since", required=True, type=_coverage_timestamp)
+    coverage.add_argument("--until", type=_coverage_timestamp)
+    coverage.add_argument("--ref", default="HEAD")
+    coverage.add_argument("--instrumented-since", type=_coverage_timestamp)
+    coverage.add_argument("--include-merges", action="store_true")
+    coverage.add_argument("--json", action="store_true")
+    coverage.set_defaults(func=command_coverage)
 
     record = sub.add_parser("record")
     record.add_argument("--log", default=DEFAULT_LOG)
