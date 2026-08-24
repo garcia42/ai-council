@@ -8,6 +8,7 @@ import ctypes
 import errno
 import hashlib
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -683,7 +684,8 @@ def _upsert_section(text: str, *, begin: str, end: str, body: str, heading: str)
     ``_upsert_block`` inserts *before* its marker, which suits a block that is
     additional to the document.  This one takes ownership of a section that is
     already there: on first install it replaces the span from ``heading`` up to
-    the next top-level heading, so the section stops existing in two places.
+    the next heading at the same or a higher level, so the section stops
+    existing in two places.
     """
 
     replacement = _block(begin, body, end)
@@ -700,10 +702,13 @@ def _upsert_section(text: str, *, begin: str, end: str, body: str, heading: str)
     position = _line_anchored_index(text, heading)
     if position < 0:
         raise InstallError(f"install marker not found: {heading}")
-    following = text.find("\n## ", position + len(heading))
-    if following < 0:
+    heading_level = len(heading) - len(heading.lstrip("#"))
+    following = re.compile(
+        rf"^#{{1,{heading_level}}}[ \t]+", re.MULTILINE
+    ).search(text, position + len(heading))
+    if following is None:
         return text[:position] + replacement
-    return text[:position] + replacement + "\n" + text[following + 1 :]
+    return text[:position] + replacement + "\n" + text[following.start() :]
 
 
 def _runtime_targets(root: Path) -> tuple[Path, ...]:

@@ -259,6 +259,32 @@ class InstallerTest(unittest.TestCase):
         clean, differences = install.check(self.root)
         self.assertTrue(clean, differences)
 
+    def test_reinstall_adopts_the_live_document_shape_without_losing_notes(self):
+        skill = self.root / ".claude/skills/council/SKILL.md"
+        skill.write_text(
+            "# Council\n\n"
+            f"{install.FORECAST_BEGIN}\n\nold forecast\n\n"
+            f"{install.FORECAST_END}\n\n"
+            "## Steps\n\nOld live steps\n\n"
+            "## Notes\n\nKeep live notes\n",
+            encoding="utf-8",
+        )
+
+        install.install(self.root, self.backups)
+        first = skill.read_bytes()
+        text = first.decode("utf-8")
+        self.assertLess(
+            text.index(install.FORECAST_BEGIN), text.index(install.STEPS_BEGIN)
+        )
+        self.assertLess(text.index(install.STEPS_END), text.index("## Notes"))
+        self.assertIn("## Notes\n\nKeep live notes\n", text)
+        self.assertNotIn("Old live steps", text)
+
+        install.install(self.root, self.backups)
+        self.assertEqual(skill.read_bytes(), first)
+        clean, differences = install.check(self.root)
+        self.assertTrue(clean, differences)
+
     def test_forecast_block_is_placed_above_the_adopted_procedure(self):
         install.install(self.root, self.backups)
         text = (self.root / ".claude/skills/council/SKILL.md").read_text(
@@ -299,6 +325,45 @@ class InstallerTest(unittest.TestCase):
             heading="## Steps\n",
         )
         self.assertEqual(again, result)
+
+    def test_section_adoption_includes_deeper_subheadings(self):
+        text = (
+            "# Council\n\n## Steps\n\nold\n\n"
+            "### Detail\n\nalso old\n\n## Notes\n\nkeep me\n"
+        )
+        result = install._upsert_section(
+            text,
+            begin=install.STEPS_BEGIN,
+            end=install.STEPS_END,
+            body="managed",
+            heading="## Steps\n",
+        )
+        self.assertNotIn("### Detail", result)
+        self.assertNotIn("also old", result)
+        self.assertIn("## Notes\n\nkeep me\n", result)
+
+    def test_section_adoption_preserves_an_adjacent_peer_heading(self):
+        text = "# Council\n\n## Steps\n## Notes\n\nkeep me\n"
+        result = install._upsert_section(
+            text,
+            begin=install.STEPS_BEGIN,
+            end=install.STEPS_END,
+            body="managed",
+            heading="## Steps\n",
+        )
+        self.assertIn("## Notes\n\nkeep me\n", result)
+
+    def test_section_adoption_preserves_a_following_higher_level_heading(self):
+        text = "# Council\n\n## Steps\n\nold\n\n# Appendix\n\nkeep me\n"
+        result = install._upsert_section(
+            text,
+            begin=install.STEPS_BEGIN,
+            end=install.STEPS_END,
+            body="managed",
+            heading="## Steps\n",
+        )
+        self.assertNotIn("old", result)
+        self.assertIn("# Appendix\n\nkeep me\n", result)
 
     def test_section_adoption_refuses_a_document_without_the_heading(self):
         with self.assertRaises(install.InstallError):
