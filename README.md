@@ -243,7 +243,7 @@ python -m council_tools.cli recording-coverage --log ./council.jsonl
 
 It reads the ledger only. It never invokes git, never classifies a commit, and never reports that a
 change went unreviewed. That restraint is the design: a reader that *did* join against version
-control had to work from a key present in a sixth of rows, and inherited a false-accusation rate to
+control had to work from a key present in a quarter of rows, and inherited a false-accusation rate to
 match.
 
 Rows that reviewed a staged or uncommitted tree are called out separately rather than counted as

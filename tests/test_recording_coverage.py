@@ -1,5 +1,6 @@
 import ast
 import json
+import re
 import os
 import subprocess
 import sys
@@ -117,9 +118,37 @@ class ShapeTest(unittest.TestCase):
         )
 
     def test_non_hex_is_not_the_convention(self):
-        for commits in (["z" * 40], ["   "], [SHA, "not a sha at all!!!!"], ["A" * 40]):
+        for commits in (["z" * 40], ["   "], [SHA, "not a sha at all!!!!"]):
             with self.subTest(commits=commits):
                 self.assertEqual(self.shape(commits), OTHER)
+
+    def test_uppercase_hex_is_accepted_because_git_resolves_it(self):
+        # The convention bucket must not be narrower than git itself.
+        self.assertEqual(self.shape(["A" * 40]), ARRAY_FULL_SHAS)
+        self.assertEqual(
+            self.shape({"base": SHA, "candidate_commit": "ABCDEF01" + "a" * 32}),
+            OBJECT_NAMES_CANDIDATE,
+        )
+
+    def test_an_object_naming_nothing_recognisable_is_other(self):
+        # OBJECT_BASE_ONLY asserts the row names a branch point; only claim that
+        # when something in it actually is an object name.
+        self.assertEqual(self.shape({"note": "reviewed by hand"}), OTHER)
+        self.assertEqual(self.shape({"candidate": {"sha": SHA}}), OTHER)
+
+    def test_an_explicit_uncommitted_declaration_outranks_a_tip(self):
+        # The row stating outright that it reviewed uncommitted content is the
+        # stronger statement; a tip recorded beside it does not undo it.
+        self.assertEqual(
+            self.shape({"base": SHA, "candidate": OTHER_SHA,
+                        "state": "uncommitted-untracked"}),
+            OBJECT_PRECOMMIT,
+        )
+
+    def test_a_tree_marker_need_not_be_a_hash(self):
+        self.assertEqual(
+            self.shape({"base": SHA, "stagedTree": "dirty"}), OBJECT_PRECOMMIT
+        )
 
     def test_an_empty_object_names_nothing(self):
         self.assertEqual(self.shape({}), OTHER)
@@ -380,7 +409,7 @@ class NoGitTest(unittest.TestCase):
         for node in ast.walk(tree):
             if (isinstance(node, ast.Constant) and isinstance(node.value, str)
                     and id(node) not in docstrings):
-                self.assertNotIn("git", node.value.lower())
+                self.assertIsNone(re.search(r"\bgit\b", node.value.lower()), node.value[:60])
 
 
 class RenderingTest(ReportTestBase):

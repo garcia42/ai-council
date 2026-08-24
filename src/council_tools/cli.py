@@ -987,9 +987,6 @@ def _recording_timestamp(value: str) -> datetime:
 
 
 def command_recording_coverage(args: argparse.Namespace) -> int:
-    if args.since and args.until and args.since >= args.until:
-        print("--since must be strictly before --until", file=sys.stderr)
-        return 2
     try:
         result = report_recording_coverage(
             log_path=args.log, since=args.since, until=args.until

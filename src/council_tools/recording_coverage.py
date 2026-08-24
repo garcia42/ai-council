@@ -99,7 +99,9 @@ def _is_object_name(value: object, *, exact: int | None = None) -> bool:
         return False
     if exact is None and not 7 <= len(value) <= 40:
         return False
-    return bool(value) and set(value) <= _HEX
+    # Git resolves uppercase object names, so the convention bucket must not be
+    # narrower than git itself.
+    return bool(value) and set(value.lower()) <= _HEX
 
 
 class RecordingCoverageError(ValueError):
@@ -141,8 +143,14 @@ def classify_shape(row: Mapping[str, Any]) -> str:
     ``{"base": B, "candidate_commit": C, "candidate_tree": null}`` carries a
     tree key whose value is null and a candidate whose value is a real commit;
     keying off presence alone filed it as a tree review and dropped it from the
-    adoption numerator.  On the live ledger that mis-scored six rows, understated
+    adoption numerator.  When found, that mis-scored six live rows, understated
     adoption by a third and overstated tree reviews by three quarters.
+
+    The key names themselves are not trustworthy either, which is the argument
+    this whole module is making: one live row records a value under
+    ``candidate_commit`` that another records under ``candidate_tree``.  Telling
+    those apart would need the git join this module deliberately does not do, so
+    the tree count is an upper bound on real tree reviews.
     """
 
     if "commits" not in row:
@@ -162,22 +170,34 @@ def classify_shape(row: Mapping[str, Any]) -> str:
             return ARRAY_FULL_SHAS
         return ARRAY_ABBREVIATED
     if isinstance(commits, Mapping):
-        # Naming the reviewed tip is the stronger, joinable fact, so it is
-        # tested before the tree keys: a row may carry both when a staged tree
-        # was reviewed and then committed.
+        # An explicit "uncommitted" declaration is the row stating outright what
+        # it reviewed, so it outranks everything: a tip recorded beside it does
+        # not undo the statement that the reviewed content was not a commit.
+        if any(
+            isinstance(value, str) and value.startswith(_PRECOMMIT_VALUE_PREFIX)
+            for value in commits.values()
+        ):
+            return OBJECT_PRECOMMIT
+        # Otherwise naming the reviewed tip is the stronger, joinable fact, so
+        # it is tested before the tree keys: a row may carry both when a staged
+        # tree was reviewed and then committed.
         if any(_is_object_name(commits.get(key)) for key in _REVIEWED_TIP_KEYS):
             return OBJECT_NAMES_CANDIDATE
+        # A tree marker need not be a hash -- "dirty" is a legitimate value --
+        # so unlike the tip keys this accepts any non-empty string. Do not
+        # "fix" that into symmetry with the check above.
         if any(
             isinstance(commits.get(key), str) and commits.get(key)
             for key in _TREE_KEYS
         ):
             return OBJECT_PRECOMMIT
-        for value in commits.values():
-            if isinstance(value, str) and value.startswith(_PRECOMMIT_VALUE_PREFIX):
-                return OBJECT_PRECOMMIT
-        if not commits:
-            return OTHER
-        return OBJECT_BASE_ONLY
+        # Only claim it names a branch point if something in it actually is an
+        # object name. Asserting a positive fact the code never checked is what
+        # made the presence-vs-value bug above possible; the array branch
+        # already routes unrecognisable content to OTHER, and so does this.
+        if any(_is_object_name(value) for value in commits.values()):
+            return OBJECT_BASE_ONLY
+        return OTHER
     return OTHER
 
 
