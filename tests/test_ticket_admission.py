@@ -144,6 +144,14 @@ class TextSubclass(str):
     pass
 
 
+class ExplodingKey:
+    def __hash__(self):
+        return hash("repository")
+
+    def __eq__(self, other):
+        raise RuntimeError("untrusted key equality must not run")
+
+
 class TicketAdmissionTest(unittest.TestCase):
     def assertReasons(self, snapshot, context, evidence, expected):
         result = evaluate_ticket_admission(snapshot, context, evidence)
@@ -228,6 +236,22 @@ class TicketAdmissionTest(unittest.TestCase):
                     result = evaluate_ticket_admission(snapshot, context, evidence)
                     self.assertIn(reason, result.reasons)
                     self.assertFalse(result.structurally_eligible)
+
+    def test_hostile_plain_dict_keys_never_escape_shape_validation(self):
+        snapshot, context, evidence = valid_inputs()
+        hostile = {ExplodingKey(): None}
+        self.assertReasons(
+            hostile, context, evidence, ("invalid-snapshot",)
+        )
+        self.assertReasons(
+            snapshot, hostile, evidence, ("invalid-context",)
+        )
+
+        hostile_closure = copy.deepcopy(context)
+        hostile_closure["dependencyClosure"] = [hostile]
+        self.assertReasons(
+            snapshot, hostile_closure, evidence, ("invalid-context",)
+        )
 
     def test_snapshot_shape_is_exact_bounded_and_read_before_parsing(self):
         snapshot, context, evidence = valid_inputs()
@@ -503,6 +527,14 @@ class TicketAdmissionTest(unittest.TestCase):
             snapshot,
             context,
             [malformed_match],
+            ("invalid-review-evidence",),
+        )
+
+        uninitialized = object.__new__(ticket_review.TicketReview)
+        self.assertReasons(
+            snapshot,
+            context,
+            [uninitialized],
             ("invalid-review-evidence",),
         )
 

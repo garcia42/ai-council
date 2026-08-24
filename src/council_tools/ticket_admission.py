@@ -129,8 +129,18 @@ def _positive_issue_number(value: Any) -> bool:
     return type(value) is int and 1 <= value <= MAX_ISSUE_NUMBER
 
 
+def _has_exact_plain_keys(value: Any, expected: frozenset[str]) -> bool:
+    """Check exact plain-dict keys without invoking untrusted key equality."""
+
+    return (
+        type(value) is dict
+        and len(value) == len(expected)
+        and all(type(key) is str and key in expected for key in value)
+    )
+
+
 def _snapshot(value: Any) -> _IssueSnapshot | None:
-    if type(value) is not dict or set(value) != SNAPSHOT_KEYS:
+    if not _has_exact_plain_keys(value, SNAPSHOT_KEYS):
         return None
     repository = value["repository"]
     issue_number = value["issueNumber"]
@@ -161,7 +171,7 @@ def _snapshot(value: Any) -> _IssueSnapshot | None:
 
 
 def _context(value: Any) -> _AdmissionContext | None:
-    if type(value) is not dict or set(value) != CONTEXT_KEYS:
+    if not _has_exact_plain_keys(value, CONTEXT_KEYS):
         return None
     repository = value["repository"]
     issue_number = value["issueNumber"]
@@ -184,7 +194,7 @@ def _context(value: Any) -> _AdmissionContext | None:
 
     normalized: list[_DependencyState] = []
     for item in closure:
-        if type(item) is not dict or set(item) != CLOSURE_KEYS:
+        if not _has_exact_plain_keys(item, CLOSURE_KEYS):
             return None
         dependency_issue_number = item["issueNumber"]
         state = item["state"]
@@ -214,9 +224,15 @@ def _evidence_shape(value: Any) -> list[TicketReview] | None:
         or any(type(item) is not TicketReview for item in value)
     ):
         return None
-    for item in value:
-        if type(item.run_id) is not str or type(item.contract_sha256) is not str:
-            return None
+    try:
+        for item in value:
+            if (
+                type(item.run_id) is not str
+                or type(item.contract_sha256) is not str
+            ):
+                return None
+    except Exception:
+        return None
     return value
 
 
