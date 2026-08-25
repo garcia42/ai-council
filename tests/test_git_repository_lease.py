@@ -320,3 +320,105 @@ class BorrowTests(LeaseTestCase):
         text = module.__doc__ or ""
         self.assertIn("does not by itself protect an in-flight operation", text)
         self.assertIn("process-local", text)
+
+
+from council_tools.git_repository_lease import (  # noqa: E402
+    TERMINAL_ACTIVE,
+    TERMINAL_REFUSED_IDENTITY,
+    TERMINAL_REMOVED,
+    remove_lease,
+)
+
+
+class RemovalTests(LeaseTestCase):
+    def test_a_fresh_lease_is_active(self):
+        self.assertEqual(self.lease().terminal_state, TERMINAL_ACTIVE)
+
+    def test_removal_deletes_the_tree_and_closes_the_descriptor(self):
+        held = acquire_lease(self.root, "claim.git")
+        (Path(held.path) / "objects").mkdir()
+        self.assertEqual(remove_lease(held), TERMINAL_REMOVED)
+        self.assertFalse(Path(held.path).exists())
+        self.assertEqual(held.terminal_state, TERMINAL_REMOVED)
+        with self.assertRaises(OSError):
+            os.fstat(held.descriptor)
+
+    def test_removal_is_refused_while_borrowed_and_deletes_nothing(self):
+        # Removing during a borrow breaks the operation in flight; it is not
+        # merely untidy.
+        held = self.lease()
+        with held.borrow():
+            with self.assertRaises(GitRepositoryLeaseError) as caught:
+                remove_lease(held)
+            self.assertEqual(caught.exception.code, "lease-is-borrowed")
+        self.assertTrue(Path(held.path).is_dir())
+        self.assertEqual(held.terminal_state, TERMINAL_ACTIVE)
+
+    def test_a_substituted_directory_at_the_retained_path_is_not_deleted(self):
+        # Deleting whatever now sits at the retained path would be the exact
+        # substitution attack the lease exists to prevent, performed by the
+        # cleanup path itself.
+        held = acquire_lease(self.root, "claim.git")
+        original = Path(held.path)
+        os.rename(original, self.root / "moved.git")
+        decoy = original
+        decoy.mkdir()
+        (decoy / "SOMEONE_ELSES_DATA").write_text("keep me", encoding="utf-8")
+
+        with self.assertRaises(GitRepositoryLeaseError) as caught:
+            remove_lease(held)
+        self.assertEqual(caught.exception.code, "identity-mismatch")
+        self.assertTrue((decoy / "SOMEONE_ELSES_DATA").exists(), "the decoy must survive")
+        self.assertEqual(held.terminal_state, TERMINAL_REFUSED_IDENTITY)
+        os.close(held.descriptor)
+
+    def test_a_missing_retained_path_is_refused_and_recorded(self):
+        held = acquire_lease(self.root, "claim.git")
+        os.rename(held.path, self.root / "moved.git")
+        with self.assertRaises(GitRepositoryLeaseError) as caught:
+            remove_lease(held)
+        self.assertEqual(caught.exception.code, "path-unreadable")
+        self.assertEqual(held.terminal_state, TERMINAL_REFUSED_IDENTITY)
+        os.close(held.descriptor)
+
+    def test_a_second_removal_is_reported_rather_than_attempted(self):
+        # A second unlink could hit a path something else has since reused.
+        held = acquire_lease(self.root, "claim.git")
+        remove_lease(held)
+        with self.assertRaises(GitRepositoryLeaseError) as caught:
+            remove_lease(held)
+        self.assertEqual(caught.exception.code, "already-terminal")
+
+    def test_removal_after_a_refusal_is_reported_not_retried(self):
+        held = acquire_lease(self.root, "claim.git")
+        os.rename(held.path, self.root / "moved.git")
+        with self.assertRaises(GitRepositoryLeaseError):
+            remove_lease(held)
+        with self.assertRaises(GitRepositoryLeaseError) as caught:
+            remove_lease(held)
+        self.assertEqual(caught.exception.code, "already-terminal")
+        os.close(held.descriptor)
+
+    def test_a_non_lease_value_is_refused(self):
+        for value in (None, "/tmp", 3, object()):
+            with self.subTest(value=repr(value)[:30]):
+                with self.assertRaises(GitRepositoryLeaseError) as caught:
+                    remove_lease(value)
+                self.assertEqual(caught.exception.code, "invalid-lease")
+
+    def test_borrows_are_checked_before_identity(self):
+        # Ordering matters: a borrowed lease whose identity also drifted must
+        # report the borrow, because that is the condition that would break an
+        # operation rather than merely delete the wrong thing.
+        held = self.lease()
+        with held.borrow():
+            with self.assertRaises(GitRepositoryLeaseError) as caught:
+                remove_lease(held)
+            self.assertEqual(caught.exception.code, "lease-is-borrowed")
+
+    def test_the_module_records_why_removal_is_ordered(self):
+        import council_tools.git_repository_lease as module
+
+        text = module.__doc__ or ""
+        self.assertIn("break something already in flight", text)
+        self.assertIn("substitution attack", text)
