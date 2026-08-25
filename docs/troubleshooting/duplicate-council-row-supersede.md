@@ -246,11 +246,10 @@ cure.
 
 **5. Rollback: one half is reversible and the other is not.** Be sure of this before step 3.
 
-*The runtime install is reversible.* `install.py restore --backup <the directory step 1c
-printed>` puts the previous runtime back, from the same source root and under the same rules.
-Note the known defect: **`restore()` does not roll back a kill-criterion reader change**
-(#36), so a restore may leave the reader ahead of the rest of the runtime. Verify both halves
-afterwards with the same two `grep`s from step 1.
+*The runtime install is reversible, in one order and not the other.* The full procedure is
+**Rolling back a runtime install** below. Read it before step 3, not after: run the two
+commands in the wrong order and you get a total council-tooling outage with no council tooling
+available to diagnose it.
 
 *The appended supersede record is not.* Nothing in this repository reverses one, because the
 store is append-only and `validate_supersede` accepts only a `kind: "council"` target — **a
@@ -262,6 +261,71 @@ derived, step 2 rehearses against a copy rather than dry-running against the liv
 `--check-only` exists, and `recover-brief` now refuses in code any line a supersede record
 names (#35). If a procedure for retracting a supersede is ever written, cross-reference it
 here.
+
+## Rolling back a runtime install
+
+Measured on a staged root (`RestoreDoesNotRollBackTheReaderTest` in `tests/test_install.py`),
+after an install that changed the gate reader:
+
+| Runtime target | What `install.py restore` puts back |
+| --- | --- |
+| `predictions_report.py` | the pre-install bytes — **rolls back** |
+| `SKILL.md`, `CLAUDE.md` | the pre-install bytes — **roll back** |
+| `blind_seat_kill_criterion.py` | the **post**-install bytes — **does not roll back** |
+
+**`restore` re-applies both rendering transforms to the payload it puts back**, so the
+criterion it restores is the reader you were trying to leave, not the one you were trying to
+return to.
+
+### Why the order matters
+
+The restored `predictions_report.py` pins `SOURCE_ROOT` and `EXPECTED_COMMIT`, and asserts at
+import that the source directory still holds that commit. Restore the shim to the old commit
+while `/home/trader/council-tools` still stands on the new one and **every invocation exits
+with `installed pin does not match source`** — including the ones you would use to work out
+what happened. Move the checkout first.
+
+```
+# 1. move the source back FIRST
+git -C /home/trader/council-tools checkout <the previous commit>
+git -C /home/trader/council-tools status --porcelain=v1 --untracked-files=all   # must be empty
+
+# 2. then restore, using the backup path the install printed
+/home/trader/ai-council/.venv/bin/python /home/trader/council-tools/install.py \
+  restore --backup <that path>
+
+# 3. confirm the pin and the source agree again
+git -C /home/trader/council-tools rev-parse HEAD
+grep -n 'EXPECTED_COMMIT\|SOURCE_ROOT' ~/.claude/knowledge/council-eval/predictions_report.py
+```
+
+The outage window is between step 1 and the end of step 2, exactly as it is for a forward
+install. It is not avoidable; it is only kept short and expected.
+
+### The reader is restored by re-installing, not by restoring
+
+Because the criterion does not roll back, **`restore` alone leaves the new reader in place**.
+To return to the previous reader, check the previous commit out in the source root and run
+`install.py install` from there — the forward path, run backwards. `restore` is for undoing
+everything *except* the reader.
+
+Confirm with `grep -c _apply_supersedes` as in step 1: it reports the reader that is actually
+installed, not the one the backup contained.
+
+### Should `restore` be changed to preserve the pre-change reader?
+
+**No, and the reason is not inertia.** The same code path also re-applies the record-kind
+allowlist, and that half must be re-applied: a criterion restored without the record kinds it
+has to recognise would misread the live ledger — a wrong answer rather than a refusal, which is
+worse than not rolling back at all. Separating the two transforms so one is re-applied and the
+other is not is a real change to the installer with its own failure modes, and it would buy a
+convenience that `install.py install` from the previous commit already provides correctly.
+
+What was missing was never the capability. It was this section. If that judgement is revisited,
+the change belongs in its own ticket, specified as: split the restore-time rendering so
+`_with_attempt_allowlist` is re-applied and `_with_superseded_reader` is not, and prove on a
+staged root that the restored criterion equals the pre-install bytes while still carrying the
+allowlist.
 
 ## Prevention
 
