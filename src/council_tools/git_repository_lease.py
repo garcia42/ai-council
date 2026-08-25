@@ -49,13 +49,23 @@ What this module does **not** promise, stated rather than implied:
   and nothing else: no lock file, no advisory lock, no shared state.  A second
   process removing the tree is not prevented by any borrow held here.
 
-Borrow counting, cleanup, and hygiene inspection are separate outcomes.
+**Removal is the operation that can break something already in flight.**  It is
+therefore ordered against the borrow count, and it confirms identity before it
+unlinks anything.  The leased path is retained for diagnostics, but by the time
+removal runs that path may name a different directory than the lease was opened
+on -- because the whole reason custody is held by descriptor is that a name can
+be replaced.  Removing whatever now sits at the retained path would be the exact
+substitution attack the lease exists to prevent, performed by the cleanup path
+itself.
+
+Hygiene inspection is a separate outcome.
 """
 
 from __future__ import annotations
 
 import errno
 import os
+import shutil
 import stat
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -100,11 +110,21 @@ class LeaseIdentity:
         )
 
 
+#: Terminal states a lease can end in, so a caller can tell a refusal from a
+#: success afterwards.  Without this they look identical from the outside.
+TERMINAL_ACTIVE = "active"
+TERMINAL_REMOVED = "removed"
+TERMINAL_REFUSED_IDENTITY = "refused-identity-mismatch"
+
+TERMINAL_STATES = (TERMINAL_ACTIVE, TERMINAL_REMOVED, TERMINAL_REFUSED_IDENTITY)
+
+
 @dataclass
 class _BorrowState:
     """Mutable borrow count, kept off the frozen lease value itself."""
 
     outstanding: int = 0
+    terminal: str = TERMINAL_ACTIVE
 
 
 @dataclass(frozen=True)
@@ -120,6 +140,12 @@ class BareRepositoryLease:
     path: str
     identity: LeaseIdentity
     _borrows: _BorrowState = field(default_factory=_BorrowState, compare=False, repr=False)
+
+    @property
+    def terminal_state(self) -> str:
+        """What became of this lease: still active, removed, or refused."""
+
+        return self._borrows.terminal
 
     @property
     def borrow_count(self) -> int:
@@ -254,8 +280,60 @@ def release_descriptor(lease: BareRepositoryLease) -> None:
         raise GitRepositoryLeaseError("descriptor-unusable", "lease.descriptor") from error
 
 
+def remove_lease(lease: BareRepositoryLease) -> str:
+    """Remove the leased directory, or refuse and say why.
+
+    Order of checks is the point.  Borrows first, because removing during one
+    breaks the operation in flight rather than merely being untidy.  Identity
+    second, because the retained path may no longer name the directory this
+    lease was opened on, and deleting whatever now sits there would be the
+    substitution attack this design exists to prevent.
+    """
+
+    if type(lease) is not BareRepositoryLease:
+        raise GitRepositoryLeaseError("invalid-lease", "lease")
+
+    if lease.terminal_state != TERMINAL_ACTIVE:
+        # Saying so is better than a second unlink of a path that may since
+        # have been reused by something else entirely.
+        raise GitRepositoryLeaseError("already-terminal", "lease")
+
+    if lease.is_borrowed:
+        raise GitRepositoryLeaseError("lease-is-borrowed", "lease")
+
+    try:
+        lease.revalidate()
+    except GitRepositoryLeaseError:
+        # Retain the evidence rather than delete an unknown replacement.
+        lease._borrows.terminal = TERMINAL_REFUSED_IDENTITY
+        raise
+
+    # Compare what the retained path names *now* against what was leased.  The
+    # descriptor is still the authority; this check is about the path we are
+    # about to hand to a recursive delete.
+    try:
+        at_path = os.stat(lease.path)
+    except OSError as error:
+        lease._borrows.terminal = TERMINAL_REFUSED_IDENTITY
+        raise GitRepositoryLeaseError("path-unreadable", "lease.path") from error
+
+    if (at_path.st_dev, at_path.st_ino) != (lease.identity.device, lease.identity.inode):
+        lease._borrows.terminal = TERMINAL_REFUSED_IDENTITY
+        raise GitRepositoryLeaseError("identity-mismatch", "lease.path")
+
+    os.close(lease.descriptor)
+    shutil.rmtree(lease.path)
+    lease._borrows.terminal = TERMINAL_REMOVED
+    return TERMINAL_REMOVED
+
+
 __all__ = [
     "PRIVATE_DIRECTORY_MODE",
+    "TERMINAL_ACTIVE",
+    "TERMINAL_REFUSED_IDENTITY",
+    "TERMINAL_REMOVED",
+    "TERMINAL_STATES",
+    "remove_lease",
     "PROC_FD_TEMPLATE",
     "BareRepositoryLease",
     "GitRepositoryLeaseError",
