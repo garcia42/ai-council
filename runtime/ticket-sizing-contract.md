@@ -32,6 +32,48 @@ This was not a hypothetical. Qualifying issue #61 twice produced `eligible` and
 declared size upward — declared 1 derived 2, then declared 2 derived 3 — and no review was
 ever bound to a contract declaring the size that review derived.
 
+## Reviewed content must not size itself
+
+The projection withholds `points` and `priority`. That removes the **structured** anchors.
+It does nothing about **semantic** ones, and those are the same failure wearing prose.
+
+Reviewed content — `problemStatement`, `acceptanceCriteria`, `testCommands`, `allowedPaths`,
+`outOfScope`, `rollbackPlan` — must not assert its own size or priority. No "this is a
+one-day change", no "size:1", no "P0", no "trivial".
+
+This is not hypothetical. Re-qualifying issue #61 required rewording an acceptance criterion
+that read:
+
+> Stop at two engineer-days, the independently reviewed size.
+
+to:
+
+> Stop at the independently reviewed size recorded on this ticket.
+
+It did two kinds of damage at once:
+
+1. **It anchored the seats.** A seat reading "two engineer-days" in the work it is sizing is
+   being told the answer.
+2. **It moved the projection digest whenever the size moved.** A derived value inside
+   reviewed content puts the size back inside the reviewed bytes, which is exactly the
+   circularity the projection exists to break. The qualification stops converging again.
+
+The second is the one people miss. The first is a bias; the second is a mechanical
+regression to the pre-projection behaviour.
+
+Refer to "the independently reviewed size recorded on this ticket" instead. Scope belongs in
+`allowedPaths` and `outOfScope`, effort belongs to the seats.
+
+**A lexical rule is not a defence.** This prohibition catches "two engineer-days" and
+"size:1". It does not catch "a quick tidy-up", "should be straightforward", "just a doc fix",
+or a problem statement written to sound small. There is no wording rule that closes semantic
+anchoring, and treating this one as if it did is worse than knowing it is partial.
+
+So the rule has a second half: **a seat that notices an anchor claim reports it rather than
+silently absorbing it.** Say what the claim was, and size the work as described regardless.
+An anchor a seat names is evidence; an anchor a seat quietly accepts is invisible drift, and
+drift is what this whole mechanism exists to stop.
+
 ## Required record
 
 Return one JSON object with these exact top-level keys:
