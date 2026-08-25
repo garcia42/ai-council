@@ -43,6 +43,21 @@ WORK_TYPES = frozenset({"bug", "change", "investigation"})
 PRIORITIES = frozenset({"P0", "P1"})
 PATH_KINDS = frozenset({"file", "directory"})
 ENVELOPE_KEYS = frozenset({"contract", "reviewRef"})
+#: ``readPaths`` is **optional**, and that is a compatibility requirement rather
+#: than a convenience.  Two measured facts force it:
+#:
+#: * :func:`_mapping_with_exact_keys` compares ``set(value) != expected``, so a
+#:   key every contract must carry would make every already-published ticket
+#:   body fail to parse.
+#: * :func:`canonical_contract_bytes` serializes the mapping as it stands, so a
+#:   contract omitting the key digests exactly as it does today, while one
+#:   carrying it -- *even as an empty list* -- digests differently.
+#:
+#: Together those mean absence has to be the only spelling for "no read
+#: dependencies".  An explicitly empty list is rejected, so one meaning never
+#: has two encodings and two digests.
+OPTIONAL_CONTRACT_KEYS = frozenset({"readPaths"})
+
 CONTRACT_KEYS = frozenset(
     {
         "schemaVersion",
@@ -60,8 +75,12 @@ CONTRACT_KEYS = frozenset(
         "outOfScope",
         "dependencies",
         "rollbackPlan",
+        "readPaths",
     }
 )
+#: What a contract must carry.  Everything else in ``CONTRACT_KEYS`` may be
+#: absent, and absence is not an empty value.
+REQUIRED_CONTRACT_KEYS = CONTRACT_KEYS - OPTIONAL_CONTRACT_KEYS
 SIZING_DERIVED_KEYS = frozenset({"points", "priority"})
 SIZING_PROJECTION_KEYS = frozenset(
     {
@@ -78,6 +97,9 @@ SIZING_PROJECTION_KEYS = frozenset(
         "outOfScope",
         "dependencies",
         "rollbackPlan",
+        # Reviewed, not derived: what a ticket depends on *reading* is part of
+        # what a sizing seat is judging, so a seat must be shown it.
+        "readPaths",
     }
 )
 # Declared independently, then checked, so adding a contract field fails here
@@ -145,14 +167,28 @@ class TicketContract:
     out_of_scope: tuple[str, ...]
     dependencies: tuple[int, ...]
     rollback_plan: str
+    #: Paths whose change invalidates this qualification but which the
+    #: implementation may **not** write.  Empty when the contract omitted the
+    #: field, which is the only way to express having none.
+    read_paths: tuple[AllowedPath, ...] = ()
 
     def allows_path(self, candidate: str) -> bool:
-        """Return the single normative, case-sensitive v1 scope decision."""
+        """Return the single normative, case-sensitive v1 scope decision.
+
+        Deliberately unchanged by ``read_paths``: a read dependency grants no
+        write permission anywhere, which is the whole reason it could not be
+        expressed as an allowed path.
+        """
 
         return any(scope.allows(candidate) for scope in self.allowed_paths)
 
+    def reads_path(self, candidate: str) -> bool:
+        """Whether ``candidate`` falls inside a declared read dependency."""
+
+        return any(scope.allows(candidate) for scope in self.read_paths)
+
     def as_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "schemaVersion": self.schema_version,
             "repository": self.repository,
             "issueNumber": self.issue_number,
@@ -169,6 +205,12 @@ class TicketContract:
             "dependencies": list(self.dependencies),
             "rollbackPlan": self.rollback_plan,
         }
+        # Omitted when empty, so a contract without read dependencies round-trips
+        # to the exact bytes -- and therefore the exact digest -- it had before
+        # this field existed.
+        if self.read_paths:
+            payload["readPaths"] = [scope.as_dict() for scope in self.read_paths]
+        return payload
 
 
 @dataclass(frozen=True)
@@ -290,8 +332,18 @@ def _mapping_with_exact_keys(
     *,
     code: str,
     field: str,
+    optional: frozenset[str] = frozenset(),
 ) -> Mapping[str, Any]:
-    if not isinstance(value, Mapping) or set(value) != expected:
+    """Require every expected key, permit the optional ones, refuse the rest.
+
+    ``optional`` defaults to empty, so every existing caller keeps the exact
+    key-set rule it had.
+    """
+
+    if not isinstance(value, Mapping):
+        raise TicketContractError(code, field)
+    present = set(value)
+    if not present.issubset(expected | optional) or not (expected - optional) <= present:
         raise TicketContractError(code, field)
     return value
 
@@ -369,10 +421,36 @@ def _is_repository_path(value: Any) -> bool:
     return True
 
 
+def _read_paths(value: Any) -> tuple[AllowedPath, ...]:
+    """Validate the optional read-dependency scopes.
+
+    An explicitly empty list is refused: absence already means "none", and
+    permitting both spellings would give one meaning two canonical forms and
+    therefore two digests.
+    """
+
+    return _path_scopes(
+        value,
+        field="contract.readPaths",
+        code="invalid-read-paths",
+        entry_code="invalid-read-path",
+    )
+
+
 def _allowed_paths(value: Any) -> tuple[AllowedPath, ...]:
-    field = "contract.allowedPaths"
+    return _path_scopes(
+        value,
+        field="contract.allowedPaths",
+        code="invalid-allowed-paths",
+        entry_code="invalid-allowed-path",
+    )
+
+
+def _path_scopes(
+    value: Any, *, field: str, code: str, entry_code: str
+) -> tuple[AllowedPath, ...]:
     if type(value) is not list or not value or len(value) > MAX_LIST_ITEMS:
-        raise TicketContractError("invalid-allowed-paths", field)
+        raise TicketContractError(code, field)
     result: list[AllowedPath] = []
     seen: set[tuple[str, str]] = set()
     for index, item in enumerate(value):
@@ -380,20 +458,18 @@ def _allowed_paths(value: Any) -> tuple[AllowedPath, ...]:
         item = _mapping_with_exact_keys(
             item,
             ALLOWED_PATH_KEYS,
-            code="invalid-allowed-path-keys",
+            code=f"{entry_code}-keys",
             field=item_field,
         )
         kind = item["kind"]
         if type(kind) is not str or kind not in PATH_KINDS:
-            raise TicketContractError(
-                "invalid-allowed-path-kind", f"{item_field}.kind"
-            )
+            raise TicketContractError(f"{entry_code}-kind", f"{item_field}.kind")
         path = item["path"]
         if not _is_repository_path(path):
-            raise TicketContractError("invalid-allowed-path", f"{item_field}.path")
+            raise TicketContractError(entry_code, f"{item_field}.path")
         identity = (kind, path)
         if identity in seen:
-            raise TicketContractError("duplicate-allowed-path", item_field)
+            raise TicketContractError(f"duplicate-{entry_code.split('invalid-')[-1]}", item_field)
         seen.add(identity)
         result.append(AllowedPath(kind=kind, path=path))
     return tuple(result)
@@ -468,6 +544,7 @@ def validate_ticket_envelope(value: Mapping[str, Any]) -> TicketEnvelope:
         CONTRACT_KEYS,
         code="invalid-contract-keys",
         field="contract",
+        optional=OPTIONAL_CONTRACT_KEYS,
     )
 
     schema_version = raw_contract["schemaVersion"]
@@ -537,6 +614,18 @@ def validate_ticket_envelope(value: Mapping[str, Any]) -> TicketEnvelope:
         field="contract.testCommands",
     )
     allowed_paths = _allowed_paths(raw_contract["allowedPaths"])
+    read_paths: tuple[AllowedPath, ...] = ()
+    if "readPaths" in raw_contract:
+        read_paths = _read_paths(raw_contract["readPaths"])
+        written = {(scope.kind, scope.path) for scope in allowed_paths}
+        for scope in read_paths:
+            # A path the implementation may write is not a path whose change
+            # should invalidate it; declaring both is a contradiction, not a
+            # belt-and-braces.
+            if (scope.kind, scope.path) in written:
+                raise TicketContractError(
+                    "read-path-also-writable", "contract.readPaths"
+                )
     out_of_scope = _require_text_list(
         raw_contract["outOfScope"],
         max_item_length=MAX_TEXT_LENGTH,
@@ -590,6 +679,7 @@ def validate_ticket_envelope(value: Mapping[str, Any]) -> TicketEnvelope:
             out_of_scope=out_of_scope,
             dependencies=dependencies,
             rollback_plan=rollback_plan,
+            read_paths=read_paths,
         ),
         review_ref=TicketReviewRef(
             run_id=run_id,
@@ -657,6 +747,8 @@ __all__ = [
     "MAX_TICKET_JSON_BYTES",
     "MAX_TEST_COMMAND_LENGTH",
     "MAX_TEXT_LENGTH",
+    "OPTIONAL_CONTRACT_KEYS",
+    "REQUIRED_CONTRACT_KEYS",
     "SIZING_DERIVED_KEYS",
     "SIZING_PROJECTION_KEYS",
     "TicketContract",

@@ -68,6 +68,7 @@ REASON_CODES = (
     "base-commit-mismatch",
     "base-commit-not-descendant",
     "base-commit-scope-changed",
+    "base-commit-read-dependency-changed",
     "priority-mismatch",
     "size-mismatch",
     "work-type-mismatch",
@@ -390,6 +391,15 @@ def evaluate_ticket_admission(
                 contract.allows_path(path) for path in evidence.changed_paths
             ):
                 found.add("base-commit-scope-changed")
+            # A declared read dependency invalidates the qualification for a
+            # different reason than a write-scope change, and it is reported
+            # separately: the first says the ticket's own files moved, the
+            # second says something it reads but must not write moved. Reading
+            # one as the other would misdirect whoever re-qualifies.
+            if any(
+                contract.reads_path(path) for path in evidence.changed_paths
+            ):
+                found.add("base-commit-read-dependency-changed")
 
         closure_issue_numbers = [
             item.issue_number for item in parsed_context.dependency_closure

@@ -137,25 +137,22 @@ is self-contradictory and fails closed with `base-commit-mismatch`.
 **An unrelated change no longer invalidates a qualification.** If a commit lands that touches
 no file inside a ticket's `allowedPaths`, that ticket stays admissible. That is the intent.
 
-The cost is real and worth stating plainly: what is guaranteed unmoved is the reviewed
-**scope**, not the reviewed **repository**. A ticket whose work depends on an interface living
-outside its own allowed paths will **not** be re-reviewed when that interface changes.
+What is guaranteed unmoved is the reviewed **scope**, not the reviewed **repository**. So a
+ticket whose work depends on an interface living outside its own allowed paths is not
+re-reviewed when that interface changes — **unless it declares the dependency**.
 
-**The contract has no way to record that dependency, and an earlier version of this section
-said otherwise.** It advised putting such a dependency in `allowedPaths` or in `dependencies`.
-Neither can hold one:
+**A ticket records that dependency in `readPaths`.** It names paths whose change invalidates
+the qualification but which the implementation may **not** write. Admission checks changed
+paths against it and refuses with `base-commit-read-dependency-changed`, reported separately
+from `base-commit-scope-changed`: the first says something the ticket reads moved, the second
+says the ticket's own files did, and whoever re-qualifies needs to know which.
 
-- `allowedPaths` grants **write** access. Putting the depended-on module there is exactly what
-  the ticket's own `outOfScope` forbids, so following the advice trades a correctness problem
-  for a worse scope problem.
-- `dependencies` holds **issue numbers** and expresses closure, not a file relationship.
-
-An author following that advice in good faith would widen a ticket's write scope in order to
-obtain an admission property. It is withdrawn here.
-
-So, stated accurately: the set of tickets a change invalidates is computed from **write
-scope**, which is a proxy for the set that actually depends on what moved. Where a ticket reads
-an interface it must not write, the proxy is wrong and admission cannot see it.
+An earlier version of this section advised recording such a dependency in `allowedPaths` or
+`dependencies` instead. That advice was withdrawn, because neither can hold one: `allowedPaths`
+grants **write** access, which is exactly what the ticket's own `outOfScope` forbids, and
+`dependencies` holds **issue numbers** and expresses closure rather than any relationship to a
+file. `readPaths` grants no write permission anywhere; that separation is the whole reason it
+exists as its own field.
 
 #### The case that measured this
 
@@ -164,31 +161,37 @@ an admission context, so its work changed materially: its acceptance criteria do
 new key, and an implementation following them would produce a context the predicate rejects.
 
 Admission against the merged `main` nevertheless returned `structurally_eligible = True` with no
-reasons — because `ticket_admission.py` is not inside #88's `allowedPaths`, and correctly must
-not be. The gap was caught by inspection immediately after the merge, not by any control. That
-is not a mechanism.
+reasons, because `ticket_admission.py` is not inside #88's `allowedPaths`, and correctly must
+not be. The gap was caught by inspection immediately after the merge, not by any control. A
+contract declaring that read dependency would have been refused.
 
-#### What was decided
+#### Using the field
 
-The contract **will gain a read-dependency field**: paths whose change invalidates a
-qualification but which the implementation may not write. Admission then checks changed paths
-against the union of that field and `allowedPaths`, while scope enforcement keeps using
-`allowedPaths` alone. It is the smallest change that names the real relationship. That mechanism
-is **#127**, and until it lands the gap above is open and this section describes the actual
-behaviour.
+`readPaths` is **optional, and absence is the only way to say "none"**. An explicitly empty list
+is rejected. That is a compatibility requirement rather than a style choice, and it follows from
+two properties of the schema:
 
-Two alternatives were considered and not chosen:
+- contract parsing requires the key set to match exactly, so a key every contract had to carry
+  would make every already-published ticket body fail to parse; and
+- the canonical form serializes the contract as it stands, so a contract omitting the key
+  digests exactly as it did before the field existed, while one carrying it — even as an empty
+  list — digests differently.
 
-- **Derive read dependencies from imports** rather than declaring them. This removes the
-  authoring burden and the chance to forget, but makes the contract depend on static analysis
-  and is a far larger change.
-- **Accept the gap** and rely on the implementing session noticing. That is what happened here,
-  and it worked only because someone looked.
+So a contract written before this field, or one that simply has no read dependencies, is
+untouched: it parses, its digest is unchanged, and its admission behaviour is what it always
+was. Adding `readPaths` to an existing ticket changes its digest and is a re-qualification.
+
+A path may not appear in both `allowedPaths` and `readPaths`; a path the implementation may
+write is not a path whose change should invalidate it, and declaring both is a contradiction
+rather than caution.
+
+`readPaths` is **reviewed** content, not derived: what a ticket depends on reading is part of
+what a sizing seat is judging, so it appears in the sizing projection.
 
 None of this is an argument for reverting #102. Under exact base-commit equality #88 would have
 needed re-qualification too — along with every other qualified ticket, including those with no
 relationship to the change. #102 narrowed re-qualification from *every ticket* to *tickets that
-depend on what moved*; the remaining gap is only in how that second set is computed.
+depend on what moved*; `readPaths` is what lets a ticket say what it depends on.
 
 ### Why it is not exact equality
 
@@ -223,6 +226,8 @@ an owner or establish a lease.
 - `sizing_projection(contract)` returns the contract without the review-derived
   fields; `sizing_projection_sha256(contract)` digests it.
 - `SIZING_DERIVED_KEYS` and `SIZING_PROJECTION_KEYS` partition `CONTRACT_KEYS`.
+- `OPTIONAL_CONTRACT_KEYS` names the keys a contract may omit, and
+  `REQUIRED_CONTRACT_KEYS` is the remainder. `readPaths` is the only optional key.
 - `TicketPolicyError` covers policy and marker failures.
 - `TicketContractError` covers strict JSON and contract failures.
 
