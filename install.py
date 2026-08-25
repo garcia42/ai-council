@@ -2920,6 +2920,23 @@ def restore(
         criterion = (
             root / ".claude/knowledge/council-eval/blind_seat_kill_criterion.py"
         )
+        # Both transforms are re-applied to the backed-up payload, so a restore
+        # puts back the *post*-change reader, never the pre-change one.  Measured
+        # on a staged root (see ``RestoreDoesNotRollBackTheReaderTest``): the
+        # restored bytes are byte-identical to the post-install criterion and
+        # differ from the pre-install one, while every other runtime target does
+        # roll back.
+        #
+        # This is deliberate and load-bearing for the allowlist half: a criterion
+        # restored without the record kinds it must recognise would misread the
+        # live ledger, which is worse than not rolling back.  The consequence for
+        # the reader half is that **restoring is not how a reader change is
+        # reversed** -- that is a checkout plus a re-install, in that order, and
+        # the procedure is in
+        # ``docs/troubleshooting/duplicate-council-row-supersede.md``.
+        #
+        # Changing this to preserve the pre-change reader is issue #36's recorded
+        # recommendation against; see that issue for the reasoning.
         payloads[criterion] = _compile_rendered_criterion(
             _with_superseded_reader(
                 _with_attempt_allowlist(payloads[criterion].decode("utf-8"))

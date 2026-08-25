@@ -1737,3 +1737,75 @@ class InstallerTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RestoreDoesNotRollBackTheReaderTest(unittest.TestCase):
+    """Pin what ``restore`` actually produces for each runtime target.
+
+    Deliberately **not** a subclass of ``InstallerTest``: that class carries 62
+    test methods, and inheriting it to reuse ``setUp`` would silently re-run all
+    of them here. The staging is borrowed explicitly instead.
+
+    Established by experiment on a staged root rather than by reading the
+    installer, because the installer's behaviour here is surprising: it
+    re-applies both rendering transforms to the payload it puts back, so the
+    criterion it restores is the *post*-change reader.
+
+    This test exists to stop that changing silently in **either** direction. If
+    a future change makes restore preserve the pre-change reader, this test
+    fails and that is correct -- the change is deliberate and needs its own
+    ticket (#36 records the recommendation against it).
+    """
+
+    def setUp(self):
+        # Borrow the fixture, not the tests.
+        InstallerTest.setUp(self)
+        self.addCleanup(self.temp.cleanup)
+
+    def test_restore_returns_the_post_install_criterion_not_the_pre_install_one(self):
+        criterion = (
+            self.root / ".claude/knowledge/council-eval/blind_seat_kill_criterion.py"
+        )
+        pre_install = criterion.read_bytes()
+        backup = install.install(self.root, self.backups)
+        post_install = criterion.read_bytes()
+        self.assertNotEqual(pre_install, post_install, "the install changed nothing")
+
+        install.restore(self.root, backup, self.backups)
+        restored = criterion.read_bytes()
+
+        # The measured behaviour, stated as an equality rather than an
+        # inequality so a future reader sees what it *is*, not only what it is not.
+        self.assertEqual(restored, post_install)
+        self.assertNotEqual(restored, pre_install)
+
+    def test_every_other_runtime_target_does_roll_back(self):
+        # The asymmetry is the dangerous part: an operator who sees the reporter
+        # revert reasonably assumes the criterion did too.
+        criterion = (
+            self.root / ".claude/knowledge/council-eval/blind_seat_kill_criterion.py"
+        )
+        originals = {t: t.read_bytes() for t in self.targets}
+        backup = install.install(self.root, self.backups)
+        install.restore(self.root, backup, self.backups)
+        for target in self.targets:
+            with self.subTest(target=target.name):
+                if target == criterion:
+                    self.assertNotEqual(target.read_bytes(), originals[target])
+                else:
+                    self.assertEqual(target.read_bytes(), originals[target])
+
+    def test_the_reader_transforms_are_what_make_restore_differ(self):
+        # Applying the same two transforms to the pre-install bytes reproduces
+        # exactly what restore puts back, which is the mechanism rather than a
+        # coincidence of this fixture.
+        criterion = (
+            self.root / ".claude/knowledge/council-eval/blind_seat_kill_criterion.py"
+        )
+        pre_install = criterion.read_text(encoding="utf-8")
+        backup = install.install(self.root, self.backups)
+        install.restore(self.root, backup, self.backups)
+        expected = install._compile_rendered_criterion(
+            install._with_superseded_reader(install._with_attempt_allowlist(pre_install))
+        ).encode("utf-8")
+        self.assertEqual(criterion.read_bytes(), expected)
