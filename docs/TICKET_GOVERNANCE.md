@@ -139,9 +139,56 @@ no file inside a ticket's `allowedPaths`, that ticket stays admissible. That is 
 
 The cost is real and worth stating plainly: what is guaranteed unmoved is the reviewed
 **scope**, not the reviewed **repository**. A ticket whose work depends on an interface living
-outside its own allowed paths will **not** be re-reviewed when that interface changes. If a
-ticket's correctness genuinely depends on code it does not name, that dependency belongs in
-`allowedPaths` or in `dependencies`, because nothing else will notice it moving.
+outside its own allowed paths will **not** be re-reviewed when that interface changes.
+
+**The contract has no way to record that dependency, and an earlier version of this section
+said otherwise.** It advised putting such a dependency in `allowedPaths` or in `dependencies`.
+Neither can hold one:
+
+- `allowedPaths` grants **write** access. Putting the depended-on module there is exactly what
+  the ticket's own `outOfScope` forbids, so following the advice trades a correctness problem
+  for a worse scope problem.
+- `dependencies` holds **issue numbers** and expresses closure, not a file relationship.
+
+An author following that advice in good faith would widen a ticket's write scope in order to
+obtain an admission property. It is withdrawn here.
+
+So, stated accurately: the set of tickets a change invalidates is computed from **write
+scope**, which is a proxy for the set that actually depends on what moved. Where a ticket reads
+an interface it must not write, the proxy is wrong and admission cannot see it.
+
+#### The case that measured this
+
+#102 added `baseCommitEvidence` to `ticket_admission.CONTEXT_KEYS`. #88's whole job is to build
+an admission context, so its work changed materially: its acceptance criteria do not mention the
+new key, and an implementation following them would produce a context the predicate rejects.
+
+Admission against the merged `main` nevertheless returned `structurally_eligible = True` with no
+reasons — because `ticket_admission.py` is not inside #88's `allowedPaths`, and correctly must
+not be. The gap was caught by inspection immediately after the merge, not by any control. That
+is not a mechanism.
+
+#### What was decided
+
+The contract **will gain a read-dependency field**: paths whose change invalidates a
+qualification but which the implementation may not write. Admission then checks changed paths
+against the union of that field and `allowedPaths`, while scope enforcement keeps using
+`allowedPaths` alone. It is the smallest change that names the real relationship. That mechanism
+is **#127**, and until it lands the gap above is open and this section describes the actual
+behaviour.
+
+Two alternatives were considered and not chosen:
+
+- **Derive read dependencies from imports** rather than declaring them. This removes the
+  authoring burden and the chance to forget, but makes the contract depend on static analysis
+  and is a far larger change.
+- **Accept the gap** and rely on the implementing session noticing. That is what happened here,
+  and it worked only because someone looked.
+
+None of this is an argument for reverting #102. Under exact base-commit equality #88 would have
+needed re-qualification too — along with every other qualified ticket, including those with no
+relationship to the change. #102 narrowed re-qualification from *every ticket* to *tickets that
+depend on what moved*; the remaining gap is only in how that second set is computed.
 
 ### Why it is not exact equality
 
