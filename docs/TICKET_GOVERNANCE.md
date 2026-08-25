@@ -93,13 +93,23 @@ that bound the review that derived it. Because the projection does not move acro
 write, the qualification converges rather than chasing its own declared size. The full
 procedure is the two-phase seal in `runtime/ticket-sizing-contract.md`.
 
-`SIZING_PROJECTION_KEYS` and `SIZING_DERIVED_KEYS` partition `CONTRACT_KEYS`, so a new
-contract field cannot be added without being classified as reviewed or derived.
+`SIZING_PROJECTION_KEYS` and `SIZING_DERIVED_KEYS` are **declared independently** and their
+partition is checked at import. Defining the reviewed set as a subtraction would make that
+check unfalsifiable: a new field would be auto-classified as reviewed, and a reviewed field
+could be hidden from the sizing seats by moving it into the derived set. Adding a field to
+`CONTRACT_KEYS` now raises until it is deliberately classified.
 
-Consequently `contractSha256` binds a contract containing two fields the seats never saw.
-The projection digest is what proves the reviewed content, and it belongs in the issue's
-Sizing prose so an auditor can re-derive it from the published contract. Like every other
-digest here, it is integrity, not authorization.
+`contractSha256` binds a contract containing two fields the seats never saw. What ties a
+review to the content its seats did see is `sizingProjectionSha256` in the review record:
+admission re-derives the projection from the published contract and returns
+`review-projection-mismatch` when the two differ. Editing a reviewed field after the review
+therefore fails admission even though `contractSha256` was recomputed; editing only the
+derived fields does not, because the seats determined them.
+
+The copy of that digest in an issue's Sizing prose is a human-auditable convenience. Nothing
+parses it. Like every other digest here, all of this is integrity, not authorization: it does
+not prove a seat ran, and one process can still construct both seat reviews and recompute
+every digest.
 
 ## Integrity and authorization
 
