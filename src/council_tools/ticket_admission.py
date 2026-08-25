@@ -21,6 +21,7 @@ from council_tools.ticket_contracts import (
     MAX_LIST_ITEMS,
     MAX_REPOSITORY_LENGTH,
     MAX_TARGET_BRANCH_LENGTH,
+    AllowedPath,
     TicketEnvelope,
 )
 from council_tools.ticket_policy import ParsedTicketLabels
@@ -31,6 +32,7 @@ ADMISSION_VERSION = 1
 MAX_ADMISSION_LABELS = MAX_LIST_ITEMS
 MAX_ADMISSION_DEPENDENCIES = MAX_LIST_ITEMS
 MAX_ADMISSION_EVIDENCE = MAX_LIST_ITEMS
+MAX_ADMISSION_CHANGED_PATHS = MAX_LIST_ITEMS
 
 SNAPSHOT_KEYS = frozenset(
     {"repository", "issueNumber", "state", "labels", "body"}
@@ -41,9 +43,11 @@ CONTEXT_KEYS = frozenset(
         "issueNumber",
         "targetBranch",
         "baseCommit",
+        "baseCommitEvidence",
         "dependencyClosure",
     }
 )
+BASE_COMMIT_EVIDENCE_KEYS = frozenset({"contractBaseIsAncestor", "changedPaths"})
 CLOSURE_KEYS = frozenset({"issueNumber", "state"})
 ISSUE_STATES = frozenset({"open", "closed"})
 
@@ -62,6 +66,8 @@ REASON_CODES = (
     "issue-number-mismatch",
     "target-branch-mismatch",
     "base-commit-mismatch",
+    "base-commit-not-descendant",
+    "base-commit-scope-changed",
     "priority-mismatch",
     "size-mismatch",
     "work-type-mismatch",
@@ -95,11 +101,25 @@ class _DependencyState:
 
 
 @dataclass(frozen=True)
+class _BaseCommitEvidence:
+    """Caller-resolved facts relating the contract base to the context base.
+
+    The predicate performs no repository access, so ancestry and the changed-path
+    set arrive the same way dependency state does: resolved by the caller and
+    supplied as evidence.  Resolving them is the adapter's job, not this one's.
+    """
+
+    contract_base_is_ancestor: bool
+    changed_paths: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class _AdmissionContext:
     repository: str
     issue_number: int
     target_branch: str
     base_commit: str
+    base_commit_evidence: _BaseCommitEvidence
     dependency_closure: tuple[_DependencyState, ...]
 
 
@@ -129,6 +149,18 @@ def _bounded_text(value: Any, *, max_length: int) -> bool:
 
 def _positive_issue_number(value: Any) -> bool:
     return type(value) is int and 1 <= value <= MAX_ISSUE_NUMBER
+
+
+def _is_repository_relative_path(value: Any) -> bool:
+    """Defer the definition of a repository path to the contract module.
+
+    ``AllowedPath.allows`` already applies the single normative path rule, and a
+    file scope admits exactly its own path, so probing with the candidate as both
+    scope and subject asks that rule the question without restating it here.  A
+    second copy of the rule is what would drift.
+    """
+
+    return AllowedPath(kind="file", path=value).allows(value)
 
 
 def _has_exact_plain_keys(value: Any, expected: frozenset[str]) -> bool:
@@ -172,6 +204,34 @@ def _snapshot(value: Any) -> _IssueSnapshot | None:
     )
 
 
+def _base_commit_evidence(value: Any) -> _BaseCommitEvidence | None:
+    """Validate caller-resolved base-commit evidence, or refuse the context.
+
+    Absent or malformed evidence is an invalid context rather than an absent
+    constraint: a caller must not be able to buy admission by leaving it out.
+    """
+
+    if not _has_exact_plain_keys(value, BASE_COMMIT_EVIDENCE_KEYS):
+        return None
+    is_ancestor = value["contractBaseIsAncestor"]
+    changed_paths = value["changedPaths"]
+    # ``type() is not bool`` so that 1 and 0 cannot stand in for the claim.
+    if type(is_ancestor) is not bool:
+        return None
+    if (
+        type(changed_paths) is not list
+        or len(changed_paths) > MAX_ADMISSION_CHANGED_PATHS
+    ):
+        return None
+    for path in changed_paths:
+        if not _is_repository_relative_path(path):
+            return None
+    return _BaseCommitEvidence(
+        contract_base_is_ancestor=is_ancestor,
+        changed_paths=tuple(changed_paths),
+    )
+
+
 def _context(value: Any) -> _AdmissionContext | None:
     if not _has_exact_plain_keys(value, CONTEXT_KEYS):
         return None
@@ -179,6 +239,7 @@ def _context(value: Any) -> _AdmissionContext | None:
     issue_number = value["issueNumber"]
     target_branch = value["targetBranch"]
     base_commit = value["baseCommit"]
+    evidence_value = value["baseCommitEvidence"]
     closure = value["dependencyClosure"]
     if not _bounded_text(repository, max_length=MAX_REPOSITORY_LENGTH):
         return None
@@ -187,6 +248,9 @@ def _context(value: Any) -> _AdmissionContext | None:
     if not _bounded_text(target_branch, max_length=MAX_TARGET_BRANCH_LENGTH):
         return None
     if type(base_commit) is not str or not _BASE_COMMIT_RE.fullmatch(base_commit):
+        return None
+    evidence = _base_commit_evidence(evidence_value)
+    if evidence is None:
         return None
     if (
         type(closure) is not list
@@ -215,6 +279,7 @@ def _context(value: Any) -> _AdmissionContext | None:
         issue_number=issue_number,
         target_branch=target_branch,
         base_commit=base_commit,
+        base_commit_evidence=evidence,
         dependency_closure=tuple(normalized),
     )
 
@@ -304,8 +369,27 @@ def evaluate_ticket_admission(
             found.add("issue-number-mismatch")
         if contract.target_branch != parsed_context.target_branch:
             found.add("target-branch-mismatch")
-        if contract.base_commit != parsed_context.base_commit:
-            found.add("base-commit-mismatch")
+        # The base-commit guarantee is scope-shaped, not tip-shaped.  What must
+        # not have moved is the work the review actually described, and the
+        # contract already declares that in ``allowedPaths``.  Requiring the two
+        # tips to be identical could not tell a commit that touched this
+        # ticket's own files from one that touched something it never names, and
+        # treated both as fatal, so no two tickets sharing a base commit could
+        # both be admitted.
+        evidence = parsed_context.base_commit_evidence
+        if contract.base_commit == parsed_context.base_commit:
+            # Identical commits admit nothing to have changed.  Evidence that
+            # says otherwise is self-contradictory, so it fails closed rather
+            # than being read as the permissive half of the claim.
+            if not evidence.contract_base_is_ancestor or evidence.changed_paths:
+                found.add("base-commit-mismatch")
+        else:
+            if not evidence.contract_base_is_ancestor:
+                found.add("base-commit-not-descendant")
+            if any(
+                contract.allows_path(path) for path in evidence.changed_paths
+            ):
+                found.add("base-commit-scope-changed")
 
         closure_issue_numbers = [
             item.issue_number for item in parsed_context.dependency_closure
@@ -412,9 +496,11 @@ def evaluate_ticket_admission(
 
 __all__ = [
     "ADMISSION_VERSION",
+    "BASE_COMMIT_EVIDENCE_KEYS",
     "CONTEXT_KEYS",
     "CLOSURE_KEYS",
     "ISSUE_STATES",
+    "MAX_ADMISSION_CHANGED_PATHS",
     "MAX_ADMISSION_DEPENDENCIES",
     "MAX_ADMISSION_EVIDENCE",
     "MAX_ADMISSION_LABELS",
