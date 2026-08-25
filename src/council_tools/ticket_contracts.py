@@ -63,7 +63,31 @@ CONTRACT_KEYS = frozenset(
     }
 )
 SIZING_DERIVED_KEYS = frozenset({"points", "priority"})
-SIZING_PROJECTION_KEYS = frozenset(CONTRACT_KEYS - SIZING_DERIVED_KEYS)
+SIZING_PROJECTION_KEYS = frozenset(
+    {
+        "schemaVersion",
+        "repository",
+        "issueNumber",
+        "targetBranch",
+        "baseCommit",
+        "workType",
+        "problemStatement",
+        "acceptanceCriteria",
+        "testCommands",
+        "allowedPaths",
+        "outOfScope",
+        "dependencies",
+        "rollbackPlan",
+    }
+)
+# Declared independently, then checked, so adding a contract field fails here
+# until it is deliberately classified as reviewed or derived.  Defining the
+# reviewed set as a subtraction would make that check unfalsifiable, and would
+# let a reviewed field be hidden from the sizing seats by reclassifying it.
+if SIZING_PROJECTION_KEYS | SIZING_DERIVED_KEYS != CONTRACT_KEYS:
+    raise AssertionError("sizing key classification does not cover CONTRACT_KEYS")
+if SIZING_PROJECTION_KEYS & SIZING_DERIVED_KEYS:
+    raise AssertionError("sizing key classification overlaps")
 REVIEW_REF_KEYS = frozenset({"runId", "contractSha256"})
 ALLOWED_PATH_KEYS = frozenset({"kind", "path"})
 
