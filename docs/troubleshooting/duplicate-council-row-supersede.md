@@ -100,15 +100,125 @@ counts as legacy. Confirm the installed criterion carries it:
 grep -c _apply_supersedes ~/.claude/knowledge/council-eval/blind_seat_kill_criterion.py
 ```
 
+If that returns `0`, activate it — the check above has no procedure attached anywhere else,
+and the two mistakes available here are both worse than not starting.
+
+> **Run `install.py` only from `/home/trader/council-tools`. Never from a session worktree.**
+>
+> `install.py` sets `REPO = Path(__file__).resolve().parent` and renders that path into the
+> installed runtime as `SOURCE_ROOT`. Run it from the worktree you happen to be standing in
+> and the live runtime is pinned to a disposable directory; when that worktree is rebased or
+> removed, every council tool on the box fails closed. `/home/trader/council-tools` is a
+> git worktree of this repository kept for exactly this purpose, and it is the only correct
+> source root.
+
+> **There is an outage window, and it opens at the checkout, not at the install.**
+>
+> `predictions_report.py` calls `_assert_source_integrity()` at import: it compares
+> `git -C /home/trader/council-tools rev-parse HEAD` and a digest of `src/council_tools`
+> against the values baked in at install time, and raises `SystemExit` on any difference.
+> So from the moment you check out a new commit there until `install.py` finishes, **every
+> tool routed through that runtime exits rather than runs** — including the supersede
+> appender in step 3. Do not start the checkout until you are ready to finish the install.
+
+```
+# 1a. rehearse first, from the session worktree, against a copy — see step 2
+# 1b. then, in the real source root:
+git -C /home/trader/council-tools fetch origin main
+git -C /home/trader/council-tools checkout <the merge commit>
+git -C /home/trader/council-tools status --porcelain=v1 --untracked-files=all   # must be empty
+# 1c. check what would change, then install — from there, not from anywhere else:
+/home/trader/ai-council/.venv/bin/python /home/trader/council-tools/install.py check
+/home/trader/ai-council/.venv/bin/python /home/trader/council-tools/install.py install
+```
+
+`check` exits 1 and prints a `DRIFT:` line per difference; `install` prints the backup
+directory it wrote. **Keep that path** — it is the only input to the runtime rollback below.
+
+The empty-status check is not advice: for a live install `install.py` runs the same command
+and refuses with `live install requires a clean council-tools source commit`. Running it
+first only means you find out before it does.
+
+Confirm both halves moved afterwards — the reader and the pin, not just one:
+
+```
+grep -c _apply_supersedes ~/.claude/knowledge/council-eval/blind_seat_kill_criterion.py
+grep -n 'EXPECTED_COMMIT\|SOURCE_ROOT' ~/.claude/knowledge/council-eval/predictions_report.py
+git -C /home/trader/council-tools rev-parse HEAD
+```
+
+`EXPECTED_COMMIT` must equal that `HEAD`, and `SOURCE_ROOT` must read
+`/home/trader/council-tools`. If `SOURCE_ROOT` names anything under
+`/home/trader/ai-council-sessions/`, the install was run from the wrong directory: re-run it
+from the correct source root before doing anything else.
+
 **2. Rehearse against a copy.** Copy the ledger somewhere outside the live tree, run the
-supersede against the copy, and diff the gate before and after. Expect `completedRuns` and
-`changedDecisionRuns` to fall by exactly the number of rows retired, `supersededRows` to
-rise to match, and the named errors to disappear. Nothing else may move.
+supersede against the copy, and diff the gate before and after.
+
+**Several counters move, and an earlier version of this document said none but two may.**
+Taken literally that instruction aborts a correct cure — and aborting between the checkout
+and the install is how a half-applied retirement becomes the unretractable state the rest of
+this document exists to avoid. What actually moves, per row retired, measured rather than
+expected:
+
+| Field | Direction | Why |
+| --- | --- | --- |
+| `completedRuns` | −1 | the retired row leaves the completed set |
+| `supersededRows` | +1 | it is counted as retired |
+| `nonCouncilRecords` | **+1** | the supersede record is itself a counted record, so this **rises** |
+| `errors` | → 0 | the duplicate error clears; this is the outcome being sought, not an anomaly |
+| `changedDecisionRuns` | −1 **only if** the retired row recorded `changedDecision: true` | otherwise unchanged |
+| `unchangedDecisionRuns` | −1 **only if** the retired row recorded `changedDecision: false` | otherwise unchanged |
+| `decisionChangingRate` | **either direction** | see below |
+
+`decisionChangingRate` is `changedDecisionRuns / completedRuns`. Retiring an *unchanged* row
+shrinks only the denominator, so the rate **rises**; retiring a *changed* row shrinks both, so
+it **falls**. Both are correct. Seeing the direction you were not expecting is not a reason to
+stop.
+
+`criterion` moves only if the retirement takes `completedRuns` below 10, and
+`operationalState` does not move at all.
+
+Compare the two gate outputs field by field rather than eyeballing a summary line:
+
+```
+cp ~/.claude/knowledge/futures-panel-log.jsonl /tmp/ledger-rehearsal.jsonl
+/home/trader/ai-council/.venv/bin/python \
+  ~/.claude/knowledge/council-eval/blind_seat_kill_criterion.py \
+  --log /tmp/ledger-rehearsal.jsonl --json > /tmp/gate-before.json
+# ... run the supersede against /tmp/ledger-rehearsal.jsonl ...
+/home/trader/ai-council/.venv/bin/python \
+  ~/.claude/knowledge/council-eval/blind_seat_kill_criterion.py \
+  --log /tmp/ledger-rehearsal.jsonl --json > /tmp/gate-after.json
+diff <(python3 -m json.tool /tmp/gate-before.json) \
+     <(python3 -m json.tool /tmp/gate-after.json)
+```
+
+> **The gate exits non-zero in exactly the situation you are running it in.** It exits **1**
+> when `errors` is non-empty — which is true before the cure, by definition — and **2** when
+> `operationalState` is `BLOCKED_DEGRADED`. It does **not** exit non-zero merely because
+> `--json` was passed. So never chain it with `&&`: the next command silently does not run,
+> and the procedure appears to have completed. Redirect to a file and read the file, as above.
 
 **3. Append the record**, on the ledger authority host, with principal approval:
 
+Re-derive the line numbers and digests **now**, at execution time. Other sessions append to
+this ledger concurrently, so any number written down earlier — in this document, in a review,
+or in your own notes from an hour ago — may already name a different row.
+
 ```
-sed -n '<line>p' ~/.claude/knowledge/futures-panel-log.jsonl | sha256sum
+# line numbers the gate currently objects to:
+/home/trader/ai-council/.venv/bin/python \
+  ~/.claude/knowledge/council-eval/blind_seat_kill_criterion.py --json > /tmp/gate-now.json
+python3 -m json.tool /tmp/gate-now.json | grep -A20 '"errors"'
+
+# the digest of one exact line, interpreter-pinned so it cannot pick up a different python:
+/home/trader/ai-council/.venv/bin/python -c '
+import hashlib, sys
+raw = open("/home/trader/.claude/knowledge/futures-panel-log.jsonl", "rb").read().splitlines(keepends=True)
+n = int(sys.argv[1])
+print(n, hashlib.sha256(raw[n - 1]).hexdigest())
+' <line>
 
 python3 ~/.claude/knowledge/council-eval/predictions_report.py \
   supersede --log ~/.claude/knowledge/futures-panel-log.jsonl \
@@ -129,7 +239,29 @@ guard on the target, but it is not evidence of duplication and is never sufficie
 reader independently replays the same shape, identity, duplicate, and composition checks;
 any record or raw JSON it cannot verify retires nothing.
 
-**4. Re-run the gate.** It should reach exit 0 with `superseded_rows=<n>`.
+**4. Re-run the gate.** It should reach exit 0, with `superseded_rows` risen by the number of
+rows retired and `errors` empty. Exit 1 means errors remain — read them; exit 2 means
+`operationalState` is `BLOCKED_DEGRADED`, which is a different problem this playbook does not
+cure.
+
+**5. Rollback: one half is reversible and the other is not.** Be sure of this before step 3.
+
+*The runtime install is reversible.* `install.py restore --backup <the directory step 1c
+printed>` puts the previous runtime back, from the same source root and under the same rules.
+Note the known defect: **`restore()` does not roll back a kill-criterion reader change**
+(#36), so a restore may leave the reader ahead of the rest of the runtime. Verify both halves
+afterwards with the same two `grep`s from step 1.
+
+*The appended supersede record is not.* Nothing in this repository reverses one, because the
+store is append-only and `validate_supersede` accepts only a `kind: "council"` target — **a
+supersede record cannot itself be superseded.** Once appended against the wrong row it stays,
+and the gate stays red on a row nobody can edit.
+
+That asymmetry is the reason for everything upstream of it: the digest is required rather than
+derived, step 2 rehearses against a copy rather than dry-running against the live ledger,
+`--check-only` exists, and `recover-brief` now refuses in code any line a supersede record
+names (#35). If a procedure for retracting a supersede is ever written, cross-reference it
+here.
 
 ## Prevention
 
@@ -165,9 +297,22 @@ Known gaps and activation prerequisites:
 
 ## History
 
-**2026-08-24.** Lines 114 and 117 of the panel log were hand-appended duplicates of 113
-and 116, the second live instance of the pattern issue #3 fixed at the instruction level.
-As recorded the gate read 60 completed / 44 changed / 73.3%; excluding the two duplicates
-it reads 58 / 43 / 74.1%. The verdict stayed KEEP either way, which is exactly why the
-contamination mattered more than the number: a gate stuck at exit 1 on rows nobody could
-touch is what trains reviewers to walk past a red gate.
+**2026-08-24.** Two hand-appended rows in the panel log duplicated two earlier rows — the
+second live instance of the pattern issue #3 fixed at the instruction level. Excluding the
+duplicates moved the tally by two completed runs and one changed run, and the verdict stayed
+`KEEP` either way. That is exactly why the contamination mattered more than the number: a gate
+stuck at exit 1 on rows nobody could touch is what trains reviewers to walk past a red gate.
+
+*Line numbers and totals are deliberately not recorded here.* Other sessions append to this
+ledger concurrently, so both had already moved twice during the review that produced this
+document, and a reader who trusted them would be working from a description of a ledger that
+no longer exists. Re-derive them from the gate at execution time — step 3 shows how.
+
+**2026-08-25.** This playbook was rewritten (#37) after an attempt to follow it end to end.
+The activation step was a check with no procedure and did not name the only correct source
+root; the outage window between checkout and install was unwritten; and the acceptance
+criterion said nothing but two counters may move, which is false and would abort a correct
+cure. The field table in step 2 is measured rather than expected.
+
+Separately, `recover-brief` now refuses in code any line a `council-superseded` record names
+(#35). The rule used to live only in prose in this document and its sibling.
