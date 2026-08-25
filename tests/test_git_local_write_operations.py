@@ -155,3 +155,147 @@ class PurityTests(unittest.TestCase):
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+
+from council_tools.git_local_write_operations import (  # noqa: E402
+    CLAIM_ENTRY_MODE,
+    CLAIM_ENTRY_NAME,
+    CLAIM_ENTRY_TYPE,
+    WRITE_OPERATIONS,
+    CreateClaimTree,
+    CreateZeroParentCommit,
+)
+from council_tools.git_object_id import Sha1ObjectId  # noqa: E402
+
+BLOB = Sha1ObjectId("47d05ff6403c8e6c3cf635ea6eb9263738432773")
+TREE = Sha1ObjectId("b439cdd182c0e51b28fa858fadcb3e9f71efb415")
+DATE = "@1234567890 +0000"
+
+
+def commit(**overrides):
+    kwargs = {
+        "tree_id": TREE, "message": b"claim",
+        "author_name": "AI Council", "author_email": "ai@example.invalid",
+        "author_date": DATE, "committer_name": "AI Council",
+        "committer_email": "ai@example.invalid", "committer_date": DATE,
+    }
+    kwargs.update(overrides)
+    return CreateZeroParentCommit(**kwargs)
+
+
+class ClaimTreeTests(unittest.TestCase):
+    def test_rendered_vector_is_pinned_and_carries_no_operand(self):
+        self.assertEqual(CreateClaimTree(BLOB).render().argv(), ("mktree",))
+
+    def test_the_entry_line_is_built_internally_from_fixed_values(self):
+        self.assertEqual(
+            CreateClaimTree(BLOB).entry_line(),
+            b"100644 blob 47d05ff6403c8e6c3cf635ea6eb9263738432773\tclaim.json\n",
+        )
+
+    def test_the_only_caller_input_is_the_blob_identifier(self):
+        # A caller able to choose the mode, name, type or entry count could
+        # choose what the claim contains, which is the whole of it.
+        self.assertEqual([f.name for f in dataclasses.fields(CreateClaimTree)], ["blob_id"])
+
+    def test_no_caller_value_can_add_or_alter_an_entry(self):
+        line = CreateClaimTree(BLOB).entry_line().decode()
+        self.assertEqual(line.count("\n"), 1)
+        self.assertIn(CLAIM_ENTRY_MODE, line)
+        self.assertIn(CLAIM_ENTRY_TYPE, line)
+        self.assertIn(CLAIM_ENTRY_NAME, line)
+
+    def test_only_the_identifier_varies_between_renders(self):
+        other = Sha1ObjectId("b" * 40)
+        first, second = CreateClaimTree(BLOB).entry_line(), CreateClaimTree(other).entry_line()
+        self.assertEqual(first.replace(BLOB.wire_text.encode(), b"X"),
+                         second.replace(other.wire_text.encode(), b"X"))
+
+    def test_a_raw_identifier_is_refused(self):
+        with self.assertRaises(GitWriteOperationError) as caught:
+            CreateClaimTree(BLOB.wire_text)  # type: ignore[arg-type]
+        self.assertEqual(caught.exception.code, "invalid-object-id")
+
+
+class ZeroParentCommitTests(unittest.TestCase):
+    def test_rendered_vector_is_pinned_exactly(self):
+        self.assertEqual(
+            commit().render().argv(), ("commit-tree", TREE.wire_text, "--")
+        )
+
+    def test_message_crosses_on_stdin_not_in_argv(self):
+        # A message in argv could be read as an option; on stdin it cannot.
+        hostile = commit(message=b"--upload-pack=evil")
+        self.assertEqual(hostile.render().argv(), commit().render().argv())
+        self.assertEqual(hostile.render().stdin, b"--upload-pack=evil")
+
+    def test_no_parent_flag_and_no_parent_parameter(self):
+        self.assertNotIn("-p", commit().render().argv())
+        self.assertNotIn("parent", {f.name for f in dataclasses.fields(CreateZeroParentCommit)})
+
+    def test_identity_travels_in_the_invocation_identity_mapping(self):
+        identity = commit().render().identity
+        self.assertEqual(
+            set(identity),
+            {"GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_AUTHOR_DATE",
+             "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL", "GIT_COMMITTER_DATE"},
+        )
+
+    def test_identical_inputs_render_byte_identical_commands(self):
+        # A claim's object name must depend on what it says, not on when it was
+        # made, so nothing here may read a clock or the environment.
+        first, second = commit().render(), commit().render()
+        self.assertEqual(first.argv(), second.argv())
+        self.assertEqual(first.stdin, second.stdin)
+        self.assertEqual(first.identity, second.identity)
+
+    def test_the_measured_raw_date_form_is_required(self):
+        # Measured on the pinned binary: "0 +0000" is rejected by git itself
+        # ("invalid date format") while "@0 +0000" is accepted.
+        for good in ("@0 +0000", "@1234567890 +0000", "@1234567890 -0500"):
+            with self.subTest(date=good):
+                self.assertEqual(commit(author_date=good).author_date, good)
+        for bad in ("0 +0000", "1234567890 +0000", "now", "", "@0", "@abc +0000"):
+            with self.subTest(date=bad):
+                with self.assertRaises(GitWriteOperationError) as caught:
+                    commit(author_date=bad)
+                self.assertEqual(caught.exception.code, "invalid-identity-date")
+
+    def test_identity_values_that_could_break_out_of_their_field_are_refused(self):
+        for value in ("A\nB", "A\rB", "A\x00B", "A<b", "A>b", ""):
+            for field_name in ("author_name", "author_email", "committer_name", "committer_email"):
+                with self.subTest(value=repr(value), field=field_name):
+                    with self.assertRaises(GitWriteOperationError) as caught:
+                        commit(**{field_name: value})
+                    self.assertEqual(caught.exception.code, "invalid-identity")
+
+    def test_a_non_bytes_message_is_refused(self):
+        with self.assertRaises(GitWriteOperationError) as caught:
+            commit(message="text")
+        self.assertEqual(caught.exception.code, "invalid-message")
+
+    def test_a_raw_tree_identifier_is_refused(self):
+        with self.assertRaises(GitWriteOperationError) as caught:
+            commit(tree_id=TREE.wire_text)
+        self.assertEqual(caught.exception.code, "invalid-object-id")
+
+
+class WriteFamilyTests(unittest.TestCase):
+    def test_the_family_is_exactly_four_operations(self):
+        self.assertEqual(
+            set(WRITE_OPERATIONS),
+            {InitializeBareRepository, WriteCanonicalBlob, CreateClaimTree, CreateZeroParentCommit},
+        )
+
+    def test_no_new_operation_enables_ambient_behaviour(self):
+        for built in (CreateClaimTree(BLOB), commit()):
+            with self.subTest(operation=type(built).__name__):
+                assert_no_ambient_behaviour(built.render(), field="rendered")
+
+    def test_no_new_operation_accepts_argv_options_or_a_repository_selector(self):
+        forbidden = {"argv", "args", "options", "global_options", "subcommand",
+                     "config", "repository", "cwd", "git_dir", "flags", "parent", "mode"}
+        for builder in (CreateClaimTree, CreateZeroParentCommit):
+            with self.subTest(builder=builder.__name__):
+                names = {f.name for f in dataclasses.fields(builder)}
+                self.assertEqual(names & forbidden, set())
