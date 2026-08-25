@@ -5,19 +5,77 @@ from __future__ import annotations
 import errno
 import fcntl
 import os
+import signal
 import sys
+import tempfile
+import time
 import unittest
+from unittest import mock
 
+from council_tools import git_process_executor
 from council_tools.git_process_contract import (
     GitCommand,
     GitCommandResult,
     RenderedInvocation,
 )
 from council_tools.git_process_executor import (
+    DEFAULT_DEADLINE_SECONDS,
     STANDARD_STREAM_DESCRIPTORS,
+    TERMINATION_DRAIN_SECONDS,
     GitExecutorError,
     GitSubprocessExecutor,
 )
+
+
+def _zombie_children() -> list[int]:
+    """Zombie children of *this* process only; see ``LeakTests`` for why."""
+
+    zombies = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/stat", encoding="utf-8") as handle:
+                stat = handle.read()
+        except OSError:
+            continue
+        fields = stat[stat.rindex(")") + 2 :].split()
+        if fields[0] == "Z" and int(fields[1]) == os.getpid():
+            zombies.append(int(entry))
+    return zombies
+
+
+def _shell_command(script: str) -> GitCommand:
+    """A command that runs ``script`` under a shell, so it can start helpers."""
+
+    return GitCommand(
+        executable="/bin/sh",
+        invocation=RenderedInvocation(
+            global_options=("-c", script), subcommand="--", identity={}
+        ),
+        environment={"LC_ALL": "C"},
+    )
+
+
+def _wait_until_gone(pid: int, limit: float = 10.0) -> bool:
+    """Poll rather than sleep a fixed interval.
+
+    A fixed wait is what makes a test load-sensitive: under parallel load the
+    reap simply takes longer, and the test reports a property failure that is
+    really a scheduling one.
+    """
+
+    deadline = time.monotonic() + limit
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            # Reparented and no longer ours to inspect, but still alive.
+            pass
+        time.sleep(0.02)
+    return False
 
 
 def _python_command(source: str, *, descriptors: tuple[int, ...] = (), stdin: bytes = b"") -> GitCommand:
@@ -283,3 +341,126 @@ class LeakTests(unittest.TestCase):
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+
+class DeadlineTests(unittest.TestCase):
+    def test_a_child_exceeding_the_deadline_is_reported_as_expiry(self) -> None:
+        executor = GitSubprocessExecutor(deadline_seconds=0.5)
+        result = executor.execute(_shell_command("sleep 60"))
+        self.assertEqual(result.local_failure, "deadline-expired")
+        self.assertIsNone(result.exit_status)
+
+    def test_expiry_is_not_reported_as_an_exit_status(self) -> None:
+        # A child killed by a signal has a status describing that signal. If it
+        # were reported, a caller could read a timeout as the command's own
+        # result, which is the confusion this asserts against.
+        result = GitSubprocessExecutor(deadline_seconds=0.5).execute(
+            _shell_command("sleep 60")
+        )
+        self.assertIsNone(result.exit_status)
+        self.assertIsNotNone(result.local_failure)
+
+    def test_a_process_the_child_started_is_also_terminated(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            record = os.path.join(directory, "helper.pid")
+            # The backgrounded sleep is a grandchild. Killing only the shell
+            # would leave it running, which is the failure being excluded.
+            script = f"sleep 60 & echo $! > {record}; sleep 60"
+            result = GitSubprocessExecutor(deadline_seconds=1.0).execute(
+                _shell_command(script)
+            )
+            self.assertEqual(result.local_failure, "deadline-expired")
+            with open(record, encoding="utf-8") as handle:
+                helper = int(handle.read().strip())
+            self.assertTrue(
+                _wait_until_gone(helper),
+                f"grandchild {helper} survived group termination",
+            )
+
+    def test_a_command_completing_within_the_deadline_is_unaffected(self) -> None:
+        result = GitSubprocessExecutor(deadline_seconds=30.0).execute(
+            _python_command("import sys; sys.stdout.write('done'); sys.exit(3)")
+        )
+        self.assertEqual(result.exit_status, 3)
+        self.assertEqual(result.stdout, b"done")
+        self.assertIsNone(result.local_failure)
+
+    def test_stdin_still_reaches_a_child_under_a_deadline(self) -> None:
+        source = "import sys\nsys.stdout.write(sys.stdin.read())\n"
+        result = GitSubprocessExecutor(deadline_seconds=30.0).execute(
+            _python_command(source, stdin=b"payload")
+        )
+        self.assertEqual(result.stdout, b"payload")
+
+    def test_nothing_is_left_unreaped_after_an_expiry(self) -> None:
+        executor = GitSubprocessExecutor(deadline_seconds=0.3)
+        for _ in range(3):
+            executor.execute(_shell_command("sleep 60"))
+        self.assertEqual(_zombie_children(), [])
+
+    def test_no_capture_descriptor_is_left_open_after_an_expiry(self) -> None:
+        executor = GitSubprocessExecutor(deadline_seconds=0.3)
+        executor.execute(_shell_command("sleep 60"))
+        before = {int(e) for e in os.listdir("/proc/self/fd")}
+        for _ in range(3):
+            executor.execute(_shell_command("sleep 60"))
+        after = {int(e) for e in os.listdir("/proc/self/fd")}
+        self.assertEqual(after - before, set())
+
+
+class DeadlineValidationTests(unittest.TestCase):
+    def test_the_default_is_a_positive_finite_number(self) -> None:
+        self.assertGreater(DEFAULT_DEADLINE_SECONDS, 0)
+        self.assertEqual(GitSubprocessExecutor().deadline_seconds, DEFAULT_DEADLINE_SECONDS)
+
+    def test_an_invalid_deadline_is_refused_before_any_command_exists(self) -> None:
+        for value in (0, -1, -0.5, float("nan"), float("inf"), "30", None, True):
+            with self.subTest(deadline=value):
+                with self.assertRaises(GitExecutorError) as caught:
+                    GitSubprocessExecutor(deadline_seconds=value)
+                self.assertEqual(caught.exception.code, "invalid-deadline")
+                self.assertEqual(caught.exception.field, "deadline_seconds")
+
+    def test_a_valid_override_is_retained(self) -> None:
+        self.assertEqual(GitSubprocessExecutor(deadline_seconds=2).deadline_seconds, 2.0)
+
+
+class TerminationDrainTests(unittest.TestCase):
+    """The fallback path must not be able to hang.
+
+    When the child leads its group the whole group is killed and nothing holds
+    the capture pipes, so the drain returns at once. When it does *not* lead the
+    group -- which this forces -- only the child is killed, a surviving
+    descendant keeps the write ends open, and an unbounded drain would wait for
+    an EOF that never arrives. That turns a deadline into a permanent hang,
+    which is the opposite of what a deadline is for.
+    """
+
+    def test_a_surviving_descendant_cannot_hang_the_drain(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            record = os.path.join(directory, "helper.pid")
+            script = f"sleep 60 & echo $! > {record}; sleep 60"
+            executor = GitSubprocessExecutor(deadline_seconds=0.5)
+            # Report a group the child does not lead, so _terminate_group takes
+            # the branch that kills only the child.
+            with mock.patch.object(os, "getpgid", return_value=-1), mock.patch.object(
+                git_process_executor, "TERMINATION_DRAIN_SECONDS", 0.3
+            ):
+                started = time.monotonic()
+                result = executor.execute(_shell_command(script))
+                elapsed = time.monotonic() - started
+            self.assertEqual(result.local_failure, "deadline-expired")
+            self.assertIsNone(result.exit_status)
+            self.assertLess(elapsed, 30.0, "the drain did not give up")
+            # The grandchild was never in a group we were willing to signal, so
+            # it is still alive; kill it rather than leaving it behind.
+            with open(record, encoding="utf-8") as handle:
+                helper = int(handle.read().strip())
+            try:
+                os.kill(helper, signal.SIGKILL)
+            except OSError:
+                pass
+
+    def test_the_drain_bound_is_positive_and_finite(self) -> None:
+        self.assertGreater(TERMINATION_DRAIN_SECONDS, 0)
+        self.assertTrue(TERMINATION_DRAIN_SECONDS < float("inf"))
