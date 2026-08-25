@@ -24,6 +24,9 @@ from council_tools.ticket_contracts import (
 
 
 GOLDEN_SHA256 = "c5d7c05babaf89936a8048dca1cf753ca22a2fa3ad03de69ae7b07520ae2fa95"
+GOLDEN_PROJECTION_SHA256 = (
+    "aa5dda62bd1807723010b7f0681f1cd7feda44c3587433845536e4aae7a1bcea"
+)
 
 
 def golden_contract():
@@ -764,21 +767,101 @@ class SizingProjectionTest(unittest.TestCase):
         projection = sizing_projection(contract)
         self.assertEqual(set(projection), SIZING_PROJECTION_KEYS)
         for derived in SIZING_DERIVED_KEYS:
-            self.assertNotIn(derived, projection)
+            with self.subTest(derived=derived):
+                self.assertNotIn(derived, projection)
+
+    def test_derived_key_set_is_pinned(self):
+        # Reclassifying a reviewed field as derived hides it from both sizing
+        # seats.  A seat cannot size work whose scope it cannot see, so the
+        # derived set is pinned rather than inferred.
+        self.assertEqual(SIZING_DERIVED_KEYS, frozenset({"points", "priority"}))
 
     def test_projection_key_set_partitions_the_contract_keys(self):
-        # A new contract field must be classified as derived or reviewed; it
-        # cannot silently appear in neither set or in both.
+        # Both sides are declared independently in the module, so this can
+        # actually fail: a new CONTRACT_KEYS entry belongs to neither set until
+        # someone classifies it.
         self.assertEqual(
             SIZING_PROJECTION_KEYS | SIZING_DERIVED_KEYS, CONTRACT_KEYS
         )
         self.assertEqual(SIZING_PROJECTION_KEYS & SIZING_DERIVED_KEYS, frozenset())
 
+    def test_every_reviewed_key_moves_the_projection_digest(self):
+        baseline = sizing_projection_sha256(golden_contract())
+        changes = {
+            "schemaVersion": 2,
+            "repository": "garcia42/other",
+            "issueNumber": 999,
+            "targetBranch": "release",
+            "baseCommit": "0" * 40,
+            "workType": "bug",
+            "problemStatement": "A different problem.",
+            "acceptanceCriteria": ["A different criterion."],
+            "testCommands": ["true"],
+            "allowedPaths": [{"kind": "file", "path": "README.md"}],
+            "outOfScope": ["Something else"],
+            "dependencies": [7],
+            "rollbackPlan": "Do nothing.",
+        }
+        # Fails closed: a new reviewed field must be classified and listed here.
+        self.assertEqual(set(changes), SIZING_PROJECTION_KEYS)
+        for key, value in changes.items():
+            contract = golden_contract()
+            contract[key] = value
+            with self.subTest(key=key):
+                self.assertIn(key, sizing_projection(contract))
+                self.assertNotEqual(sizing_projection_sha256(contract), baseline)
+
+    def test_projection_is_identical_for_every_phase_one_placeholder(self):
+        # Phase one builds the contract with any placeholder for the derived
+        # fields, including omitting them.  The reviewed content must be
+        # byte-identical to the sealed contract's, or phase two invalidates the
+        # review that produced it.
+        sealed_bytes = sizing_projection_bytes(golden_contract())
+        sealed_digest = sizing_projection_sha256(golden_contract())
+
+        omitted = golden_contract()
+        del omitted["points"]
+        del omitted["priority"]
+        candidates = [("omitted", omitted)]
+        for placeholder in (None, 0, "", "TBD", float("nan"), object()):
+            candidate = golden_contract()
+            candidate["points"] = placeholder
+            candidate["priority"] = placeholder
+            candidates.append((repr(placeholder), candidate))
+
+        for label, candidate in candidates:
+            with self.subTest(placeholder=label):
+                self.assertEqual(sizing_projection_bytes(candidate), sealed_bytes)
+                self.assertEqual(sizing_projection_sha256(candidate), sealed_digest)
+
+    def test_golden_projection_pins_canonical_bytes_and_digest(self):
+        expected = (
+            '{"acceptanceCriteria":["Valid envelopes normalize '
+            'deterministically."],"allowedPaths":[{"kind":"file","path":'
+            '"src/council_tools/ticket_contracts.py"},{"kind":"file","path":'
+            '"tests/test_ticket_contracts.py"}],"baseCommit":'
+            '"befbbfaea22f4c6f69fa42a8bc5bff21e5a189dd","dependencies":[],'
+            '"issueNumber":2,"outOfScope":["GitHub API integration"],'
+            '"problemStatement":"Add a strict ticket contract for Jos\u00e9.",'
+            '"repository":"garcia42/ai-council","rollbackPlan":'
+            '"Revert the issue commit.","schemaVersion":1,"targetBranch":"main",'
+            '"testCommands":["PYTHONPATH=src:. python3 -m unittest '
+            'tests.test_ticket_contracts -v"],"workType":"change"}'
+        ).encode("utf-8")
+        encoded = sizing_projection_bytes(golden_contract())
+        self.assertEqual(encoded, expected)
+        self.assertNotIn(b'"points"', encoded)
+        self.assertNotIn(b'"priority"', encoded)
+        self.assertEqual(
+            sizing_projection_sha256(golden_contract()), GOLDEN_PROJECTION_SHA256
+        )
+
     def test_projection_preserves_every_reviewed_field_exactly(self):
         contract = golden_contract()
         projection = sizing_projection(contract)
         for key in SIZING_PROJECTION_KEYS:
-            self.assertEqual(projection[key], contract[key], key)
+            with self.subTest(key=key):
+                self.assertEqual(projection[key], contract[key])
 
     def test_projection_digest_is_stable_across_every_derived_value(self):
         # This is the property that makes a qualification converge.
@@ -805,7 +888,8 @@ class SizingProjectionTest(unittest.TestCase):
         ):
             contract = golden_contract()
             contract[key] = value
-            self.assertNotEqual(sizing_projection_sha256(contract), baseline, key)
+            with self.subTest(key=key):
+                self.assertNotEqual(sizing_projection_sha256(contract), baseline)
 
     def test_writing_a_derived_value_back_does_not_move_the_projection(self):
         # Phase one: seats review the projection.  Phase two: the derived values
@@ -842,19 +926,49 @@ class SizingProjectionTest(unittest.TestCase):
         self.assertEqual(encoded, canonical_contract_bytes(sizing_projection(contract)))
 
     def test_projection_rejects_non_mapping_input(self):
-        for bad in (None, [], "contract", 3, b"{}"):
-            with self.assertRaises(TicketContractError) as caught:
-                sizing_projection(bad)
-            self.assertEqual(caught.exception.code, "non-canonical-json")
-            self.assertEqual(caught.exception.field, "contract")
+        for bad in (
+            None,
+            [],
+            (),
+            "contract",
+            3,
+            b"{}",
+            bytearray(b"{}"),
+            memoryview(b"{}"),
+            {"points"},
+            object(),
+            TextSubclass("{}"),
+            BytesSubclass(b"{}"),
+            IntegerSubclass(2),
+            IntegerEnum.TWO,
+        ):
+            with self.subTest(candidate_type=type(bad).__name__):
+                with self.assertRaises(TicketContractError) as caught:
+                    sizing_projection(bad)
+                self.assertEqual(caught.exception.code, "non-canonical-json")
+                self.assertEqual(caught.exception.field, "contract")
+                self.assertEqual(
+                    str(caught.exception),
+                    "ticket contract non-canonical-json at contract",
+                )
 
     def test_projection_digest_rejects_what_the_canonical_encoder_rejects(self):
-        for bad_value in (float("nan"), float("inf"), {1, 2}, object()):
+        for bad_value in (
+            float("nan"),
+            float("inf"),
+            {1, 2},
+            object(),
+            Decimal("1"),
+            "\ud800",
+        ):
             contract = golden_contract()
             contract["problemStatement"] = bad_value
-            with self.assertRaises(TicketContractError) as caught:
-                sizing_projection_sha256(contract)
-            self.assertEqual(caught.exception.code, "non-canonical-json")
+            with self.subTest(bad_value=repr(bad_value)):
+                for call in (sizing_projection_bytes, sizing_projection_sha256):
+                    with self.assertRaises(TicketContractError) as caught:
+                        call(contract)
+                    self.assertEqual(caught.exception.code, "non-canonical-json")
+                    self.assertEqual(caught.exception.field, "contract")
 
     def test_projection_digest_is_lowercase_hex(self):
         digest = sizing_projection_sha256(golden_contract())
@@ -868,7 +982,8 @@ class SizingProjectionTest(unittest.TestCase):
             "sizing_projection_bytes",
             "sizing_projection_sha256",
         ):
-            self.assertIn(name, ticket_contracts.__all__, name)
+            with self.subTest(name=name):
+                self.assertIn(name, ticket_contracts.__all__)
 
 
 if __name__ == "__main__":
