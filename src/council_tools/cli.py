@@ -15,6 +15,12 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from .artifacts import ArtifactStore, SecretDetectedError, secret_detectors
+from .capture_schema import strict_json_loads
+from .ticket_qualification import (
+    phase_one_material,
+    render_ticket_body,
+    seal_qualification,
+)
 from .activation_evidence import evaluate_activation_evidence
 from .capture_runtime import (
     append_capture_activation,
@@ -1047,6 +1053,70 @@ def command_recording_coverage(args: argparse.Namespace) -> int:
     return recording_exit_code(result)
 
 
+def _read_ticket_json(path: str, *, field: str) -> Any:
+    """Read one strict JSON document for a ticket command.
+
+    Uses the same strict loader as the ledger surfaces, so duplicate keys and
+    non-strict encodings are rejected before any governance function sees them.
+    """
+
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ValueError(f"cannot read {field}: {exc}") from exc
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"{field} is not valid UTF-8") from exc
+    return strict_json_loads(text)
+
+
+def command_ticket_projection(args: argparse.Namespace) -> int:
+    """Phase one: print exactly what a sizing seat may be shown."""
+
+    contract = _read_ticket_json(args.contract, field="contract")
+    material = phase_one_material(contract)
+    print(
+        json.dumps(
+            {
+                "projection": material.projection,
+                "sizingProjectionSha256": material.projection_sha256,
+            },
+            indent=2,
+            sort_keys=True,
+            ensure_ascii=False,
+        )
+    )
+    return 0
+
+
+def command_ticket_seal(args: argparse.Namespace) -> int:
+    """Phase two: record the derived values and bind the review to them."""
+
+    contract = _read_ticket_json(args.contract, field="contract")
+    reviews = _read_ticket_json(args.reviews, field="seat reviews")
+    sealed = seal_qualification(contract, reviews, run_id=args.run_id)
+    result: dict[str, Any] = {
+        "contract": sealed.contract,
+        "contractSha256": sealed.contract_sha256,
+        "reviewRecord": sealed.review_record,
+        "reviewRef": sealed.review_ref(),
+        "sizingProjectionSha256": sealed.projection_sha256,
+    }
+    if args.prose is not None:
+        try:
+            prose = Path(args.prose).read_text(encoding="utf-8")
+        except OSError as exc:
+            raise ValueError(f"cannot read prose: {exc}") from exc
+        except UnicodeDecodeError as exc:
+            raise ValueError("prose is not valid UTF-8") from exc
+        body = render_ticket_body(prose, sealed.contract, sealed.review_ref())
+        result["body"] = body
+        if args.out_body is not None:
+            # The only path either command writes, and only when named.
+            Path(args.out_body).write_text(body, encoding="utf-8")
+    print(json.dumps(result, indent=2, sort_keys=True, ensure_ascii=False))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1062,6 +1132,24 @@ def build_parser() -> argparse.ArgumentParser:
             _coordination_anchor_field=anchor_field,
             _coordination_context_fields=context_fields,
         )
+
+    projection = sub.add_parser(
+        "ticket-projection",
+        help="phase one: print the sizing projection a seat may see, and its digest",
+    )
+    projection.add_argument("--contract", required=True)
+    projection.set_defaults(func=command_ticket_projection)
+
+    seal = sub.add_parser(
+        "ticket-seal",
+        help="phase two: record the derived values and bind the review to them",
+    )
+    seal.add_argument("--contract", required=True)
+    seal.add_argument("--reviews", required=True)
+    seal.add_argument("--run-id", required=True)
+    seal.add_argument("--prose")
+    seal.add_argument("--out-body")
+    seal.set_defaults(func=command_ticket_seal)
 
     report = sub.add_parser("report")
     report.add_argument("--log", default=DEFAULT_LOG)
