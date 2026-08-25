@@ -214,8 +214,14 @@ Operator-enforced, with nothing checking it:
 - That the prose digest in the issue matches the one in the review record.
 - That reviewed content carries no self-sizing assertion.
 
-If a seat is re-run, re-run it against the same projection digest. A new projection digest is
-a new ticket for sizing purposes, not a second round on the same one.
+If a seat is re-run, re-run it against the same projection digest. A new projection digest
+is different work: its estimate is a first opinion on that work, not a second opinion on the
+old work.
+
+That is a statement about **sizing identity only**. It resets nothing. The run guard's
+`maxReviewRounds` budget is a session counter in
+`plugins/ai-council-run-guard/scripts/run_guard.py`, it is independent of projection
+identity, and editing reviewed content does not give a session more rounds.
 
 ## Integrity is not authorization
 
