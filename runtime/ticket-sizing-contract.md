@@ -143,8 +143,18 @@ Use `P0` for an active safety, security, or integrity failure; risk of
 irreversible loss; or an enforcement bypass that blocks safe activation.
 
 Use `P1` for a required bounded governance capability or correctness gap that
-does not meet the P0 impact bar. No P2 or lower implementation priority exists
-in this policy.
+does not meet the P0 impact bar.
+
+**No P2 or lower ticket priority exists.** The label namespace is exactly
+`priority:P0` and `priority:P1`, and `parse_ticket_labels` rejects `priority:P2`.
+A P2 *ticket* is not a backlog item; it is not a thing.
+
+Do not confuse this with **review-finding severity**, which is a different scale
+in the same repository: findings run `P0` through `P3`, where P0 and P1 block an
+acceptance contract and P2 and P3 are retained as backlog (`docs/RUN_GUARD.md`,
+`AGENTS.md`). So "are there any P2s left" has opposite answers depending on which
+scale is meant — none can exist as tickets, while P2 findings are the ordinary
+non-blocking remainder. Name the scale whenever it is not obvious from context.
 
 When submitted seats disagree, P0 wins. This permits one seat to escalate a
 live integrity concern conservatively.

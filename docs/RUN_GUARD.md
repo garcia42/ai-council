@@ -25,6 +25,11 @@ agent work.
 | No-progress review rounds | 2 | Treat as a stuck signal |
 | Blocking severities | P0 and P1 only | Preserve P2/P3 as backlog |
 
+These severities grade **review findings**, not tickets. Ticket priority is a
+separate scale with only `priority:P0` and `priority:P1` — a P2 ticket cannot
+exist, while a P2 finding is the ordinary non-blocking backlog. See the priority
+rubric in `runtime/ticket-sizing-contract.md`.
+
 The versioned source of truth is [`.ai-council/run-guard.json`](../.ai-council/run-guard.json).
 The parser rejects missing or extra keys, non-positive limits, renewal windows above two hours,
 and any attempt to make P2 or P3 blocking.
