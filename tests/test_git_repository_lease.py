@@ -237,3 +237,86 @@ class DocumentedLimitsTests(LeaseTestCase):
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+
+class BorrowTests(LeaseTestCase):
+    def test_a_fresh_lease_is_not_borrowed(self):
+        held = self.lease()
+        self.assertEqual(held.borrow_count, 0)
+        self.assertFalse(held.is_borrowed)
+
+    def test_a_borrow_is_visible_while_held_and_gone_afterwards(self):
+        # A removal path needs something exact to observe, not a convention.
+        held = self.lease()
+        with held.borrow():
+            self.assertEqual(held.borrow_count, 1)
+            self.assertTrue(held.is_borrowed)
+        self.assertEqual(held.borrow_count, 0)
+        self.assertFalse(held.is_borrowed)
+
+    def test_a_borrow_blocks_closing_the_descriptor(self):
+        # Closing mid-operation is the same failure as removing the tree: the
+        # bound child loses its repository.
+        held = self.lease()
+        with held.borrow():
+            with self.assertRaises(GitRepositoryLeaseError) as caught:
+                release_descriptor(held)
+            self.assertEqual(caught.exception.code, "lease-is-borrowed")
+        release_descriptor(held)
+
+    def test_nested_borrows_count_and_only_the_last_release_frees_the_lease(self):
+        held = self.lease()
+        with held.borrow():
+            with held.borrow():
+                self.assertEqual(held.borrow_count, 2)
+                with self.assertRaises(GitRepositoryLeaseError):
+                    release_descriptor(held)
+            self.assertEqual(held.borrow_count, 1)
+            self.assertTrue(held.is_borrowed)
+        self.assertEqual(held.borrow_count, 0)
+
+    def test_an_exception_inside_a_borrow_still_releases_it(self):
+        # A failed operation must not pin a lease forever, because cleanup
+        # waits on this count.
+        held = self.lease()
+
+        class Boom(Exception):
+            pass
+
+        with self.assertRaises(Boom):
+            with held.borrow():
+                raise Boom
+        self.assertEqual(held.borrow_count, 0)
+        release_descriptor(held)
+
+    def test_taking_a_borrow_revalidates_identity_first(self):
+        # An operation must never begin against a descriptor whose identity has
+        # already drifted.
+        held = self.lease()
+        drifted = dataclasses.replace(
+            held, identity=dataclasses.replace(held.identity, inode=held.identity.inode + 1)
+        )
+        with self.assertRaises(GitRepositoryLeaseError) as caught:
+            with drifted.borrow():
+                pass  # pragma: no cover - the borrow must not be entered
+        self.assertEqual(caught.exception.code, "identity-mismatch")
+        self.assertEqual(drifted.borrow_count, 0)
+
+    def test_a_borrow_yields_the_lease_itself(self):
+        held = self.lease()
+        with held.borrow() as borrowed:
+            self.assertIs(borrowed, held)
+
+    def test_borrow_state_does_not_affect_lease_equality(self):
+        # The count is operational state, not part of the lease's identity.
+        held = self.lease()
+        snapshot = dataclasses.replace(held)
+        with held.borrow():
+            self.assertEqual(held, snapshot)
+
+    def test_the_module_records_that_a_descriptor_does_not_protect_an_operation(self):
+        import council_tools.git_repository_lease as module
+
+        text = module.__doc__ or ""
+        self.assertIn("does not by itself protect an in-flight operation", text)
+        self.assertIn("process-local", text)
