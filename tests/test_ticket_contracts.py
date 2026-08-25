@@ -10,6 +10,8 @@ from council_tools.ticket_contracts import (
     AllowedPath,
     CONTRACT_KEYS,
     MAX_TICKET_JSON_BYTES,
+    OPTIONAL_CONTRACT_KEYS,
+    REQUIRED_CONTRACT_KEYS,
     SIZING_DERIVED_KEYS,
     SIZING_PROJECTION_KEYS,
     TicketContractError,
@@ -765,7 +767,12 @@ class SizingProjectionTest(unittest.TestCase):
     def test_projection_omits_exactly_the_derived_fields(self):
         contract = golden_contract()
         projection = sizing_projection(contract)
-        self.assertEqual(set(projection), SIZING_PROJECTION_KEYS)
+        # Compared against the contract's own keys rather than the full reviewed
+        # set, because an optional reviewed key may legitimately be absent. The
+        # property under test is unchanged: the projection drops the derived
+        # keys and keeps everything else the contract actually carried.
+        self.assertEqual(set(projection), set(contract) - SIZING_DERIVED_KEYS)
+        self.assertTrue(set(projection) <= SIZING_PROJECTION_KEYS)
         for derived in SIZING_DERIVED_KEYS:
             with self.subTest(derived=derived):
                 self.assertNotIn(derived, projection)
@@ -801,6 +808,9 @@ class SizingProjectionTest(unittest.TestCase):
             "outOfScope": ["Something else"],
             "dependencies": [7],
             "rollbackPlan": "Do nothing.",
+            # Adding an optional reviewed field must move the digest too: a seat
+            # that was not shown it reviewed different content.
+            "readPaths": [{"kind": "file", "path": "src/council_tools/cli.py"}],
         }
         # Fails closed: a new reviewed field must be classified and listed here.
         self.assertEqual(set(changes), SIZING_PROJECTION_KEYS)
@@ -859,9 +869,15 @@ class SizingProjectionTest(unittest.TestCase):
     def test_projection_preserves_every_reviewed_field_exactly(self):
         contract = golden_contract()
         projection = sizing_projection(contract)
-        for key in SIZING_PROJECTION_KEYS:
+        for key in SIZING_PROJECTION_KEYS & set(contract):
             with self.subTest(key=key):
                 self.assertEqual(projection[key], contract[key])
+
+    def test_an_optional_reviewed_field_is_carried_when_present(self):
+        contract = golden_contract()
+        contract["readPaths"] = [{"kind": "file", "path": "src/council_tools/cli.py"}]
+        projection = sizing_projection(contract)
+        self.assertEqual(projection["readPaths"], contract["readPaths"])
 
     def test_projection_digest_is_stable_across_every_derived_value(self):
         # This is the property that makes a qualification converge.
@@ -988,3 +1004,160 @@ class SizingProjectionTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReadPathsTest(unittest.TestCase):
+    """The optional read-dependency field.
+
+    Optionality here is a compatibility requirement, not a convenience: the
+    key-set check is exact and the canonical form serializes the mapping as it
+    stands, so a required key would break every published body and an
+    always-present empty value would move every published digest.
+    """
+
+    def test_a_contract_omitting_the_field_is_valid_and_digests_unchanged(self):
+        contract = golden_contract()
+        self.assertNotIn("readPaths", contract)
+        before = contract_sha256(contract)
+        envelope = validate_ticket_envelope(
+            {"contract": contract, "reviewRef": {"runId": "r", "contractSha256": before}}
+        )
+        self.assertEqual(envelope.contract.read_paths, ())
+        # The round-trip must not introduce the key either, or a caller that
+        # re-serializes a parsed contract would move its digest.
+        self.assertNotIn("readPaths", envelope.contract.as_dict())
+        self.assertEqual(contract_sha256(envelope.contract.as_dict()), before)
+
+    def test_an_explicitly_empty_value_is_rejected(self):
+        # Absence already means "none". Two spellings would give one meaning two
+        # canonical forms and therefore two digests.
+        contract = golden_contract()
+        contract["readPaths"] = []
+        with self.assertRaises(TicketContractError) as caught:
+            validate_ticket_envelope(
+                {
+                    "contract": contract,
+                    "reviewRef": {
+                        "runId": "r",
+                        "contractSha256": contract_sha256(contract),
+                    },
+                }
+            )
+        self.assertEqual(caught.exception.code, "invalid-read-paths")
+
+    def test_a_declared_read_path_round_trips(self):
+        contract = golden_contract()
+        contract["readPaths"] = [
+            {"kind": "file", "path": "src/council_tools/ticket_admission.py"}
+        ]
+        envelope = validate_ticket_envelope(
+            {
+                "contract": contract,
+                "reviewRef": {
+                    "runId": "r",
+                    "contractSha256": contract_sha256(contract),
+                },
+            }
+        )
+        self.assertEqual(len(envelope.contract.read_paths), 1)
+        self.assertTrue(
+            envelope.contract.reads_path("src/council_tools/ticket_admission.py")
+        )
+        self.assertEqual(envelope.contract.as_dict()["readPaths"], contract["readPaths"])
+
+    def test_a_read_path_grants_no_write_permission(self):
+        contract = golden_contract()
+        contract["readPaths"] = [
+            {"kind": "file", "path": "src/council_tools/ticket_admission.py"}
+        ]
+        envelope = validate_ticket_envelope(
+            {
+                "contract": contract,
+                "reviewRef": {
+                    "runId": "r",
+                    "contractSha256": contract_sha256(contract),
+                },
+            }
+        )
+        # The entire reason the field exists: it must not widen write scope.
+        self.assertFalse(
+            envelope.contract.allows_path("src/council_tools/ticket_admission.py")
+        )
+
+    def test_a_path_in_both_scopes_is_rejected(self):
+        contract = golden_contract()
+        contract["readPaths"] = list(contract["allowedPaths"][:1])
+        with self.assertRaises(TicketContractError) as caught:
+            validate_ticket_envelope(
+                {
+                    "contract": contract,
+                    "reviewRef": {
+                        "runId": "r",
+                        "contractSha256": contract_sha256(contract),
+                    },
+                }
+            )
+        self.assertEqual(caught.exception.code, "read-path-also-writable")
+
+    def test_entries_are_validated_like_write_scopes(self):
+        bad_entries = [
+            [{"kind": "socket", "path": "a.py"}],
+            [{"kind": "file", "path": "../escape.py"}],
+            [{"kind": "file", "path": "a/.git/config"}],
+            [{"kind": "file"}],
+            [{"kind": "file", "path": "a.py", "extra": 1}],
+            [{"kind": "file", "path": "a.py"}, {"kind": "file", "path": "a.py"}],
+            "not-a-list",
+        ]
+        for entries in bad_entries:
+            with self.subTest(entries=entries):
+                contract = golden_contract()
+                contract["readPaths"] = entries
+                with self.assertRaises(TicketContractError):
+                    validate_ticket_envelope(
+                        {
+                            "contract": contract,
+                            "reviewRef": {
+                                "runId": "r",
+                                "contractSha256": contract_sha256(contract),
+                            },
+                        }
+                    )
+
+    def test_an_unknown_key_is_still_rejected(self):
+        # Optionality applies to one named key, not to anything a caller invents.
+        contract = golden_contract()
+        contract["writePaths"] = []
+        with self.assertRaises(TicketContractError) as caught:
+            validate_ticket_envelope(
+                {
+                    "contract": contract,
+                    "reviewRef": {
+                        "runId": "r",
+                        "contractSha256": contract_sha256(contract),
+                    },
+                }
+            )
+        self.assertEqual(caught.exception.code, "invalid-contract-keys")
+
+    def test_a_missing_required_key_is_still_rejected(self):
+        contract = golden_contract()
+        del contract["rollbackPlan"]
+        with self.assertRaises(TicketContractError) as caught:
+            validate_ticket_envelope(
+                {
+                    "contract": contract,
+                    "reviewRef": {
+                        "runId": "r",
+                        "contractSha256": contract_sha256(contract),
+                    },
+                }
+            )
+        self.assertEqual(caught.exception.code, "invalid-contract-keys")
+
+    def test_the_optional_set_is_pinned(self):
+        self.assertEqual(OPTIONAL_CONTRACT_KEYS, frozenset({"readPaths"}))
+        self.assertEqual(REQUIRED_CONTRACT_KEYS, CONTRACT_KEYS - OPTIONAL_CONTRACT_KEYS)
+        # Optional or not, it is reviewed content and the seats must see it.
+        self.assertIn("readPaths", SIZING_PROJECTION_KEYS)
+        self.assertNotIn("readPaths", SIZING_DERIVED_KEYS)

@@ -206,6 +206,7 @@ class TicketAdmissionTest(unittest.TestCase):
             "base-commit-mismatch",
             "base-commit-not-descendant",
             "base-commit-scope-changed",
+            "base-commit-read-dependency-changed",
             "priority-mismatch",
             "size-mismatch",
             "work-type-mismatch",
@@ -907,3 +908,80 @@ class ProjectionBindingTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReadDependencyAdmissionTest(unittest.TestCase):
+    """A change to a declared read dependency invalidates a qualification.
+
+    Before this field existed the invalidated set was computed from write scope
+    alone, which is a proxy: a ticket that reads an interface it must not write
+    stayed admissible when that interface moved. #88 was the measured case.
+    """
+
+    # Deliberately OUTSIDE the fixture's allowedPaths, which already grant write
+    # access to ticket_admission.py. A path in both scopes is a contradiction the
+    # contract refuses, and using one here would test that refusal by accident
+    # instead of testing the admission rule.
+    READ_PATH = "src/council_tools/ticket_contracts.py"
+
+    def _contract_with_read_path(self):
+        raw = copy.deepcopy(contract())
+        raw["readPaths"] = [{"kind": "file", "path": self.READ_PATH}]
+        return raw
+
+    def test_a_change_to_a_read_dependency_refuses_with_its_own_reason(self):
+        snapshot, context, evidence = valid_inputs(self._contract_with_read_path())
+        context["baseCommit"] = "b" * 40
+        context["baseCommitEvidence"] = {
+            "contractBaseIsAncestor": True,
+            "changedPaths": [self.READ_PATH],
+        }
+        result = evaluate_ticket_admission(snapshot, context, evidence)
+        self.assertFalse(result.structurally_eligible)
+        self.assertIn("base-commit-read-dependency-changed", result.reasons)
+        # Reported distinctly from a write-scope change: the first says the
+        # ticket's own files moved, the second says something it reads did.
+        self.assertNotIn("base-commit-scope-changed", result.reasons)
+
+    def test_a_change_elsewhere_still_admits(self):
+        snapshot, context, evidence = valid_inputs(self._contract_with_read_path())
+        context["baseCommit"] = "b" * 40
+        context["baseCommitEvidence"] = {
+            "contractBaseIsAncestor": True,
+            "changedPaths": ["docs/UNRELATED.md"],
+        }
+        result = evaluate_ticket_admission(snapshot, context, evidence)
+        self.assertTrue(result.structurally_eligible)
+
+    def test_without_the_field_a_read_dependency_change_still_admits(self):
+        # The behaviour every already-published contract keeps: this is what
+        # makes the field additive rather than a silent re-qualification of the
+        # entire backlog.
+        snapshot, context, evidence = valid_inputs()
+        context["baseCommit"] = "b" * 40
+        context["baseCommitEvidence"] = {
+            "contractBaseIsAncestor": True,
+            "changedPaths": [self.READ_PATH],
+        }
+        result = evaluate_ticket_admission(snapshot, context, evidence)
+        self.assertTrue(result.structurally_eligible)
+
+    def test_both_reasons_can_be_reported_together(self):
+        raw = self._contract_with_read_path()
+        snapshot, context, evidence = valid_inputs(raw)
+        context["baseCommit"] = "b" * 40
+        context["baseCommitEvidence"] = {
+            "contractBaseIsAncestor": True,
+            "changedPaths": [self.READ_PATH, raw["allowedPaths"][0]["path"]],
+        }
+        result = evaluate_ticket_admission(snapshot, context, evidence)
+        self.assertIn("base-commit-read-dependency-changed", result.reasons)
+        self.assertIn("base-commit-scope-changed", result.reasons)
+
+    def test_the_read_dependency_grants_no_write_permission(self):
+        snapshot, context, evidence = valid_inputs(self._contract_with_read_path())
+        result = evaluate_ticket_admission(snapshot, context, evidence)
+        self.assertTrue(result.structurally_eligible)
+        envelope = ticket_policy.parse_ticket_issue_body(snapshot["body"])
+        self.assertTrue(envelope.contract.reads_path(self.READ_PATH))
+        self.assertFalse(envelope.contract.allows_path(self.READ_PATH))
