@@ -18,7 +18,8 @@ from council_tools.ticket_review import (
 
 
 CONTRACT_SHA256 = "a" * 64
-GOLDEN_REVIEW_SHA256 = "e0b3dc3912293f9ba957f4c9c7b9d445d03ec837798532ff21c4c6c8cdcd3c14"
+PROJECTION_SHA256 = "b" * 64
+GOLDEN_REVIEW_SHA256 = "43baa162296e60ba38826d9d5992949425004df22dd92771a83822fcb9cfe32b"
 
 
 def submitted(
@@ -53,9 +54,10 @@ def unavailable(seat_id, reason="Seat was unavailable for this review."):
 
 def record(*, claude=None, codex=None):
     return {
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "runId": "review-run-6",
         "contractSha256": CONTRACT_SHA256,
+        "sizingProjectionSha256": PROJECTION_SHA256,
         "requiredSeats": ["claude", "codex"],
         "seatReviews": [
             claude
@@ -97,9 +99,12 @@ class TicketReviewTest(unittest.TestCase):
         normalized = validate_ticket_review(
             record(), expected_contract_sha256=CONTRACT_SHA256
         )
-        self.assertEqual(normalized.schema_version, 1)
+        self.assertEqual(normalized.schema_version, 2)
         self.assertEqual(normalized.run_id, "review-run-6")
         self.assertEqual(normalized.contract_sha256, CONTRACT_SHA256)
+        self.assertEqual(
+            normalized.sizing_projection_sha256, PROJECTION_SHA256
+        )
         self.assertEqual(normalized.required_seats, REQUIRED_SEATS)
         self.assertEqual(normalized.state, "eligible")
         self.assertEqual(normalized.points, 3)
@@ -111,12 +116,14 @@ class TicketReviewTest(unittest.TestCase):
             '{"contractSha256":"'
             + CONTRACT_SHA256
             + '","requiredSeats":["claude","codex"],"runId":"review-run-6",'
-            '"schemaVersion":1,"seatReviews":[{"confidence":80,'
+            '"schemaVersion":2,"seatReviews":[{"confidence":80,'
             '"engineerDays":2,"priority":"P1","seatId":"claude",'
             '"singleOutcome":true,"splitReasons":[],"status":"submitted"},'
             '{"confidence":60,"engineerDays":3,"priority":"P0",'
             '"seatId":"codex","singleOutcome":true,"splitReasons":[],'
-            '"status":"submitted"}]}'
+            '"status":"submitted"}],"sizingProjectionSha256":"'
+            + PROJECTION_SHA256
+            + '"}'
         ).encode("utf-8")
         self.assertEqual(canonical_review_bytes(normalized), expected)
         self.assertEqual(normalized.review_sha256, GOLDEN_REVIEW_SHA256)
@@ -137,7 +144,7 @@ class TicketReviewTest(unittest.TestCase):
             normalized.state = "needs-split"
 
     def test_schema_version_dispatches_before_exact_key_validation(self):
-        for version in (0, 2, True, "1"):
+        for version in (0, 1, 3, True, "2"):
             raw = {"schemaVersion": version, "future": "shape"}
             with self.subTest(version=version):
                 self.assertReviewError(
@@ -571,7 +578,7 @@ class TicketReviewTest(unittest.TestCase):
     def test_strict_json_loader_rejects_duplicates_constants_and_malformed(self):
         document = json.dumps(record())
         duplicate = document.replace(
-            '"schemaVersion": 1', '"schemaVersion": 1, "schemaVersion": 1'
+            '"schemaVersion": 2', '"schemaVersion": 2, "schemaVersion": 2'
         )
         nested_duplicate = document.replace(
             '"seatId": "claude"', '"seatId": "claude", "seatId": "claude"'

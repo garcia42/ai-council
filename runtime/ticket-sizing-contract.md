@@ -32,9 +32,10 @@ Return one JSON object with these exact top-level keys:
 
 ```json
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "runId": "review-run-id",
-  "contractSha256": "lowercase-64-hex-ticket-contract-digest",
+  "contractSha256": "lowercase-64-hex-sealed-contract-digest",
+  "sizingProjectionSha256": "lowercase-64-hex-sizing-projection-digest",
   "requiredSeats": ["claude", "codex"],
   "seatReviews": [
     {
@@ -134,13 +135,16 @@ when those values are recorded.
    and that digest. Collect the seat reviews and derive the decision.
 2. **Phase two, seal.** Write the derived `points` and `priority` into the contract. The
    projection digest is byte-identical across this write — assert it. Compute
-   `contract_sha256` over the sealed contract, and bind the review record and `reviewRef`
-   to that digest.
+   `contract_sha256` over the sealed contract, bind `reviewRef` to that digest, and record
+   the projection digest in the review record's `sizingProjectionSha256`.
 
-Record the projection digest in the issue's Sizing prose. An auditor re-derives it from the
-published contract and confirms it matches what the seats were given. A change to any
-reviewed field moves the projection digest and invalidates the qualification; a change to a
-derived field does not, because the seats determined it.
+`sizingProjectionSha256` is what the seats were shown. Admission re-derives the projection
+from the published contract and rejects the review with `review-projection-mismatch` if the
+two differ, so a reviewed field edited after the review fails even though the contract digest
+was recomputed. A change to a derived field does not, because the seats determined it.
+
+Record the projection digest in the issue's Sizing prose as well. The prose copy is for a
+human auditor; the enforced binding is the one in the review record.
 
 If a seat is re-run, re-run it against the same projection digest. A new projection digest is
 a new ticket for sizing purposes, not a second round on the same one.
