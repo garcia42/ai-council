@@ -18,7 +18,7 @@ from typing import Any, Mapping
 import council_tools.ticket_contracts as ticket_contracts
 
 
-REVIEW_SCHEMA_VERSION = 1
+REVIEW_SCHEMA_VERSION = 2
 REQUIRED_SEATS = ("claude", "codex")
 MAX_ENGINEER_DAYS = 30
 ELIGIBLE_MAX_DAYS = 3
@@ -33,6 +33,7 @@ REVIEW_KEYS = frozenset(
         "schemaVersion",
         "runId",
         "contractSha256",
+        "sizingProjectionSha256",
         "requiredSeats",
         "seatReviews",
     }
@@ -108,6 +109,7 @@ class TicketReview:
     schema_version: int
     run_id: str
     contract_sha256: str
+    sizing_projection_sha256: str
     required_seats: tuple[str, ...]
     seat_reviews: tuple[SeatReview, ...]
     state: str
@@ -124,6 +126,7 @@ class TicketReview:
             "schemaVersion": self.schema_version,
             "runId": self.run_id,
             "contractSha256": self.contract_sha256,
+            "sizingProjectionSha256": self.sizing_projection_sha256,
             "requiredSeats": list(self.required_seats),
             "seatReviews": [seat.as_dict() for seat in self.seat_reviews],
         }
@@ -332,6 +335,14 @@ def validate_ticket_review(
             "contract-sha256-mismatch", "review.contractSha256"
         )
 
+    sizing_projection_sha256 = raw["sizingProjectionSha256"]
+    if type(sizing_projection_sha256) is not str or not _SHA256_RE.fullmatch(
+        sizing_projection_sha256
+    ):
+        raise TicketReviewError(
+            "invalid-sizing-projection-sha256", "review.sizingProjectionSha256"
+        )
+
     required_seats = raw["requiredSeats"]
     if (
         type(required_seats) is not list
@@ -396,6 +407,7 @@ def validate_ticket_review(
         schema_version=REVIEW_SCHEMA_VERSION,
         run_id=run_id,
         contract_sha256=contract_sha256,
+        sizing_projection_sha256=sizing_projection_sha256,
         required_seats=REQUIRED_SEATS,
         seat_reviews=seat_reviews,
         state=state,

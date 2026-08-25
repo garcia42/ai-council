@@ -13,6 +13,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+import council_tools.ticket_contracts as ticket_contracts
 import council_tools.ticket_policy as ticket_policy
 import council_tools.ticket_review as ticket_review
 from council_tools.ticket_contracts import (
@@ -72,6 +73,7 @@ REASON_CODES = (
     "review-not-eligible",
     "review-size-mismatch",
     "review-priority-mismatch",
+    "review-projection-mismatch",
 )
 
 _BASE_COMMIT_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
@@ -371,6 +373,26 @@ def evaluate_ticket_admission(
                         found.add("review-size-mismatch")
                     if matched_review.priority != envelope.contract.priority:
                         found.add("review-priority-mismatch")
+                    # The contract digest binds the sealed contract, which the
+                    # seats never saw: it carries the two fields their review
+                    # derived, and it is recomputed after those are recorded.
+                    # Re-deriving the projection from the published contract is
+                    # what ties the review to the content actually reviewed, so
+                    # a reviewed field edited after the review fails here.
+                    try:
+                        published_projection = (
+                            ticket_contracts.sizing_projection_sha256(
+                                envelope.contract.as_dict()
+                            )
+                        )
+                    except ValueError:
+                        published_projection = None
+                    if (
+                        published_projection is None
+                        or published_projection
+                        != matched_review.sizing_projection_sha256
+                    ):
+                        found.add("review-projection-mismatch")
 
     reasons = _ordered_reasons(found)
     structurally_eligible = not reasons

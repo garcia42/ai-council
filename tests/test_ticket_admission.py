@@ -11,7 +11,10 @@ from council_tools.ticket_admission import (
     REASON_CODES,
     evaluate_ticket_admission,
 )
-from council_tools.ticket_contracts import contract_sha256
+from council_tools.ticket_contracts import (
+    contract_sha256,
+    sizing_projection_sha256,
+)
 
 
 BASE_COMMIT = "d8b53357087a4baa478851f156c148792ae9ca0f"
@@ -46,9 +49,10 @@ def contract():
 def raw_review(raw_contract=None, *, days=(2, 3), priorities=("P1", "P0")):
     raw_contract = raw_contract if raw_contract is not None else contract()
     return {
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "runId": RUN_ID,
         "contractSha256": contract_sha256(raw_contract),
+        "sizingProjectionSha256": sizing_projection_sha256(raw_contract),
         "requiredSeats": ["claude", "codex"],
         "seatReviews": [
             {
@@ -204,6 +208,7 @@ class TicketAdmissionTest(unittest.TestCase):
             "review-not-eligible",
             "review-size-mismatch",
             "review-priority-mismatch",
+            "review-projection-mismatch",
         )
         self.assertEqual(REASON_CODES, expected)
         self.assertEqual(len(REASON_CODES), len(set(REASON_CODES)))
@@ -684,6 +689,71 @@ class TicketAdmissionTest(unittest.TestCase):
         ):
             with self.subTest(name=name):
                 self.assertFalse(hasattr(ticket_admission, name))
+
+
+class ProjectionBindingTest(unittest.TestCase):
+    """A review is bound to the content its seats were shown, not just to a digest."""
+
+    def _admit(self, raw_contract, review_contract=None):
+        # review_contract is what the seats reviewed; raw_contract is what was
+        # finally published.  They differ in the tamper cases below.
+        reviewed = review_contract if review_contract is not None else raw_contract
+        raw = raw_review(reviewed)
+        raw["contractSha256"] = contract_sha256(raw_contract)
+        raw["sizingProjectionSha256"] = sizing_projection_sha256(reviewed)
+        review = ticket_review.validate_ticket_review(
+            raw, expected_contract_sha256=contract_sha256(raw_contract)
+        )
+        snapshot, context, _ = valid_inputs(raw_contract)
+        return evaluate_ticket_admission(snapshot, context, [review])
+
+    def test_untampered_contract_is_admitted(self):
+        self.assertTrue(self._admit(contract()).structurally_eligible)
+
+    def test_editing_any_reviewed_field_after_review_fails_admission(self):
+        # Seat results are held fixed and the contract digest is recomputed, so
+        # only the projection binding can detect these.
+        edits = {
+            "problemStatement": "A different problem entirely.",
+            "acceptanceCriteria": ["Something nobody sized."],
+            "testCommands": ["true"],
+            "allowedPaths": [{"kind": "directory", "path": "src"}],
+            "outOfScope": ["Nothing at all"],
+            "rollbackPlan": "Leave it broken.",
+            "workType": "bug",
+        }
+        for key, value in edits.items():
+            reviewed = contract()
+            published = contract()
+            published[key] = value
+            with self.subTest(edited=key):
+                result = self._admit(published, review_contract=reviewed)
+                self.assertFalse(result.structurally_eligible)
+                self.assertIn("review-projection-mismatch", result.reasons)
+
+    def test_editing_only_the_derived_fields_still_passes(self):
+        # points and priority are what the seats derived; changing them to the
+        # derived values is exactly what phase two does.
+        reviewed = contract()
+        reviewed["points"] = 1
+        reviewed["priority"] = "P1"
+        published = contract()
+        self.assertEqual(published["points"], 3)
+        self.assertEqual(published["priority"], "P0")
+        result = self._admit(published, review_contract=reviewed)
+        self.assertTrue(result.structurally_eligible, result.reasons)
+
+    def test_projection_mismatch_is_reported_with_a_stable_reason_code(self):
+        raw = raw_review(contract())
+        raw["sizingProjectionSha256"] = "c" * 64
+        review = ticket_review.validate_ticket_review(
+            raw, expected_contract_sha256=contract_sha256(contract())
+        )
+        snapshot, context, _ = valid_inputs(contract())
+        result = evaluate_ticket_admission(snapshot, context, [review])
+        self.assertFalse(result.structurally_eligible)
+        self.assertEqual(result.reasons, ("review-projection-mismatch",))
+
 
 
 if __name__ == "__main__":
