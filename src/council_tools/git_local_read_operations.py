@@ -40,6 +40,7 @@ NO_REPLACE_OBJECTS = "--no-replace-objects"
 
 CAT_FILE = "cat-file"
 LS_TREE = "ls-tree"
+REV_PARSE = "rev-parse"
 
 
 class GitReadOperationError(ValueError):
@@ -123,9 +124,41 @@ class ListTree(_TypedObjectRead):
         )
 
 
+@dataclass(frozen=True)
+class ObserveObjectFormat:
+    """Observe the format this repository names objects in.
+
+    This is the one read in the family that takes **no object selector**, and it
+    is deliberately shaped differently from the rest for a measured reason.
+
+    On the pinned ``git 2.39.5`` the documented option terminator is *consumed as
+    an operand* by this query: ``rev-parse --end-of-options --show-object-format``
+    treats the terminator as the thing being asked about, so a builder written on
+    the assumption that the terminator separates flags from operands renders a
+    command that asks the wrong question.  It is therefore absent here on
+    purpose, not by oversight (spike Row 9).
+
+    Because there is no selector, there is also no typed operand carrying the
+    operand defence the way ``Sha1ObjectId`` does for the reads above.  This
+    operation's safety rests entirely on accepting **nothing** from a caller, so
+    it takes no parameters at all.
+
+    It observes and does not judge: comparing the result to a required format
+    belongs to whichever caller holds that expectation.
+    """
+
+    def render(self) -> RenderedInvocation:
+        return RenderedInvocation(
+            global_options=(),
+            subcommand=REV_PARSE,
+            subcommand_args=("--show-object-format",),
+        )
+
+
 #: Every read this module can emit.  Used by tests to assert the family is
 #: closed rather than checked case by case.
-READ_OPERATIONS = (ReadObjectType, ReadCommitBytes, ReadBlobBytes, ListTree)
+SELECTOR_READS = (ReadObjectType, ReadCommitBytes, ReadBlobBytes, ListTree)
+READ_OPERATIONS = SELECTOR_READS + (ObserveObjectFormat,)
 
 
 __all__ = [
@@ -133,6 +166,9 @@ __all__ = [
     "LS_TREE",
     "NO_REPLACE_OBJECTS",
     "READ_OPERATIONS",
+    "REV_PARSE",
+    "SELECTOR_READS",
+    "ObserveObjectFormat",
     "GitReadOperationError",
     "ListTree",
     "ReadBlobBytes",
