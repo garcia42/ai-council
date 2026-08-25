@@ -87,7 +87,12 @@ python3 ~/.claude/knowledge/council-eval/predictions_report.py \
 
 The spec pins the ledger hash, line count, byte count, mode, both raw line hashes and
 the expected after-image. Execution re-derives all of it independently and refuses on
-any disagreement, so a wrong plan repairs nothing. It writes a SHA-named byte-exact
+any disagreement, so a wrong plan repairs nothing.
+
+**A line named by a `council-superseded` record is refused, in code, by both planning and
+execution** (#35). That rule used to live only in this document; rewriting such a line breaks
+the digest that record pins, and the record cannot afterwards be withdrawn, so the gate would
+stay red on a row nobody could touch. It writes a SHA-named byte-exact
 backup and a prepared/completed audit pair under
 `~/.local/state/council-tools/ledger-recovery-<runId>/`.
 

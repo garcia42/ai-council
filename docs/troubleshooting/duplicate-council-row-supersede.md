@@ -84,7 +84,10 @@ verified. Do not execute it merely because the repository contains the implement
 **Nothing else can cure this.** `repair-tail` removes only a line that fails JSON parsing,
 and these parse. `recover-brief` rewrites `blindSeat.brief`; pointing a duplicate at a
 different brief would assert the seat read a brief it never read, which is fabricating
-evidence to clear a validator. `recover-valid-row` is allowlisted to
+evidence to clear a validator. **It is also now refused in code** (#35): once a
+`council-superseded` record names a line — through either `supersedes` or `duplicateOf` —
+`recover-brief` refuses that line at both planning and execution, because rewriting it would
+break the digest the record pins and that record cannot afterwards be withdrawn. `recover-valid-row` is allowlisted to
 `blindSeat.role -> "SKIPPED"` on `ran=false` rows and must not grow a case for this. The
 row is not wrong in a field — it should not exist, and an append-only store cannot say
 that by editing.
