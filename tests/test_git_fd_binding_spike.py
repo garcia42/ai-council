@@ -273,8 +273,32 @@ class GitDescriptorBindingSpike(unittest.TestCase):
         # NOT keep the repository usable once the tree is unlinked, because Git
         # re-resolves /proc/self/fd/N as a path and the entries below it are
         # gone.  Cleanup must therefore wait or refuse while a borrow is live.
-        # The consolation is the direction of failure: an error, never a wrong
-        # answer from a substituted repository.
+        #
+        # THE SYNCHRONISATION BELOW IS LOAD-BEARING.  Do not remove it.  An
+        # earlier version of this test removed the tree immediately after
+        # Popen and asserted the child reported the repository absent.  That
+        # is a race by construction -- the assertion holds only if the child
+        # got far enough to be affected by the unlink and not so far that it
+        # had already opened the repository -- and it failed once during a
+        # full run with six other processes active (issue #122).
+        #
+        # Synchronising does not merely stabilise that assertion; it falsifies
+        # it.  A child that has ALREADY opened the repository does not report
+        # the repository absent after the unlink.  It answers the next lookup
+        # with "<oid> missing" on stdout and exits 0.  Measured on the pinned
+        # binary and reproduced 5/5 while re-contracting #122.
+        #
+        # That distinction is the point, and it is why design/git-fd-binding-
+        # spike.md Row 6 no longer claims the failure is always an error.  A
+        # verification read already in flight comes back looking like a clean
+        # answer of "no such object", which for a claim protocol is the
+        # difference between not knowing and concluding nobody holds the claim.
+        #
+        # How this version was checked, since a flake fix that is only run idle
+        # has not been checked at all: 10 consecutive runs of this test under 40
+        # CPU-bound processes on a 20-core host, all passing, plus the full
+        # module and the full suite.  The behaviour it now asserts was itself
+        # measured 5/5 before being written down.
         _, _, commit = self.build_claim()
         child = subprocess.Popen(
             [GIT, f"--git-dir={self.selector}", "cat-file", "--batch"],
@@ -284,16 +308,55 @@ class GitDescriptorBindingSpike(unittest.TestCase):
             pass_fds=(self.fd,),
             env={**BASE_ENV, **CONFIG_SUPPRESSION},
         )
-        shutil.rmtree(self.repo)
-        stdout, stderr = child.communicate(input=(commit + "\n").encode(), timeout=30)
-        self.assertNotEqual(child.returncode, 0)
-        self.assertIn(b"not a git repository", stderr)
-        self.assertEqual(stdout, b"")
+        self.addCleanup(self._reap, child)
 
+        # Phase one: make the child answer, so it is KNOWN to be past startup
+        # with the repository open rather than presumed to be.
+        child.stdin.write((commit + "\n").encode())
+        child.stdin.flush()
+        header = child.stdout.readline()
+        self.assertRegex(header, rb"^[0-9a-f]{40} commit \d+\n$")
+        # Consume the body and its trailing newline so the stream stays aligned.
+        child.stdout.read(int(header.split()[2]) + 1)
+
+        # Phase two: unlink while that child is live, then ask it again.
+        shutil.rmtree(self.repo)
         self.assertTrue(os.readlink(self.selector).endswith("(deleted)"))
+
+        child.stdin.write((commit + "\n").encode())
+        child.stdin.flush()
+        child.stdin.close()
+        stdout = child.stdout.read()
+        stderr = child.stderr.read()
+        child.wait(timeout=30)
+
+        # The in-flight read reports the object absent and succeeds.  It does
+        # NOT report the repository absent, and it does NOT fail.
+        self.assertEqual(child.returncode, 0)
+        self.assertEqual(stdout, f"{commit} missing\n".encode())
+        self.assertEqual(stderr, b"")
+        self.assertNotIn(b"not a git repository", stderr)
+
+        # A command started AFTER the removal does still fail closed, which is
+        # the behaviour that makes cleanup ordering mandatory.  This half was
+        # never raced and is unchanged.
         after = self.bound("cat-file", "-t", commit)
         self.assertNotEqual(after.returncode, 0)
         self.assertIn(b"not a git repository", after.stderr)
+
+    @staticmethod
+    def _reap(child):
+        """Leave nothing running if an assertion aborts mid-protocol."""
+
+        if child.poll() is None:
+            child.kill()
+        for stream in (child.stdin, child.stdout, child.stderr):
+            try:
+                if stream is not None:
+                    stream.close()
+            except OSError:
+                pass
+        child.wait(timeout=30)
 
     # -- row 7: config suppression ----------------------------------------
 

@@ -36,7 +36,7 @@ skips itself if the version does not match, so the results are never silently cl
 | 3 | procfs present; `/proc/self/fd/N` resolves to the intended directory in the child | **PASS** |
 | 4 | `--git-dir=/proc/self/fd/N` binds init, blob, tree, commit, reads, object-format | **PASS** |
 | 5 | Binding follows the leased inode across rename and hostile substitution | **PASS** |
-| 6 | Cleanup while borrowed | **FAILS CLOSED** — see below |
+| 6 | Cleanup while borrowed | **SPLIT** — fails closed for a new command; an in-flight read returns `missing` and exits 0. See below |
 | 7 | User/XDG/system config suppression | **PASS**, and demonstrably necessary |
 | 8 | `--no-replace-objects` in the Git-global position | **PASS**, and demonstrably necessary |
 | 9 | Option terminators | **PARTIAL** — see below |
@@ -58,23 +58,48 @@ After a **hostile bare repository is planted at the original pathname**, the bou
 reads the original object and **cannot see any object the decoy contains**. Name substitution
 does not redirect a bound child. This is the core custody claim, and it holds.
 
-### Row 6 — cleanup while borrowed fails closed, and a lease does not outlive its tree
+### Row 6 — cleanup while borrowed, and a lease does not outlive its tree
 
 This is the finding that contradicts the design brief.
 
 The brief assumed a borrowed duplicate descriptor keeps the repository alive until the child is
 reaped. **It does not.** Git re-resolves `/proc/self/fd/N` as a *path*; once the tree is unlinked,
 the magic symlink resolves to `…/claim.git (deleted)` and the entries beneath it are gone.
-Measured: deleting the tree while a `cat-file --batch` child is live makes that child fail
-`fatal: not a git repository`, and every subsequent bound command fails the same way.
+Measured: after the tree is unlinked, every subsequent bound command fails with
+`fatal: not a git repository`. What the *already-running* child does depends on how far it had got,
+which is the distinction the next paragraphs draw.
 
-The direction of failure is the consolation: an **error**, never a wrong answer from a substituted
-repository. Nothing silently succeeds against the wrong tree.
+**The direction of failure is not uniform, and an earlier version of this row overstated it.** It
+said the failure was always an error and that nothing silently succeeds. That holds for a command
+started *after* the removal. It does not hold for a read *already in flight*.
+
+Measured while re-contracting #122, reproduced 5/5 on the same pinned binary: if the child is first
+made to answer one request -- so it is known to have opened the repository rather than presumed to --
+then after the unlink its next lookup returns `<oid> missing` on **stdout** and the child **exits 0**.
+It does not report the repository absent and it does not fail.
+
+So the two cases differ:
+
+| Case | Outcome |
+| --- | --- |
+| Command started after the removal | `fatal: not a git repository`, non-zero exit — fails closed |
+| Read already in flight, repository already opened | `<oid> missing` on stdout, exit 0 — succeeds, reporting absence |
+
+The original single-outcome claim came from a test that removed the tree immediately after spawning
+the child, so it measured whichever of the two won a race. That race is what made the test
+load-sensitive (#122), and stabilising it is what exposed the second row.
+
+**This strengthens the cleanup requirement rather than weakening it.** The earlier reading was that a
+mistimed cleanup breaks the operation loudly. The measurement says an in-flight *verification* read
+can instead come back looking like a clean answer of "no such object" — which, for a protocol whose
+purpose is to decide whether a claim exists, is the difference between not knowing and concluding
+that nobody holds the claim. A loud break is recoverable; a confident wrong answer is not.
 
 Consequences for the contracts:
 
 - E4's "cleanup waits or refuses while borrowed" is **mandatory, not defensive**. Deleting during
-  a borrow is not merely untidy; it breaks the operation in flight.
+  a borrow is not merely untidy: it breaks a new operation outright, and it makes an in-flight
+  verification read return a reported absence instead of an error.
 - Holding a duplicate fd is **not sufficient** to protect an in-flight operation. Whatever E2's
   borrow/refcount does, it must prevent the *unlink*, not merely keep a descriptor open.
 - A refcount that permits cleanup once the last borrow is released is still correct. What is not
