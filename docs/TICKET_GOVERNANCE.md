@@ -111,6 +111,51 @@ parses it. Like every other digest here, all of this is integrity, not authoriza
 not prove a seat ran, and one process can still construct both seat reviews and recompute
 every digest.
 
+## What the base commit guarantees
+
+A contract pins a `baseCommit`, and that value is reviewed content. What admission checks
+about it is deliberately **scope-shaped, not tip-shaped**.
+
+Admission requires two things of the context's base commit:
+
+1. The contract's base commit is an **ancestor** of it. Implementing against a diverged or
+   unrelated history fails closed with `base-commit-not-descendant`.
+2. **No path that changed between the two commits falls inside the contract's
+   `allowedPaths`.** A change that does fails closed with `base-commit-scope-changed`.
+
+Both facts are **resolved by the caller** and supplied in the context as `baseCommitEvidence`,
+in exactly the way `dependencyClosure` supplies dependency state. The predicate performs no
+repository access, and that is not an oversight to be fixed later: it is what keeps the
+decision a pure function of its inputs. Missing or malformed evidence is an `invalid-context`,
+never an absent constraint, so a caller cannot obtain admission by leaving it out.
+
+Where the two base commits are identical, nothing can have changed. Evidence claiming otherwise
+is self-contradictory and fails closed with `base-commit-mismatch`.
+
+### What this deliberately does not guarantee
+
+**An unrelated change no longer invalidates a qualification.** If a commit lands that touches
+no file inside a ticket's `allowedPaths`, that ticket stays admissible. That is the intent.
+
+The cost is real and worth stating plainly: what is guaranteed unmoved is the reviewed
+**scope**, not the reviewed **repository**. A ticket whose work depends on an interface living
+outside its own allowed paths will **not** be re-reviewed when that interface changes. If a
+ticket's correctness genuinely depends on code it does not name, that dependency belongs in
+`allowedPaths` or in `dependencies`, because nothing else will notice it moving.
+
+### Why it is not exact equality
+
+Exact equality was the original rule. It could not distinguish a commit that changed the
+ticket's own files from one that changed something the ticket never names, and treated both as
+fatal. The consequence was that a queue of ready tickets was not a reachable state: two tickets
+qualified against one commit could never both be admitted, because merging either one moved the
+branch and invalidated the other, and every qualification after the first needed a fresh pair of
+seat runs against a new projection.
+
+That was measured, not predicted. Issues #88 and #90 were qualified against the same commit with
+disjoint allowed paths; #88 admitted cleanly until #90 merged, and then reported
+`base-commit-mismatch`.
+
 ## Integrity and authorization
 
 `contractSha256` binds the canonical parsed `contract` value. It does not hash

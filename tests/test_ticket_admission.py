@@ -7,6 +7,7 @@ import council_tools.ticket_admission as ticket_admission
 import council_tools.ticket_policy as ticket_policy
 import council_tools.ticket_review as ticket_review
 from council_tools.ticket_admission import (
+    MAX_ADMISSION_CHANGED_PATHS,
     MAX_ADMISSION_EVIDENCE,
     REASON_CODES,
     evaluate_ticket_admission,
@@ -127,6 +128,12 @@ def valid_inputs(raw_contract=None):
         "issueNumber": raw_contract["issueNumber"],
         "targetBranch": raw_contract["targetBranch"],
         "baseCommit": raw_contract["baseCommit"],
+        # The base commit is identical here, so the only self-consistent
+        # evidence is "ancestor of itself, nothing changed".
+        "baseCommitEvidence": {
+            "contractBaseIsAncestor": True,
+            "changedPaths": [],
+        },
         "dependencyClosure": [
             {"issueNumber": issue_number, "state": "closed"}
             for issue_number in raw_contract["dependencies"]
@@ -197,6 +204,8 @@ class TicketAdmissionTest(unittest.TestCase):
             "issue-number-mismatch",
             "target-branch-mismatch",
             "base-commit-mismatch",
+            "base-commit-not-descendant",
+            "base-commit-scope-changed",
             "priority-mismatch",
             "size-mismatch",
             "work-type-mismatch",
@@ -434,11 +443,6 @@ class TicketAdmissionTest(unittest.TestCase):
             ("repository", "other/repository", "repository-mismatch"),
             ("issueNumber", 78, "issue-number-mismatch"),
             ("targetBranch", "release", "target-branch-mismatch"),
-            (
-                "baseCommit",
-                "0" * 40,
-                "base-commit-mismatch",
-            ),
         )
         for field, value, reason in fields:
             snapshot, context, evidence = valid_inputs()
@@ -455,6 +459,151 @@ class TicketAdmissionTest(unittest.TestCase):
             evidence,
             ("repository-mismatch", "issue-number-mismatch"),
         )
+
+    def test_identical_base_commits_still_admit(self):
+        snapshot, context, evidence = valid_inputs()
+        result = evaluate_ticket_admission(snapshot, context, evidence)
+        self.assertTrue(result.structurally_eligible)
+        self.assertEqual(result.reasons, ())
+
+    def test_a_descendant_that_leaves_the_allowed_paths_alone_is_admitted(self):
+        # This is the whole point of the rule: an unrelated commit must not
+        # invalidate a qualification whose own files did not move.
+        snapshot, context, evidence = valid_inputs()
+        context["baseCommit"] = "b" * 40
+        context["baseCommitEvidence"] = {
+            "contractBaseIsAncestor": True,
+            "changedPaths": ["docs/UNRELATED.md", "src/council_tools/elsewhere.py"],
+        }
+        result = evaluate_ticket_admission(snapshot, context, evidence)
+        self.assertTrue(result.structurally_eligible)
+        self.assertEqual(result.reasons, ())
+
+    def test_a_descendant_touching_a_file_scope_reports_a_scope_change(self):
+        snapshot, context, evidence = valid_inputs()
+        touched = contract()["allowedPaths"][0]["path"]
+        context["baseCommit"] = "b" * 40
+        context["baseCommitEvidence"] = {
+            "contractBaseIsAncestor": True,
+            "changedPaths": ["docs/UNRELATED.md", touched],
+        }
+        self.assertReasons(
+            snapshot, context, evidence, ("base-commit-scope-changed",)
+        )
+
+    def test_a_descendant_touching_a_directory_scope_reports_a_scope_change(self):
+        raw = contract()
+        raw["allowedPaths"] = [
+            {"kind": "directory", "path": "src/council_tools"}
+        ]
+        snapshot, context, evidence = valid_inputs(raw)
+        context["baseCommit"] = "b" * 40
+        context["baseCommitEvidence"] = {
+            "contractBaseIsAncestor": True,
+            "changedPaths": ["src/council_tools/anything.py"],
+        }
+        self.assertReasons(
+            snapshot, context, evidence, ("base-commit-scope-changed",)
+        )
+
+    def test_a_non_ancestor_fails_closed_and_is_distinguishable(self):
+        snapshot, context, evidence = valid_inputs()
+        context["baseCommit"] = "b" * 40
+        context["baseCommitEvidence"] = {
+            "contractBaseIsAncestor": False,
+            "changedPaths": [],
+        }
+        self.assertReasons(
+            snapshot, context, evidence, ("base-commit-not-descendant",)
+        )
+
+    def test_a_non_ancestor_that_also_changes_scope_reports_both(self):
+        snapshot, context, evidence = valid_inputs()
+        touched = contract()["allowedPaths"][0]["path"]
+        context["baseCommit"] = "b" * 40
+        context["baseCommitEvidence"] = {
+            "contractBaseIsAncestor": False,
+            "changedPaths": [touched],
+        }
+        self.assertReasons(
+            snapshot,
+            context,
+            evidence,
+            ("base-commit-not-descendant", "base-commit-scope-changed"),
+        )
+
+    def test_evidence_contradicting_identical_commits_fails_closed(self):
+        # Identical commits admit nothing to have changed.  Evidence saying
+        # otherwise is self-contradictory and must not be read permissively.
+        for contradiction in (
+            {"contractBaseIsAncestor": True, "changedPaths": ["docs/x.md"]},
+            {"contractBaseIsAncestor": False, "changedPaths": []},
+            {"contractBaseIsAncestor": False, "changedPaths": ["docs/x.md"]},
+        ):
+            snapshot, context, evidence = valid_inputs()
+            context["baseCommitEvidence"] = contradiction
+            with self.subTest(evidence=contradiction):
+                self.assertReasons(
+                    snapshot, context, evidence, ("base-commit-mismatch",)
+                )
+
+    def test_omitted_evidence_is_an_invalid_context_not_an_absent_constraint(self):
+        snapshot, context, evidence = valid_inputs()
+        del context["baseCommitEvidence"]
+        self.assertReasons(snapshot, context, evidence, ("invalid-context",))
+
+    def test_malformed_evidence_is_an_invalid_context(self):
+        cases = (
+            None,
+            [],
+            "ancestor",
+            {},
+            {"contractBaseIsAncestor": True},
+            {"changedPaths": []},
+            {"contractBaseIsAncestor": True, "changedPaths": [], "extra": 1},
+            # 1 and 0 must not stand in for the boolean claim.
+            {"contractBaseIsAncestor": 1, "changedPaths": []},
+            {"contractBaseIsAncestor": 0, "changedPaths": []},
+            {"contractBaseIsAncestor": "true", "changedPaths": []},
+            {"contractBaseIsAncestor": True, "changedPaths": "docs/x.md"},
+            {"contractBaseIsAncestor": True, "changedPaths": ListSubclass()},
+            {"contractBaseIsAncestor": True, "changedPaths": [None]},
+            {"contractBaseIsAncestor": True, "changedPaths": [""]},
+            {"contractBaseIsAncestor": True, "changedPaths": ["/absolute/path"]},
+            {"contractBaseIsAncestor": True, "changedPaths": ["trailing/"]},
+            {"contractBaseIsAncestor": True, "changedPaths": ["back\\slash"]},
+            {"contractBaseIsAncestor": True, "changedPaths": [DictSubclass()]},
+        )
+        for candidate in cases:
+            snapshot, context, evidence = valid_inputs()
+            context["baseCommitEvidence"] = candidate
+            with self.subTest(candidate=repr(candidate)[:60]):
+                self.assertReasons(snapshot, context, evidence, ("invalid-context",))
+
+    def test_an_over_long_changed_path_set_is_refused(self):
+        snapshot, context, evidence = valid_inputs()
+        context["baseCommit"] = "b" * 40
+        context["baseCommitEvidence"] = {
+            "contractBaseIsAncestor": True,
+            "changedPaths": [
+                f"docs/file{index}.md"
+                for index in range(MAX_ADMISSION_CHANGED_PATHS + 1)
+            ],
+        }
+        self.assertReasons(snapshot, context, evidence, ("invalid-context",))
+
+    def test_the_bound_itself_is_accepted(self):
+        snapshot, context, evidence = valid_inputs()
+        context["baseCommit"] = "b" * 40
+        context["baseCommitEvidence"] = {
+            "contractBaseIsAncestor": True,
+            "changedPaths": [
+                f"docs/file{index}.md"
+                for index in range(MAX_ADMISSION_CHANGED_PATHS)
+            ],
+        }
+        result = evaluate_ticket_admission(snapshot, context, evidence)
+        self.assertTrue(result.structurally_eligible)
 
     def test_labels_must_agree_with_each_present_contract_field(self):
         cases = (
