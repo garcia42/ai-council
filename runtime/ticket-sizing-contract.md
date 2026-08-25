@@ -18,8 +18,14 @@ contract. The projection is the contract with the review-derived fields removed:
 
 A seat determines those two values, so showing a seat a proposed value for them invites
 anchor-and-adjust drift. `council_tools.ticket_contracts.sizing_projection` computes the
-projection and `sizing_projection_sha256` digests it. Record that digest alongside the
-seat results; it is the proof of what was reviewed.
+projection and `sizing_projection_sha256` digests it. That digest goes in the review
+record's `sizingProjectionSha256`, which is what binds a review to the content its seats
+saw.
+
+The classification is not inferred. `SIZING_PROJECTION_KEYS` and `SIZING_DERIVED_KEYS` are
+declared independently and their partition is checked at import, so adding a field to
+`CONTRACT_KEYS` raises until someone classifies it, and a reviewed field cannot be hidden
+from the seats by quietly reclassifying it.
 
 This was not a hypothetical. Qualifying issue #61 twice produced `eligible` and
 `singleOutcome: true` from both seats in both rounds, but the derived size tracked the
@@ -143,8 +149,28 @@ from the published contract and rejects the review with `review-projection-misma
 two differ, so a reviewed field edited after the review fails even though the contract digest
 was recomputed. A change to a derived field does not, because the seats determined it.
 
-Record the projection digest in the issue's Sizing prose as well. The prose copy is for a
-human auditor; the enforced binding is the one in the review record.
+Record the projection digest in the issue's Sizing prose as well. **The prose copy is a
+human-auditable convenience, not the enforced binding** — nothing parses it. The enforced
+binding is `sizingProjectionSha256` in the review record.
+
+### What is enforced, and what is not
+
+Enforced in code:
+
+- The key classification partitions `CONTRACT_KEYS`, checked at import.
+- The projection is byte-identical for every value of the derived fields, including omitted ones.
+- `contract_sha256` binds the sealed contract; a mismatch is `contract-sha256-mismatch`.
+- Admission re-derives the projection from the published contract and rejects a differing
+  attested digest with `review-projection-mismatch`, so a reviewed field edited after the
+  review fails even though the contract digest was recomputed.
+- Admission rejects derived values that disagree with the review, by size and priority.
+
+Operator-enforced, with nothing checking it:
+
+- That the seats were actually shown the projection whose digest is recorded.
+- That the named seats ran at all, and that their results are theirs.
+- That the prose digest in the issue matches the one in the review record.
+- That reviewed content carries no self-sizing assertion.
 
 If a seat is re-run, re-run it against the same projection digest. A new projection digest is
 a new ticket for sizing purposes, not a second round on the same one.
