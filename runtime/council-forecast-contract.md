@@ -27,6 +27,20 @@ authority rule, rehearse on that host, and rerun the council activation review.
    git commit and source digest before every command and refuses source drift. Develop future changes
    in another worktree; do not edit the active source tree.
 
+   **The active source tree is `/home/trader/council-tools`, and `install.py` must be run only from
+   there.** It sets `REPO = Path(__file__).resolve().parent` and renders that path into the installed
+   runtime as `SOURCE_ROOT`, so running it from a session worktree pins the live runtime to a
+   disposable directory; when that worktree is rebased or removed, every council tool fails closed.
+   For a live install it additionally requires that source tree to report no changes, untracked files
+   included.
+
+   Because the reporter checks its pin before every command, **the outage window opens at the
+   checkout and not at the install**: from the moment a new commit is checked out in the active
+   source tree until `install.py` finishes, every command routed through the installed runtime exits
+   rather than runs. Do not begin the checkout until you are ready to finish the install. The
+   step-by-step procedure is in
+   `docs/troubleshooting/duplicate-council-row-supersede.md`.
+
 2. Define one neutral **shared outcome** before any seat answers. It must be binary, material to
    the reviewed decision, and recorded with:
 
