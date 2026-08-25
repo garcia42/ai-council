@@ -36,6 +36,12 @@ def completion(attempt):
         "blindSeat": {
             "role": "SKIPPED",
             "required": False,
+            # A required:false exemption owes a non-empty notRequiredReason.
+            # This fixture omitted it, which the contract already forbade and
+            # nothing checked until the write-boundary validation added for #3.
+            # Corrected rather than accommodated: a fixture that writes a row
+            # the contract forbids is a fixture asserting the wrong thing.
+            "notRequiredReason": "mechanical test fixture with no decision surface",
             "ran": False,
             "changedDecision": None,
             "brief": f"/tmp/council-briefs/brief-{attempt['runId']}.md",
@@ -800,6 +806,11 @@ class ForecastCliTest(unittest.TestCase):
                         "blindSeat": {
                             "role": "SKIPPED",
                             "required": False,
+                            # See the note on the fixture above: a required:false
+                            # exemption owes a non-empty notRequiredReason.
+                            "notRequiredReason": (
+                                "mechanical test fixture with no decision surface"
+                            ),
                             "ran": False,
                             "changedDecision": None,
                             "brief": f"/tmp/council-briefs/brief-{seeded['runId']}.md",

@@ -1678,3 +1678,149 @@ class ForecastLedgerTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+#: Sentinel meaning "omit this key entirely", distinct from a null value.
+_ABSENT = object()
+
+
+class BlindSeatContractTest(unittest.TestCase):
+    """The blind-seat contract, enforced where the row is written.
+
+    The contract is stated in ``council/SKILL.md`` and ``blind-seat/SKILL.md``:
+    a **required** non-run records the ``SKIPPED`` sentinel as its role,
+    ``ran: false``, ``null`` for agreement and decision-change, and a non-empty
+    ``blockedReason``; a seat that ran must not carry the sentinel; a
+    ``required: false`` row carries a non-empty ``notRequiredReason`` and a
+    ``required: true`` row must not.
+
+    It matters at the *write* boundary specifically, because nothing downstream
+    can undo a bad row: the store is append-only, tail repair removes only a
+    line that fails to parse, and brief recovery rewrites only the brief path.
+    """
+
+    RUN_ID = "run-0123456789abcdef0123456789abcdef"
+
+    def row(self, **blind_seat):
+        seat = {
+            "role": "generic",
+            "required": True,
+            "ran": True,
+            "agreedWithPanel": True,
+            "changedDecision": False,
+            "brief": f"/tmp/council-briefs/brief-{self.RUN_ID}.md",
+        }
+        seat.update(blind_seat)
+        for key, value in list(seat.items()):
+            if value is _ABSENT:
+                del seat[key]
+        return {"runId": self.RUN_ID, "blindSeat": seat}
+
+    def assertAccepted(self, **blind_seat):
+        forecasts.validate_blind_brief_identity(self.row(**blind_seat), [])
+
+    def assertRefused(self, expected, **blind_seat):
+        with self.assertRaises(forecasts.LedgerError) as caught:
+            forecasts.validate_blind_brief_identity(self.row(**blind_seat), [])
+        self.assertIn(expected, str(caught.exception))
+
+    # -- the shape that actually reached the live ledger -------------------
+
+    def test_the_live_incident_shape_is_refused(self):
+        # A genuine non-run recorded with the role the seat *would* have taken.
+        self.assertRefused(
+            "must be 'SKIPPED'",
+            ran=False,
+            role="allocator",
+            agreedWithPanel=None,
+            changedDecision=None,
+            blockedReason="launcher failure",
+        )
+
+    def test_the_corrected_form_of_that_row_is_accepted(self):
+        self.assertAccepted(
+            ran=False,
+            role="SKIPPED",
+            agreedWithPanel=None,
+            changedDecision=None,
+            blockedReason="launcher failure",
+        )
+
+    # -- each rule, with its valid counterpart -----------------------------
+
+    def test_a_seat_that_ran_may_not_carry_the_sentinel(self):
+        # The inverse defect. A one-directional correction tool is required
+        # later precisely because a symmetric one could write this.
+        self.assertRefused("must not be 'SKIPPED'", ran=True, role="SKIPPED")
+        self.assertAccepted(ran=True, role="generic")
+
+    def test_a_non_run_must_null_both_judgment_fields(self):
+        base = dict(ran=False, role="SKIPPED", blockedReason="timeout")
+        for field in ("agreedWithPanel", "changedDecision"):
+            with self.subTest(field=field):
+                self.assertRefused(
+                    f"blindSeat.{field} must be null",
+                    **{**base, "agreedWithPanel": None, "changedDecision": None,
+                       field: True},
+                )
+        self.assertAccepted(**base, agreedWithPanel=None, changedDecision=None)
+
+    def test_a_required_non_run_owes_a_blocked_reason(self):
+        base = dict(ran=False, role="SKIPPED", required=True,
+                    agreedWithPanel=None, changedDecision=None)
+        for missing in (_ABSENT, None, "", "   ", 7):
+            with self.subTest(blockedReason=missing):
+                self.assertRefused("blockedReason", **base, blockedReason=missing)
+        self.assertAccepted(**base, blockedReason="provider quota exhausted")
+
+    def test_a_seat_that_was_not_required_owes_no_blocked_reason(self):
+        # It did not fail to run; it was not asked to. Demanding both would
+        # refuse a legitimate row shape.
+        self.assertAccepted(
+            ran=False, role="SKIPPED", required=False,
+            notRequiredReason="mechanical change with no decision surface",
+            agreedWithPanel=None, changedDecision=None,
+            blockedReason=_ABSENT,
+        )
+
+    def test_a_not_required_seat_owes_a_reason(self):
+        base = dict(required=False)
+        for missing in (_ABSENT, None, "", "  "):
+            with self.subTest(notRequiredReason=missing):
+                self.assertRefused(
+                    "notRequiredReason", **base, notRequiredReason=missing
+                )
+        self.assertAccepted(**base, notRequiredReason="mechanical refactor")
+
+    def test_a_required_seat_may_not_carry_an_exemption_reason(self):
+        # So stale exemption text cannot coast into a later decision-shaped run.
+        self.assertRefused(
+            "must be absent", required=True, notRequiredReason="left over"
+        )
+        self.assertAccepted(required=True, notRequiredReason=None)
+
+    def test_the_ran_flag_must_be_boolean(self):
+        for value in ("false", 0, 1, None):
+            with self.subTest(ran=value):
+                self.assertRefused("blindSeat.ran must be true or false", ran=value)
+
+    def test_the_required_flag_is_checked_only_when_present(self):
+        # The rules state what required *means*, not that every row carries it.
+        self.assertAccepted(required=_ABSENT)
+        self.assertRefused("must be true or false", required="yes")
+
+    # -- what must not change ----------------------------------------------
+
+    def test_a_pre_contract_row_is_left_alone(self):
+        # No ran key at all: the kill criterion leaves these alone and so must
+        # the write boundary, or the contract is applied retroactively.
+        row = {"runId": self.RUN_ID, "blindSeat": {"role": "whatever"}}
+        forecasts.validate_blind_brief_identity(row, [])
+
+    def test_an_older_narrower_refusal_still_wins(self):
+        # The contract check runs last, so a row with a bad brief path is told
+        # about the brief path rather than about the contract.
+        row = self.row(ran=False, role="allocator", brief="relative/path.md")
+        with self.assertRaises(forecasts.LedgerError) as caught:
+            forecasts.validate_blind_brief_identity(row, [])
+        self.assertIn("absolute and normalized", str(caught.exception))

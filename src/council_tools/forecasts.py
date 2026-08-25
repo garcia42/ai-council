@@ -604,6 +604,92 @@ def evidence_write_lock(path: str | Path | None):
 
 RUN_ID_RE = re.compile(r"run-[0-9a-f]{32}")
 
+#: The role a required non-run records instead of the role the seat would have
+#: taken.  It is a sentinel, not a role: a seat that did not run held no role.
+SKIPPED_BLIND_SEAT_ROLE = "SKIPPED"
+
+
+def _validate_blind_seat_contract(blind_seat: dict[str, Any]) -> None:
+    """Refuse a blind-seat block the documented contract forbids.
+
+    The contract is stated in ``council/SKILL.md`` and ``blind-seat/SKILL.md``:
+    a required non-run records the skipped sentinel as its role, ``ran: false``,
+    ``null`` for both agreement and decision-change, and a non-empty blocked
+    reason; a seat that ran must not carry the sentinel.
+
+    Nothing enforced it, and the store cannot be corrected afterwards -- it is
+    append-only, tail repair removes only a line that fails to parse, and brief
+    recovery rewrites only the brief path.  So a row written wrong stays wrong
+    and the gate stays red on it, which is what turns one slip into a permanent
+    deviation every later council has to record.
+
+    Callers reach this only after the ``ran``-key check above, so a pre-contract
+    row is never judged against a contract that did not exist when it was
+    written.
+    """
+
+    ran = blind_seat.get("ran")
+    if not isinstance(ran, bool):
+        raise LedgerError("blindSeat.ran must be true or false")
+
+    role = blind_seat.get("role")
+    if ran:
+        if role == SKIPPED_BLIND_SEAT_ROLE:
+            # The inverse defect, and the reason the later correction command
+            # must be one-directional: a symmetric editor could write this.
+            raise LedgerError(
+                "blindSeat.role must not be "
+                f"{SKIPPED_BLIND_SEAT_ROLE!r} when blindSeat.ran is true"
+            )
+    else:
+        if role != SKIPPED_BLIND_SEAT_ROLE:
+            raise LedgerError(
+                "blindSeat.role must be "
+                f"{SKIPPED_BLIND_SEAT_ROLE!r} when blindSeat.ran is false, "
+                f"not {role!r}"
+            )
+        for field in ("agreedWithPanel", "changedDecision"):
+            if blind_seat.get(field, None) is not None:
+                raise LedgerError(
+                    f"blindSeat.{field} must be null when blindSeat.ran is false"
+                )
+        if blind_seat.get("required") is True:
+            # Only a *required* non-run owes a blocked reason.  A seat that was
+            # not required did not fail to run; it was not asked to, and it
+            # accounts for itself with notRequiredReason below.  Demanding both
+            # would refuse a legitimate row shape.
+            reason = blind_seat.get("blockedReason")
+            if not isinstance(reason, str) or not reason.strip():
+                raise LedgerError(
+                    "blindSeat.blockedReason must be a non-empty string when "
+                    "blindSeat.ran is false and blindSeat.required is true"
+                )
+
+    # ``required`` is only checked when present.  Its absence is not this
+    # check's business: the contract states what the two values *mean*, not that
+    # every row must carry the key, and rows that omit it are read by the gate
+    # the same way they always were.
+    required = blind_seat.get("required")
+    if required is None:
+        return
+    if not isinstance(required, bool):
+        raise LedgerError("blindSeat.required must be true or false")
+    not_required_reason = blind_seat.get("notRequiredReason")
+    if required:
+        # Rejected rather than ignored, so stale exemption text cannot coast
+        # into a later decision-shaped review.
+        if not_required_reason is not None:
+            raise LedgerError(
+                "blindSeat.notRequiredReason must be absent when "
+                "blindSeat.required is true"
+            )
+    elif not isinstance(not_required_reason, str) or not not_required_reason.strip():
+        raise LedgerError(
+            "blindSeat.notRequiredReason must be a non-empty string when "
+            "blindSeat.required is false"
+        )
+
+
 def validate_blind_brief_identity(
     row: dict[str, Any], prior_rows: Iterable[dict[str, Any]]
 ) -> None:
@@ -661,6 +747,11 @@ def validate_blind_brief_identity(
             raise LedgerError(
                 f"blind brief path already belongs to another council: {brief}"
             )
+
+    # Last, deliberately.  Every refusal above is older, narrower and names a
+    # specific defect; running this first would pre-empt them and report a
+    # contract violation where the real answer is "that brief path is wrong".
+    _validate_blind_seat_contract(blind_seat)
 
 
 def make_supersede(
