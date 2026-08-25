@@ -8,6 +8,24 @@ The required v1 seats are exactly `claude` followed by `codex`. A different
 seat set or order requires a new schema version. A caller cannot omit a seat or
 choose a smaller approving subset.
 
+## What the seats are shown
+
+Sizing seats are shown the **sizing projection** of the ticket contract, never the raw
+contract. The projection is the contract with the review-derived fields removed:
+
+- `points` — derived from the submitted estimates.
+- `priority` — derived from the submitted priorities.
+
+A seat determines those two values, so showing a seat a proposed value for them invites
+anchor-and-adjust drift. `council_tools.ticket_contracts.sizing_projection` computes the
+projection and `sizing_projection_sha256` digests it. Record that digest alongside the
+seat results; it is the proof of what was reviewed.
+
+This was not a hypothetical. Qualifying issue #61 twice produced `eligible` and
+`singleOutcome: true` from both seats in both rounds, but the derived size tracked the
+declared size upward — declared 1 derived 2, then declared 2 derived 3 — and no review was
+ever bound to a contract declaring the size that review derived.
+
 ## Required record
 
 Return one JSON object with these exact top-level keys:
@@ -102,6 +120,30 @@ Downstream label policy maps `eligible` to the derived `size:N` and permits a
 later admission control to assign `agent:ready`. It maps `needs-split` to the
 `needs-split` label, no size label, and either no agent state or
 `agent:blocked`. This module does not mutate labels.
+
+## Two-phase seal
+
+`reviewRef.contractSha256` binds the whole contract, including the two derived fields, and
+admission rejects a review whose derived `points` or `priority` differ from the contract's.
+Recording a derived value therefore changes the digest that bound the review that derived it.
+Qualification converges only because the *reviewed content* — the projection — does not move
+when those values are recorded.
+
+1. **Phase one, review.** Build the contract with any placeholder for `points` and
+   `priority`. Compute `sizing_projection_sha256`. Give every required seat the projection
+   and that digest. Collect the seat reviews and derive the decision.
+2. **Phase two, seal.** Write the derived `points` and `priority` into the contract. The
+   projection digest is byte-identical across this write — assert it. Compute
+   `contract_sha256` over the sealed contract, and bind the review record and `reviewRef`
+   to that digest.
+
+Record the projection digest in the issue's Sizing prose. An auditor re-derives it from the
+published contract and confirms it matches what the seats were given. A change to any
+reviewed field moves the projection digest and invalidates the qualification; a change to a
+derived field does not, because the seats determined it.
+
+If a seat is re-run, re-run it against the same projection digest. A new projection digest is
+a new ticket for sizing purposes, not a second round on the same one.
 
 ## Integrity is not authorization
 

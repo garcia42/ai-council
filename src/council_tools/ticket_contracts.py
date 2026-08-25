@@ -5,6 +5,13 @@ reference names these exact contract fields.  It is not authorization and does
 not prove that a council or human actually approved the ticket.  Later adapters
 must verify that trust decision against their own protected evidence source.
 
+``points`` and ``priority`` are derived by the sizing review rather than chosen
+by the ticket author, so :func:`sizing_projection` exposes the contract without
+them.  That projection is what sizing seats are shown, and its digest is what
+proves the reviewed content.  Keeping the derived fields out of the reviewed
+content is what makes a qualification converge: recording the derived values
+does not change what was reviewed.
+
 Use :func:`load_ticket_envelope_json` at JSON-text boundaries.  It rejects
 duplicate keys and non-strict encodings before calling the mapping validator.
 Call :func:`validate_ticket_envelope` directly only for already-parsed trusted
@@ -55,6 +62,8 @@ CONTRACT_KEYS = frozenset(
         "rollbackPlan",
     }
 )
+SIZING_DERIVED_KEYS = frozenset({"points", "priority"})
+SIZING_PROJECTION_KEYS = frozenset(CONTRACT_KEYS - SIZING_DERIVED_KEYS)
 REVIEW_REF_KEYS = frozenset({"runId", "contractSha256"})
 ALLOWED_PATH_KEYS = frozenset({"kind", "path"})
 
@@ -197,6 +206,45 @@ def contract_sha256(contract: Mapping[str, Any]) -> str:
     """Return the lowercase SHA-256 digest of canonical raw contract bytes."""
 
     return hashlib.sha256(canonical_contract_bytes(contract)).hexdigest()
+
+
+def sizing_projection(contract: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the contract without the fields a sizing review derives.
+
+    ``points`` and ``priority`` are outputs of the sizing review, so a seat must
+    never be shown a proposed value for them.  The projection is the content the
+    seats actually review.  Because it is identical for every value of the
+    derived fields, writing a derived value back into the contract leaves the
+    projection unchanged, which is what lets a qualification converge instead of
+    chasing its own declared size.
+
+    This is a shallow copy of a raw contract mapping.  It does not validate the
+    contract, and it never mutates its argument.
+    """
+
+    if not isinstance(contract, Mapping):
+        raise TicketContractError("non-canonical-json", "contract")
+    return {
+        key: value
+        for key, value in contract.items()
+        if key not in SIZING_DERIVED_KEYS
+    }
+
+
+def sizing_projection_bytes(contract: Mapping[str, Any]) -> bytes:
+    """Return canonical v1 JSON bytes for the sizing projection."""
+
+    return canonical_contract_bytes(sizing_projection(contract))
+
+
+def sizing_projection_sha256(contract: Mapping[str, Any]) -> str:
+    """Return the lowercase SHA-256 digest of the sizing projection.
+
+    This digest proves what the sizing seats were shown.  It is an integrity
+    binding, not authorization, exactly as ``contract_sha256`` is.
+    """
+
+    return hashlib.sha256(sizing_projection_bytes(contract)).hexdigest()
 
 
 def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -585,6 +633,8 @@ __all__ = [
     "MAX_TICKET_JSON_BYTES",
     "MAX_TEST_COMMAND_LENGTH",
     "MAX_TEXT_LENGTH",
+    "SIZING_DERIVED_KEYS",
+    "SIZING_PROJECTION_KEYS",
     "TicketContract",
     "TicketContractError",
     "TicketEnvelope",
@@ -592,5 +642,8 @@ __all__ = [
     "canonical_contract_bytes",
     "contract_sha256",
     "load_ticket_envelope_json",
+    "sizing_projection",
+    "sizing_projection_bytes",
+    "sizing_projection_sha256",
     "validate_ticket_envelope",
 ]

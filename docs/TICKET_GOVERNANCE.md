@@ -80,6 +80,27 @@ The issue body is limited to 65,536 characters and 196,608 UTF-8 bytes. The
 synthetic envelope retains its separate 131,072-byte loader limit, so an issue
 body may pass its outer bound and still fail the stricter machine-data bound.
 
+## The sizing projection
+
+`points` and `priority` are **outputs** of the sizing review, not author choices. The
+content a sizing seat actually reviews is therefore the contract minus those two fields —
+the *sizing projection*, computed by `sizing_projection` and digested by
+`sizing_projection_sha256`.
+
+The projection is identical for every value of the derived fields. That is deliberate:
+`contractSha256` binds the whole contract, so recording a derived value changes the digest
+that bound the review that derived it. Because the projection does not move across that
+write, the qualification converges rather than chasing its own declared size. The full
+procedure is the two-phase seal in `runtime/ticket-sizing-contract.md`.
+
+`SIZING_PROJECTION_KEYS` and `SIZING_DERIVED_KEYS` partition `CONTRACT_KEYS`, so a new
+contract field cannot be added without being classified as reviewed or derived.
+
+Consequently `contractSha256` binds a contract containing two fields the seats never saw.
+The projection digest is what proves the reviewed content, and it belongs in the issue's
+Sizing prose so an auditor can re-derive it from the published contract. Like every other
+digest here, it is integrity, not authorization.
+
 ## Integrity and authorization
 
 `contractSha256` binds the canonical parsed `contract` value. It does not hash
@@ -97,6 +118,9 @@ an owner or establish a lease.
 - `TICKET_POLICY_V1` is the immutable source of label and marker configuration.
 - `parse_ticket_labels(labels)` returns optional structural label values.
 - `parse_ticket_issue_body(body)` returns a validated `TicketEnvelope`.
+- `sizing_projection(contract)` returns the contract without the review-derived
+  fields; `sizing_projection_sha256(contract)` digests it.
+- `SIZING_DERIVED_KEYS` and `SIZING_PROJECTION_KEYS` partition `CONTRACT_KEYS`.
 - `TicketPolicyError` covers policy and marker failures.
 - `TicketContractError` covers strict JSON and contract failures.
 
