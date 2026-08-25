@@ -499,3 +499,191 @@ class ValidatorAgreementTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def supersede_row(supersedes_line, supersedes_sha, duplicate_line, duplicate_sha):
+    """A well-formed ``council-superseded`` record, shaped as forecasts validates it."""
+
+    return {
+        "schemaVersion": 1,
+        "kind": brief_recovery.SUPERSEDE_KIND,
+        "ts": "2026-08-24T09:00:00Z",
+        "supersedes": {"line": supersedes_line, "rawLineSha256": supersedes_sha},
+        "duplicateOf": {"line": duplicate_line, "rawLineSha256": duplicate_sha},
+        "reason": "retired duplicate",
+        "approval": {
+            "operator": "principal",
+            "approvedAt": "2026-08-24T09:00:00Z",
+            "reference": "test approval",
+        },
+    }
+
+
+class SupersededTargetGuardTest(BriefRecoveryTest):
+    """Recovery must refuse a line a ``council-superseded`` record pins.
+
+    Recovery rewrites one line in place; a supersede record pins the row it names
+    by the digest of exactly those bytes. Rewriting such a line re-enters the
+    retired row in the tally, turns the gate red, and the record that turned it
+    red cannot afterwards be withdrawn -- its validator accepts only a council
+    completion as a target. A permanently red gate on a row nobody can touch.
+    """
+
+    def line_digest(self, line_number):
+        lines = self.ledger.read_bytes().splitlines(keepends=True)
+        return brief_recovery._digest(lines[line_number - 1])
+
+    def append_supersede(self, **kwargs):
+        row = supersede_row(**kwargs)
+        with self.ledger.open("a", encoding="utf-8") as handle:
+            handle.write(canonical(row))
+        return row
+
+    # -- the two references ------------------------------------------------
+
+    def test_a_target_named_by_supersedes_is_refused_at_planning(self):
+        self.append_supersede(
+            supersedes_line=3,
+            supersedes_sha=self.line_digest(3),
+            duplicate_line=2,
+            duplicate_sha=self.line_digest(2),
+        )
+        before = self.ledger.read_bytes()
+        with self.assertRaises(LedgerError) as caught:
+            self.plan()
+        self.assertIn("council-superseded", str(caught.exception))
+        self.assertIn("line 3", str(caught.exception))
+        self.assertEqual(self.ledger.read_bytes(), before)
+
+    def test_a_target_named_by_duplicate_of_is_refused_at_planning(self):
+        # The surviving side is pinned by digest exactly as the retired side is,
+        # so rewriting it breaks the record just the same.
+        self.append_supersede(
+            supersedes_line=2,
+            supersedes_sha=self.line_digest(2),
+            duplicate_line=3,
+            duplicate_sha=self.line_digest(3),
+        )
+        before = self.ledger.read_bytes()
+        with self.assertRaises(LedgerError) as caught:
+            self.plan()
+        self.assertIn("council-superseded", str(caught.exception))
+        self.assertEqual(self.ledger.read_bytes(), before)
+
+    # -- the acting path ---------------------------------------------------
+
+    def _plan_against_superseded_ledger(self):
+        """A spec for a ledger that already holds the blocking record.
+
+        Appending the record *after* planning would move the ledger digest, and
+        the pre-existing drift check would then refuse the recovery before this
+        guard was ever consulted -- so that version of this test passed with the
+        acting-path guard deleted. The guard is suppressed for the planning call
+        only, so the spec matches the ledger byte for byte and the sole reason
+        recovery can refuse is the guard under test.
+        """
+
+        self.append_supersede(
+            supersedes_line=3,
+            supersedes_sha=self.line_digest(3),
+            duplicate_line=2,
+            duplicate_sha=self.line_digest(2),
+        )
+        with mock.patch.object(
+            brief_recovery, "_refuse_superseded_target", lambda rows, line: None
+        ):
+            return self.plan()
+
+    def test_the_acting_path_refuses_independently_of_the_plan(self):
+        spec = self._plan_against_superseded_ledger()
+        before = self.ledger.read_bytes()
+        # Proof the spec is otherwise good: the drift check cannot be what
+        # refuses, because the recorded digest matches the ledger on disk.
+        self.assertEqual(brief_recovery._digest(before), spec["ledger"]["expectedSha256"])
+        with self.assertRaises(LedgerError) as caught:
+            self.recover(spec)
+        self.assertIn("council-superseded", str(caught.exception))
+        self.assertIn("line 3", str(caught.exception))
+        self.assertEqual(self.ledger.read_bytes(), before)
+
+    def test_nothing_is_written_anywhere_by_a_refused_recovery(self):
+        spec = self._plan_against_superseded_ledger()
+        before = self.ledger.read_bytes()
+        artifacts = self.artifact_dir(spec)
+        existing = sorted(p.name for p in artifacts.iterdir()) if artifacts.is_dir() else []
+        destination = self._mirror(spec["replacementBrief"]["destinationPath"])
+        with self.assertRaises(LedgerError):
+            self.recover(spec)
+        self.assertEqual(self.ledger.read_bytes(), before)
+        self.assertFalse(destination.exists(), "the replacement brief was written")
+        now = sorted(p.name for p in artifacts.iterdir()) if artifacts.is_dir() else []
+        self.assertEqual(now, existing, "an artifact was written")
+
+    # -- the guard must not over-refuse ------------------------------------
+
+    def test_a_record_naming_another_line_does_not_block_the_target(self):
+        self.append_supersede(
+            supersedes_line=1,
+            supersedes_sha=self.line_digest(1),
+            duplicate_line=2,
+            duplicate_sha=self.line_digest(2),
+        )
+        spec = self.plan()
+        self.recover(spec)
+        self.assertEqual(
+            json.loads(self.ledger.read_bytes().splitlines()[2])["blindSeat"]["brief"],
+            spec["replacementBrief"]["destinationPath"],
+        )
+
+    def test_a_ledger_with_no_supersede_records_still_recovers(self):
+        spec = self.plan()
+        self.recover(spec)
+        self.assert_repaired(spec)
+
+    # -- malformed records refuse rather than being skipped ----------------
+
+    def test_a_malformed_supersede_record_refuses_rather_than_being_skipped(self):
+        bad_references = [
+            {"supersedes": None},
+            {"supersedes": {}},
+            {"supersedes": {"rawLineSha256": "a" * 64}},
+            {"supersedes": {"line": "3", "rawLineSha256": "a" * 64}},
+            {"supersedes": {"line": True, "rawLineSha256": "a" * 64}},
+            {"supersedes": {"line": 0, "rawLineSha256": "a" * 64}},
+            {"duplicateOf": None},
+            {"duplicateOf": {"line": -1, "rawLineSha256": "a" * 64}},
+        ]
+        base = self.ledger.read_bytes()
+        for override in bad_references:
+            with self.subTest(override=str(override)[:48]):
+                self.ledger.write_bytes(base)
+                row = supersede_row(
+                    supersedes_line=1,
+                    supersedes_sha=self.line_digest(1),
+                    duplicate_line=2,
+                    duplicate_sha=self.line_digest(2),
+                )
+                row.update(override)
+                with self.ledger.open("a", encoding="utf-8") as handle:
+                    handle.write(canonical(row))
+                unchanged = self.ledger.read_bytes()
+                with self.assertRaises(LedgerError) as caught:
+                    self.plan()
+                self.assertIn("council-superseded", str(caught.exception))
+                self.assertEqual(self.ledger.read_bytes(), unchanged)
+        self.ledger.write_bytes(base)
+
+    def test_a_non_supersede_row_is_never_inspected_for_references(self):
+        # Only rows declaring the supersede kind are checked, so an unrelated
+        # row carrying a "supersedes" key cannot block a recovery.
+        with self.ledger.open("a", encoding="utf-8") as handle:
+            handle.write(canonical({"schemaVersion": 1, "kind": "council-attempt",
+                                    "runId": "x", "supersedes": "not a reference"}))
+        spec = self.plan()
+        self.recover(spec)
+        self.assert_repaired(spec)
+
+    def test_the_reference_labels_are_pinned(self):
+        self.assertEqual(
+            brief_recovery.SUPERSEDE_LINE_REFERENCES, ("supersedes", "duplicateOf")
+        )

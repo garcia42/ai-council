@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from .forecasts import LedgerError, _ledger_lock
+from .forecasts import SUPERSEDE_KIND, LedgerError, _ledger_lock
 
 
 LIVE_KNOWLEDGE_ROOT = Path("/home/trader/.claude/knowledge")
@@ -184,6 +184,71 @@ def _parse_rows(lines: list[bytes]) -> list[dict[str, Any]]:
             raise LedgerError(f"ledger line {line_number} is not an object")
         rows.append(value)
     return rows
+
+
+#: The two references a ``council-superseded`` record carries.  **Both** name a
+#: line and both pin it by digest, so rewriting either breaks that record's pin.
+#: Checking only the retired side would leave the surviving side rewritable, and
+#: the resulting red gate is just as unretractable.
+SUPERSEDE_LINE_REFERENCES = ("supersedes", "duplicateOf")
+
+
+def _superseded_lines(rows: list[dict[str, Any]]) -> dict[int, int]:
+    """Map each line a supersede record names to the record's own line.
+
+    Derived from the ledger rows the caller already parsed under its lock, never
+    from an argument.  A caller-supplied assertion that a line is safe is the
+    same class of evidence as the playbook sentence that already exists, and it
+    would fail in exactly the case that matters: an operator who is mistaken.
+
+    A row that declares itself a supersede record but whose references cannot be
+    read raises rather than being skipped.  An unreadable record is not evidence
+    that the target is safe; it is evidence that the ledger holds something this
+    code does not understand, and continuing past it would write bytes on that
+    basis.
+    """
+
+    blocked: dict[int, int] = {}
+    for record_line, row in enumerate(rows, 1):
+        if row.get("kind") != SUPERSEDE_KIND:
+            continue
+        for label in SUPERSEDE_LINE_REFERENCES:
+            reference = row.get(label)
+            if not isinstance(reference, dict) or "line" not in reference:
+                raise LedgerError(
+                    f"ledger line {record_line} is a {SUPERSEDE_KIND} record whose "
+                    f"{label} reference cannot be read"
+                )
+            line = reference["line"]
+            # bool is an int subclass and is not a line number.
+            if isinstance(line, bool) or not isinstance(line, int) or line < 1:
+                raise LedgerError(
+                    f"ledger line {record_line} is a {SUPERSEDE_KIND} record whose "
+                    f"{label}.line is not a line number"
+                )
+            blocked.setdefault(line, record_line)
+    return blocked
+
+
+def _refuse_superseded_target(rows: list[dict[str, Any]], target_line: int) -> None:
+    """Refuse a recovery whose target a supersede record pins.
+
+    Recovery rewrites one line in place, and a supersede record pins the row it
+    names by the digest of exactly those bytes.  Rewriting such a line retires
+    nothing, re-enters the retired row in the tally, and turns the gate red with
+    a record that cannot afterwards be withdrawn -- its validator accepts only a
+    council completion as a target, and a supersede record is not one.  So the
+    result is a permanently red gate on a row nobody can touch.
+    """
+
+    blocked = _superseded_lines(rows)
+    record_line = blocked.get(target_line)
+    if record_line is not None:
+        raise LedgerError(
+            f"line {target_line} is named by the {SUPERSEDE_KIND} record on line "
+            f"{record_line}; recovering it would break that record's pinned "
+            "digest and the record cannot afterwards be withdrawn"
+        )
 
 
 def _brief_owners(rows: list[dict[str, Any]], brief: str) -> list[int]:
@@ -572,6 +637,9 @@ def recover_blind_brief(
             raise LedgerError("ledger line-count drift")
         before_sha = _digest(before)
         rows = _parse_rows(lines)
+        # Before the backup, the audit record, the destination, or the ledger
+        # itself is touched: a refusal here leaves the tree exactly as it was.
+        _refuse_superseded_target(rows, spec["target"]["line"])
         target_index = spec["target"]["line"] - 1
         conflict_index = spec["target"]["conflictingLine"] - 1
         if target_index >= len(rows) or conflict_index >= len(rows):
@@ -835,6 +903,10 @@ def plan_blind_brief_recovery(
         before = ledger.read_bytes()
         lines = before.splitlines(keepends=True)
         rows = _parse_rows(lines)
+        # Refused at planning too, not only at the acting step: a plan that
+        # proposes a forbidden recovery is a document an operator can carry to a
+        # later invocation, and the point is that no such plan exists.
+        _refuse_superseded_target(rows, target_line)
         if target_line > len(rows):
             raise LedgerError(f"target line {target_line} is outside the ledger")
         target_index = target_line - 1
