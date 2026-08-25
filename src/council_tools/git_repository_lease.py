@@ -19,6 +19,20 @@ So the target must not already exist, the final component is opened with symlink
 following disabled, and the created directory's device, inode, owner and mode
 are recorded so a later check has something exact to compare against.
 
+**A borrowed descriptor does not by itself protect an in-flight operation.**
+That was measured, not assumed (Row 6).  Git re-resolves the procfs selector as
+a *path*, so once the directory is unlinked the selector resolves to a deleted
+path and the entries beneath it are gone: deleting the tree while a child was
+live made that child fail, and every later bound command failed the same way.
+The direction of that failure is the only consolation -- an error, never a wrong
+answer read from a substituted repository.
+
+So a borrow exists to prevent the **removal**, not to keep a descriptor open.
+An operation spanning validation through the reaping of its child holds one, and
+a removal path observes the count.  Without such a token there is nothing for
+cleanup to wait on, and the ordering that keeps an in-flight operation intact
+would exist only as a convention nothing enforces.
+
 What this module does **not** promise, stated rather than implied:
 
 * **A lease crossing a process boundary is unmeasured.**  Every spike result was
@@ -31,6 +45,9 @@ What this module does **not** promise, stated rather than implied:
   configuration -- not an attacker already running as this user.
 * Freshness means the created directory held no repository, object, reference or
   configuration state before use.  It does not mean it is now safe.
+* **A borrow is process-local.**  It coordinates operations inside this process
+  and nothing else: no lock file, no advisory lock, no shared state.  A second
+  process removing the tree is not prevented by any borrow held here.
 
 Borrow counting, cleanup, and hygiene inspection are separate outcomes.
 """
@@ -40,8 +57,10 @@ from __future__ import annotations
 import errno
 import os
 import stat
-from dataclasses import dataclass
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Iterator
 
 #: Owner-only, because a group- or world-writable repository can be modified by
 #: someone the lease was never meant to include.
@@ -81,6 +100,13 @@ class LeaseIdentity:
         )
 
 
+@dataclass
+class _BorrowState:
+    """Mutable borrow count, kept off the frozen lease value itself."""
+
+    outstanding: int = 0
+
+
 @dataclass(frozen=True)
 class BareRepositoryLease:
     """An opaque handle on one private directory, held by descriptor.
@@ -93,6 +119,34 @@ class BareRepositoryLease:
     descriptor: int
     path: str
     identity: LeaseIdentity
+    _borrows: _BorrowState = field(default_factory=_BorrowState, compare=False, repr=False)
+
+    @property
+    def borrow_count(self) -> int:
+        """How many borrows are outstanding, for a removal path to observe."""
+
+        return self._borrows.outstanding
+
+    @property
+    def is_borrowed(self) -> bool:
+        return self._borrows.outstanding > 0
+
+    @contextmanager
+    def borrow(self) -> Iterator["BareRepositoryLease"]:
+        """Hold the lease for one operation, from validation through completion.
+
+        Identity is revalidated as the borrow is taken, so an operation never
+        begins against a descriptor whose identity has already drifted.  The
+        borrow is released on the raising path too: a failed operation must not
+        leave a lease pinned forever, because cleanup waits on this count.
+        """
+
+        self.revalidate()
+        self._borrows.outstanding += 1
+        try:
+            yield self
+        finally:
+            self._borrows.outstanding -= 1
 
     @property
     def selector(self) -> str:
@@ -159,7 +213,9 @@ def acquire_lease(parent_directory: str | os.PathLike[str], name: str) -> BareRe
         _remove_quietly(target)
         raise
 
-    return BareRepositoryLease(descriptor=descriptor, path=str(target), identity=identity)
+    return BareRepositoryLease(
+        descriptor=descriptor, path=str(target), identity=identity
+    )
 
 
 def _require_fresh(descriptor: int) -> None:
@@ -188,6 +244,10 @@ def release_descriptor(lease: BareRepositoryLease) -> None:
     fail, so removal must be ordered against borrows rather than done here.
     """
 
+    if lease.is_borrowed:
+        # Closing the descriptor mid-operation is the same failure as removing
+        # the tree: the bound child loses its repository.
+        raise GitRepositoryLeaseError("lease-is-borrowed", "lease.descriptor")
     try:
         os.close(lease.descriptor)
     except OSError as error:
