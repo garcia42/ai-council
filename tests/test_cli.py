@@ -2202,5 +2202,232 @@ class ForecastCliTest(unittest.TestCase):
         )
 
 
+TICKET_RUN_ID = "claude-opus-5:adc28853-61ae-4641-9fed-f5fd60da7d07"
+
+
+def ticket_contract(**overrides):
+    contract = {
+        "schemaVersion": 1,
+        "repository": "garcia42/ai-council",
+        "issueNumber": 85,
+        "targetBranch": "main",
+        "baseCommit": "21357c87d6c958579495552af5aac567ae876a69",
+        "workType": "change",
+        # Placeholders: phase one never shows a seat either of these.
+        "priority": "P1",
+        "points": 1,
+        "problemStatement": "Expose the two-phase seal on the command line.",
+        "acceptanceCriteria": ["Phase one and phase two are commands."],
+        "testCommands": ["PYTHONPATH=src:. python3 -m pytest tests/test_cli.py -q"],
+        "allowedPaths": [
+            {"kind": "file", "path": "src/council_tools/cli.py"},
+            {"kind": "file", "path": "tests/test_cli.py"},
+        ],
+        "outOfScope": ["Any GitHub API call."],
+        "dependencies": [],
+        "rollbackPlan": "Revert the commit.",
+    }
+    contract.update(overrides)
+    return contract
+
+
+def ticket_seats(*, codex_days=3, codex_single=True, codex_reasons=()):
+    return [
+        {
+            "seatId": "claude",
+            "status": "submitted",
+            "engineerDays": 2,
+            "singleOutcome": True,
+            "splitReasons": [],
+            "priority": "P1",
+            "confidence": 80,
+        },
+        {
+            "seatId": "codex",
+            "status": "submitted",
+            "engineerDays": codex_days,
+            "singleOutcome": codex_single,
+            "splitReasons": list(codex_reasons),
+            "priority": "P1",
+            "confidence": 90,
+        },
+    ]
+
+
+class TicketQualificationCliTest(unittest.TestCase):
+    """The two-phase seal, driven the way an operator drives it."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir="/var/tmp")
+        self.root = Path(self.temp.name)
+        self.addCleanup(self.temp.cleanup)
+
+    def write(self, name, value):
+        path = self.root / name
+        if isinstance(value, str):
+            path.write_text(value, encoding="utf-8")
+        else:
+            path.write_text(json.dumps(value, indent=2), encoding="utf-8")
+        return str(path)
+
+    def run_cli(self, *args):
+        env = dict(os.environ)
+        env["PYTHONPATH"] = str(Path(__file__).parents[1] / "src")
+        return subprocess.run(
+            [sys.executable, "-m", "council_tools.cli", *args],
+            text=True,
+            capture_output=True,
+            env=env,
+            check=False,
+        )
+
+    def projection(self, contract=None):
+        path = self.write("contract.json", contract or ticket_contract())
+        return self.run_cli("ticket-projection", "--contract", path)
+
+    def seal(self, *extra, contract=None, seats=None, run_id=TICKET_RUN_ID):
+        contract_path = self.write("contract.json", contract or ticket_contract())
+        seats_path = self.write("reviews.json", seats if seats is not None else ticket_seats())
+        return self.run_cli(
+            "ticket-seal",
+            "--contract",
+            contract_path,
+            "--reviews",
+            seats_path,
+            "--run-id",
+            run_id,
+            *extra,
+        )
+
+    # -- phase one --------------------------------------------------------
+
+    def test_phase_one_never_shows_a_seat_the_derived_fields(self):
+        result = self.projection()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertRegex(payload["sizingProjectionSha256"], r"\A[0-9a-f]{64}\Z")
+        for derived in ("points", "priority"):
+            with self.subTest(derived=derived):
+                self.assertNotIn(derived, payload["projection"])
+
+    def test_phase_one_digest_ignores_every_placeholder(self):
+        baseline = json.loads(self.projection().stdout)["sizingProjectionSha256"]
+        for points, priority in ((3, "P0"), (2, "P1")):
+            with self.subTest(points=points, priority=priority):
+                other = self.projection(ticket_contract(points=points, priority=priority))
+                self.assertEqual(
+                    json.loads(other.stdout)["sizingProjectionSha256"], baseline
+                )
+
+    # -- phase two --------------------------------------------------------
+
+    def test_phase_two_records_the_derived_values_and_binds_the_review(self):
+        before = json.loads(self.projection().stdout)["sizingProjectionSha256"]
+        result = self.seal()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+
+        self.assertEqual(payload["contract"]["points"], 3)
+        self.assertEqual(payload["contract"]["priority"], "P1")
+        # The reviewed content did not move when the derived values landed.
+        self.assertEqual(payload["sizingProjectionSha256"], before)
+        self.assertEqual(payload["reviewRecord"]["sizingProjectionSha256"], before)
+        self.assertEqual(
+            payload["reviewRecord"]["contractSha256"], payload["contractSha256"]
+        )
+        self.assertEqual(
+            payload["reviewRef"],
+            {"runId": TICKET_RUN_ID, "contractSha256": payload["contractSha256"]},
+        )
+
+    def test_rendered_body_parses_and_round_trips(self):
+        prose = self.write("prose.md", "## Outcome\n\nDrive the seal from a command.")
+        out_body = str(self.root / "body.md")
+        result = self.seal("--prose", prose, "--out-body", out_body)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+
+        from council_tools.ticket_policy import parse_ticket_issue_body
+
+        envelope = parse_ticket_issue_body(payload["body"])
+        self.assertEqual(envelope.contract.as_dict(), payload["contract"])
+        self.assertEqual(envelope.review_ref.as_dict(), payload["reviewRef"])
+        self.assertEqual(Path(out_body).read_text(encoding="utf-8"), payload["body"])
+
+    def test_no_body_file_is_written_unless_it_is_named(self):
+        prose = self.write("prose.md", "Prose.")
+        result = self.seal("--prose", prose)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        # Only the three inputs exist: the body was printed, never written.
+        self.assertEqual(
+            sorted(p.name for p in self.root.iterdir()),
+            ["contract.json", "prose.md", "reviews.json"],
+        )
+        self.assertIn("body", json.loads(result.stdout))
+
+    def test_output_is_deterministic(self):
+        first = self.seal()
+        second = self.seal()
+        self.assertEqual(first.stdout, second.stdout)
+
+    def test_inputs_are_not_mutated(self):
+        contract_path = self.write("contract.json", ticket_contract())
+        original = Path(contract_path).read_text(encoding="utf-8")
+        self.seal()
+        self.assertEqual(Path(contract_path).read_text(encoding="utf-8"), original)
+
+    # -- refusals ---------------------------------------------------------
+
+    def test_an_ineligible_decision_is_refused(self):
+        cases = {
+            "estimate-over-three": ticket_seats(codex_days=4),
+            "multiple-outcomes": ticket_seats(
+                codex_single=False, codex_reasons=("Two outcomes.",)
+            ),
+        }
+        for expected, seats in cases.items():
+            with self.subTest(reason=expected):
+                result = self.seal(seats=seats)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("review-not-eligible", result.stderr)
+                self.assertIn(expected, result.stderr)
+                self.assertEqual(result.stdout, "")
+
+    def test_marker_text_in_prose_is_refused(self):
+        from council_tools.ticket_policy import TICKET_POLICY_V1
+
+        prose = self.write(
+            "prose.md", f"Discussing {TICKET_POLICY_V1.contract_start_marker} inline."
+        )
+        result = self.seal("--prose", prose)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("prose-contains-marker", result.stderr)
+
+    def test_unreadable_and_malformed_inputs_fail_closed(self):
+        missing = str(self.root / "absent.json")
+        cases = (
+            ("missing contract", ("ticket-projection", "--contract", missing)),
+            (
+                "malformed contract",
+                (
+                    "ticket-projection",
+                    "--contract",
+                    self.write("bad.json", "{not json"),
+                ),
+            ),
+        )
+        for name, args in cases:
+            with self.subTest(case=name):
+                result = self.run_cli(*args)
+                self.assertEqual(result.returncode, 1)
+                self.assertTrue(result.stderr.strip())
+                self.assertEqual(result.stdout, "")
+
+    def test_seat_reviews_must_be_a_list(self):
+        result = self.seal(seats={"seatId": "claude"})
+        self.assertEqual(result.returncode, 1)
+        self.assertTrue(result.stderr.strip())
+
+
 if __name__ == "__main__":
     unittest.main()
