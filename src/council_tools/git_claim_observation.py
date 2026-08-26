@@ -37,6 +37,15 @@ measured rather than assumed:
 * every byte is attacker-influenced, because a remote chooses its own strings and
   can emit a line shaped like a status line for a ref nobody asked about.
 
+**A rejection is recognised by its flag alone; the two granting outcomes are
+not.**  The rejection summary was first pinned to ``[rejected] (stale info)``,
+which is what a *sequential* second push produces — and six processes racing one
+claim produce ``[remote rejected] (failed to update ref)`` instead, which the
+observer then refused.  The fix is not another table entry, because a server has
+many ways to say no and no reading of one binary exhausts them.  The asymmetry is
+about which way an error runs: claiming wrongly is unrecoverable, declining is
+not.
+
 **None of this is authorization.**  Observing that a server created a ref is
 evidence about server state *at one moment*, not proof that this session owns the
 claim: the object still has to be read back from a fresh repository before anyone
@@ -66,18 +75,41 @@ PORCELAIN_HEADER_PREFIX = "To "
 MAX_PORCELAIN_LINES = 256
 MAX_PORCELAIN_BYTES = 64 * 1024
 
-#: The measured outcomes, keyed by ``(flag, summary)``.  Both halves are required:
-#: a flag alone is not specific enough, and matching a summary loosely is how an
-#: unfamiliar answer becomes the nearest familiar one.
 CREATED = "created"
 ALREADY_CURRENT = "already-current"
 REJECTED = "rejected"
 
-_MEASURED_OUTCOMES: dict[tuple[str, str], str] = {
+#: The outcomes that **grant**, keyed by ``(flag, summary)``.  Both halves are
+#: required, because reading something as created or already-current asserts
+#: ownership, and asserting ownership wrongly is the failure the protocol cannot
+#: survive.  Matching these loosely is how an unfamiliar answer becomes the
+#: nearest familiar one.
+_GRANTING_OUTCOMES: dict[tuple[str, str], str] = {
     ("*", "[new branch]"): CREATED,
     ("=", "[up to date]"): ALREADY_CURRENT,
-    ("!", "[rejected] (stale info)"): REJECTED,
 }
+
+#: The flag that **declines**.  Honoured whatever summary follows it.
+#:
+#: This asymmetry is deliberate and was forced by measurement.  The rejection
+#: summary was originally pinned to ``[rejected] (stale info)``, which is what a
+#: *sequential* second push produces.  Six processes racing one claim on the
+#: pinned ``git 2.39.5`` produce ``[remote rejected] (failed to update ref)``
+#: instead, so the observer refused the outcome of the one case the protocol
+#: exists to decide.
+#:
+#: Another table entry would not have fixed it.  A server has many ways to say
+#: no — a hook declines, a reference is locked, a policy forbids the namespace —
+#: and no reading of one binary exhausts them.  What separates the cases is which
+#: way an error runs: declining to claim is recoverable by trying later, while
+#: claiming wrongly is not.  So the exactness stays on the two outcomes that
+#: grant, and this flag is honoured on its own.
+REJECTION_FLAG = "!"
+
+#: Retained so a change to it is visible rather than silently absorbed by the
+#: flag rule.  Nothing branches on it.
+CONTENDED_REJECTION_SUMMARY = "[remote rejected] (failed to update ref)"
+SEQUENTIAL_REJECTION_SUMMARY = "[rejected] (stale info)"
 
 
 class GitClaimObservationError(ValueError):
@@ -161,7 +193,11 @@ def observe_claim_push(stdout: Any, *, expected_ref: Any) -> ClaimPushObservatio
         source, _, destination = pair.rpartition(":")
         if destination != expected_ref:
             continue
-        outcome = _MEASURED_OUTCOMES.get((flag, summary))
+        outcome = _GRANTING_OUTCOMES.get((flag, summary))
+        if outcome is None and flag == REJECTION_FLAG:
+            # The summary is kept exactly as the server wrote it, so an operator
+            # can still see which refusal this was.
+            outcome = REJECTED
         if outcome is None:
             raise GitClaimObservationError(
                 "unrecognised-outcome", f"stdout[{index}]", f"{flag} {summary}"

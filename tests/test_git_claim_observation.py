@@ -6,10 +6,13 @@ from pathlib import Path
 
 from council_tools.git_claim_observation import (
     ALREADY_CURRENT,
+    CONTENDED_REJECTION_SUMMARY,
     CREATED,
     MAX_PORCELAIN_BYTES,
     MAX_PORCELAIN_LINES,
     REJECTED,
+    REJECTION_FLAG,
+    SEQUENTIAL_REJECTION_SUMMARY,
     ClaimPushObservation,
     GitClaimObservationError,
     observe_claim_push,
@@ -130,6 +133,104 @@ class RealGitPorcelainTest(unittest.TestCase):
         self.assertIn("error:", pushed.stderr)
         self.assertNotIn("error:", pushed.stdout)
 
+    def test_racing_processes_produce_exactly_one_created_reference(self):
+        """The contended path, which every sequential test misses.
+
+        This is the case the protocol exists to decide, and the summary its
+        losers report is not the one a sequential second push produces.
+        """
+        import concurrent.futures
+
+        racers = 6
+        workspaces = []
+        for index in range(racers):
+            work = self.root / f"racer{index}"
+            self._git("init", "-q", "--object-format=sha1", str(work))
+            self._git(
+                "-c", "user.name=r", "-c", f"user.email=r{index}@e",
+                "commit", "-q", "--allow-empty", "-m", f"racer-{index}", cwd=work,
+            )
+            oid = self._git("rev-parse", "HEAD", cwd=work).stdout.strip()
+            workspaces.append((work, oid))
+
+        def attempt(pair):
+            work, oid = pair
+            return subprocess.run(
+                [
+                    GIT, "push", "--porcelain", "--no-verify", f"file://{self.remote}",
+                    f"--force-with-lease={REF}:", f"{oid}:{REF}",
+                ],
+                cwd=work, capture_output=True, text=True,
+            )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=racers) as pool:
+            pushed = list(pool.map(attempt, workspaces))
+
+        outcomes = [
+            observe_claim_push(result.stdout, expected_ref=REF).outcome
+            for result in pushed
+        ]
+        self.assertEqual(
+            outcomes.count(CREATED), 1, f"expected exactly one winner, got {outcomes}"
+        )
+        for outcome in outcomes:
+            self.assertIn(outcome, (CREATED, ALREADY_CURRENT, REJECTED))
+        self.assertEqual(
+            outcomes.count(REJECTED) + outcomes.count(ALREADY_CURRENT), racers - 1
+        )
+
+        listed = self._git("ls-remote", f"file://{self.remote}").stdout.strip().splitlines()
+        self.assertEqual(len(listed), 1, listed)
+
+    def test_a_contended_loser_reports_a_summary_the_old_table_refused(self):
+        """Pins the regression: this is the byte sequence that broke the observer."""
+        import concurrent.futures
+
+        workspaces = []
+        for index in range(4):
+            work = self.root / f"loser{index}"
+            self._git("init", "-q", "--object-format=sha1", str(work))
+            self._git(
+                "-c", "user.name=r", "-c", f"user.email=l{index}@e",
+                "commit", "-q", "--allow-empty", "-m", f"loser-{index}", cwd=work,
+            )
+            workspaces.append((work, self._git("rev-parse", "HEAD", cwd=work).stdout.strip()))
+
+        def attempt(pair):
+            work, oid = pair
+            return subprocess.run(
+                [
+                    GIT, "push", "--porcelain", "--no-verify", f"file://{self.remote}",
+                    f"--force-with-lease={REF}:", f"{oid}:{REF}",
+                ],
+                cwd=work, capture_output=True, text=True,
+            )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            pushed = list(pool.map(attempt, workspaces))
+
+        losers = [
+            observe_claim_push(result.stdout, expected_ref=REF)
+            for result in pushed
+            if result.returncode != 0
+        ]
+        self.assertTrue(losers, "no loser: the pushes did not contend at all")
+
+        # Both measured summaries are pinned. Which one a loser gets depends on
+        # whether it lost the ref lock (contended) or found the ref already
+        # written (serialised), and that is a property of the machine, not of
+        # this module -- so either is accepted and anything else is a change in
+        # Git's wording that should be seen rather than absorbed by the flag rule.
+        measured = {CONTENDED_REJECTION_SUMMARY, SEQUENTIAL_REJECTION_SUMMARY}
+        for loser in losers:
+            with self.subTest(summary=loser.summary):
+                self.assertEqual(loser.outcome, REJECTED)
+                self.assertIn(
+                    loser.summary,
+                    measured,
+                    f"unmeasured rejection summary on this binary: {loser.summary!r}",
+                )
+
     def test_a_missing_remote_produces_no_porcelain_at_all(self):
         pushed = subprocess.run(
             [
@@ -207,20 +308,52 @@ class HostileOutputTest(unittest.TestCase):
                     observe_claim_push(output, expected_ref=REF)
                 self.assertEqual(caught.exception.code, "diagnostic-on-stdout")
 
-    def test_an_unfamiliar_flag_or_summary_is_not_mapped_to_the_nearest_case(self):
+    def test_a_granting_flag_with_an_unfamiliar_summary_is_still_refused(self):
+        """Reading something as created or already-current asserts ownership."""
         for flag, summary in (
             ("*", "[up to date]"),
             ("=", "[new branch]"),
-            ("!", "[remote rejected] hook declined"),
+            ("*", "[new tag]"),
+            ("=", "[everything up-to-date]"),
             ("+", "[forced update]"),
             ("-", "[deleted]"),
-            ("*", "[new tag]"),
         ):
             with self.subTest(flag=flag, summary=summary):
                 output = f"To {URL}\n{flag}\t{OID}:{REF}\t{summary}\nDone\n"
                 with self.assertRaises(GitClaimObservationError) as caught:
                     observe_claim_push(output, expected_ref=REF)
                 self.assertEqual(caught.exception.code, "unrecognised-outcome")
+
+    def test_a_rejection_is_recognised_whatever_summary_the_server_chose(self):
+        """Declining to claim is the recoverable direction, so the flag suffices."""
+        for summary in (
+            SEQUENTIAL_REJECTION_SUMMARY,
+            CONTENDED_REJECTION_SUMMARY,
+            "[remote rejected] pre-receive hook declined",
+            "[remote rejected] (cannot lock ref)",
+            "[rejected] (non-fast-forward)",
+            "[remote rejected] (refusing to update protected ref)",
+            "[rejected] (something no one has seen)",
+        ):
+            with self.subTest(summary=summary):
+                output = f"To {URL}\n!\t{OID}:{REF}\t{summary}\nDone\n"
+                observation = observe_claim_push(output, expected_ref=REF)
+                self.assertEqual(observation.outcome, REJECTED)
+
+    def test_the_server_summary_is_retained_exactly_as_written(self):
+        output = f"To {URL}\n!\t{OID}:{REF}\t{CONTENDED_REJECTION_SUMMARY}\nDone\n"
+        self.assertEqual(
+            observe_claim_push(output, expected_ref=REF).summary,
+            CONTENDED_REJECTION_SUMMARY,
+        )
+
+    def test_the_measured_contended_summary_is_pinned(self):
+        """So a change to it is visible rather than absorbed by the flag rule."""
+        self.assertEqual(
+            CONTENDED_REJECTION_SUMMARY, "[remote rejected] (failed to update ref)"
+        )
+        self.assertEqual(SEQUENTIAL_REJECTION_SUMMARY, "[rejected] (stale info)")
+        self.assertEqual(REJECTION_FLAG, "!")
 
     def test_a_reference_containing_a_colon_splits_on_the_last_one(self):
         weird = "refs/heads/ai-council/claims/9"
