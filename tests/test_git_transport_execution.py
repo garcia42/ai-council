@@ -12,7 +12,17 @@ from council_tools.git_process_contract import (
 )
 from council_tools import git_repository_read_runner as read_runner
 from council_tools import git_repository_write_runner as write_runner
-from council_tools.git_claim_observation import PORCELAIN_TRAILER
+from council_tools.git_claim_observation import (
+    PORCELAIN_TRAILER,
+    GitClaimObservationError,
+    observe_claim_push,
+)
+from council_tools.git_transport_diagnostics import (
+    LINE_TRUNCATION_MARKER,
+    MAX_LINES,
+    REDACTION_MARKER,
+    redact_transport_diagnostics,
+)
 from council_tools.git_process_executor import GitSubprocessExecutor
 from council_tools.git_repository_lease import (
     BareRepositoryLease,
@@ -615,3 +625,126 @@ class RealPushBindingTest(unittest.TestCase):
         result = self.executor.execute(unbound)
         self.assertNotEqual(result.exit_status, 0)
         self.assertIn(b"not a git repository", result.stderr)
+
+
+class ProtocolStreamTest(unittest.TestCase):
+    """Standard output is protocol data; standard error is prose.
+
+    Before this, both existing result tests exercised only `stderr`, so the
+    treatment of `stdout` was never tested at all -- which is how redacting it
+    shipped.
+    """
+
+    PORCELAIN = (
+        b"To file:///tmp/r.git\n"
+        b"*\t5f1bc6e6:refs/heads/ai-council/claims/154\t[new branch]\n"
+        b"Done\n"
+    )
+
+    def run_with(self, **streams):
+        executor = RecordingExecutor(GitCommandResult(exit_status=0, **streams))
+        return run_remote_operation(executor, GIT, target(), "push")
+
+    def test_the_separators_survive_byte_for_byte(self):
+        result = self.run_with(stdout=self.PORCELAIN)
+        self.assertEqual(result.stdout, self.PORCELAIN.decode())
+        self.assertIn("\t", result.stdout)
+
+    def test_the_returned_porcelain_parses_with_nothing_done_to_it(self):
+        result = self.run_with(stdout=self.PORCELAIN)
+        observation = observe_claim_push(
+            result.stdout, expected_ref="refs/heads/ai-council/claims/154"
+        )
+        self.assertEqual(observation.outcome, "created")
+        self.assertEqual(observation.summary, "[new branch]")
+
+    def test_redacted_porcelain_would_not_have_parsed(self):
+        # The defect this ticket fixes, pinned so a reinstated redaction fails
+        # here rather than in a caller.
+        redacted = redact_transport_diagnostics(self.PORCELAIN)
+        with self.assertRaises(GitClaimObservationError) as caught:
+            observe_claim_push(
+                redacted, expected_ref="refs/heads/ai-council/claims/154"
+            )
+        self.assertEqual(caught.exception.code, "unparseable-line")
+
+    def test_an_undecodable_byte_becomes_the_replacement_character(self):
+        # A remote must not be able to suppress its own answer by sending one.
+        result = self.run_with(stdout=b"To x\n*\t\xff:refs/heads/x\t[new branch]\nDone\n")
+        self.assertIn("�", result.stdout)
+        self.assertIn("\t", result.stdout)
+
+    def test_standard_output_is_neither_bounded_nor_redacted(self):
+        # Both halves of the deliberate trade-off, pinned rather than implied:
+        # the module no longer bounds this stream and no longer redacts it, and
+        # recording it safely is the caller's obligation. The observer applies
+        # its own, larger bounds.
+        lines = [f"line{index}" for index in range(MAX_LINES + 10)]
+        raw = ("\n".join(lines) + "\nghp_" + "A" * 32 + "\n").encode()
+        result = self.run_with(stdout=raw)
+        self.assertEqual(result.stdout, raw.decode())
+        self.assertNotIn(LINE_TRUNCATION_MARKER, result.stdout)
+        self.assertNotIn(REDACTION_MARKER, result.stdout)
+
+    def test_standard_error_is_still_bounded_and_redacted(self):
+        raw = (
+            b"fatal: could not read from https://user:secret@h/x\n"
+            + b"noise\n" * (MAX_LINES + 10)
+        )
+        result = self.run_with(stderr=raw)
+        self.assertNotIn("secret", result.stderr)
+        self.assertIn(REDACTION_MARKER, result.stderr)
+        self.assertIn("further line(s) omitted", result.stderr)
+        self.assertLessEqual(len(result.stderr.split("\n")), MAX_LINES + 1)
+
+    def test_a_stream_that_is_not_bytes_is_refused_on_either_side(self):
+        for stream in ("stdout", "stderr"):
+            with self.subTest(stream=stream):
+                executor = RecordingExecutor(
+                    GitCommandResult(exit_status=0, **{stream: "already text"})
+                )
+                with self.assertRaises(TypeError):
+                    run_remote_operation(executor, GIT, target(), "push")
+
+
+class RealPushPorcelainTest(unittest.TestCase):
+    """The whole stack, end to end: a real push read by the real observer.
+
+    This is the composition #153 recorded as invisible to per-module review.
+    Both modules pass their own suites; only running the operation the module
+    exists to run shows that one destroys what the other must read.
+    """
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="transport-porcelain-"))
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        self.remote = self.root / "remote.git"
+        subprocess.run(
+            [GIT, "init", "--bare", "-q", str(self.remote)],
+            check=True,
+            env=dict(BASE_CHILD_ENVIRONMENT),
+        )
+        self.target = validate_remote_url(f"file://{self.remote}")
+        self.lease, self.commit = _source_repository(self.root)
+        self.addCleanup(release_descriptor, self.lease)
+        self.ref = "refs/heads/ai-council/claims/154"
+
+    def test_a_real_push_is_read_by_the_real_observer(self):
+        result = run_remote_operation(
+            GitSubprocessExecutor(),
+            GIT,
+            self.target,
+            "push",
+            (
+                "--porcelain",
+                "--no-verify",
+                f"--force-with-lease={self.ref}:",
+                f"{self.commit}:{self.ref}",
+            ),
+            repository=self.lease,
+        )
+        self.assertEqual(result.exit_status, 0)
+        observation = observe_claim_push(result.stdout, expected_ref=self.ref)
+        self.assertEqual(observation.outcome, "created")
+        self.assertEqual(observation.source, self.commit)
+        self.assertEqual(observation.destination, self.ref)

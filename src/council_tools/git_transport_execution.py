@@ -66,6 +66,36 @@ The lease is **borrowed for the whole operation**, as the local runners borrow
 theirs: identity is revalidated as the borrow is taken, and cleanup waits on the
 borrow count, so the repository cannot be removed from under a running child.
 
+**The two output streams are not the same kind of thing, and are not treated the
+same way.**  Standard error carries prose a remote chose.  It reaches a log or a
+report unexamined, so it is bounded and redacted by
+:func:`~council_tools.git_transport_diagnostics.redact_transport_diagnostics`
+exactly as before.  Standard output, for the operations this module exists to
+run, is **protocol data**.  Redaction strips control characters -- written as a
+keep-list on purpose, so it strips TAB -- and TAB is what a push status line is
+separated by.  Measured::
+
+    in  : "*\t<oid>:refs/heads/x\t[new branch]"
+    out : "*<oid>:refs/heads/x[new branch]"
+
+:func:`~council_tools.git_claim_observation.observe_claim_push` splits on TAB and
+requires exactly three fields, so redacting that stream made **every** claim
+attempt come back ``unparseable-line``.  Removing the separators does not make
+the stream safer; the parser already treats it as hostile, bounding it in lines
+and bytes before parsing, requiring its trailer, refusing a diagnostic offered as
+a status line, ignoring a status line for a reference nobody asked about, and
+refusing two lines for the one requested.  Removing them only makes every answer
+unreadable, and an unreadable answer about who holds a claim is the failure the
+apparatus exists to avoid.
+
+**So a caller that records standard output is recording bytes a remote chose,
+and bounding and redacting them at the point of record is that caller's
+obligation** -- this module no longer does it for that stream.  It is still
+decoded with ``errors="replace"``, for the reason the diagnostics module uses the
+same policy: undecodable bytes are a thing a remote can send, and failing on them
+would let it suppress its own answer.  How much a child may produce at all is a
+separate question, and it is issue #126 rather than this module's.
+
 This module spawns nothing itself: every command goes through the executor, whose
 deadline and process-group termination are inherited unchanged.  It contacts no
 network host, obtains no credential, and reads no credential material.
@@ -133,7 +163,13 @@ class GitTransportExecutionError(ValueError):
 
 @dataclass(frozen=True)
 class RemoteOperationResult:
-    """What a remote operation produced, with its output already made safe."""
+    """What a remote operation produced.
+
+    ``stderr`` is bounded and redacted.  ``stdout`` is **not**: it is the
+    child's bytes decoded and otherwise untouched, because for the operations
+    this module runs it is protocol data whose separators redaction destroys.
+    Recording it safely is the caller's obligation; see the module docstring.
+    """
 
     exit_status: int | None
     stdout: str
@@ -237,6 +273,21 @@ def _checked_arguments(arguments: Any, field: str) -> tuple[str, ...]:
     return tuple(checked)
 
 
+def _decode_protocol_stream(raw: Any) -> str:
+    """Decode a machine-readable stream without altering a byte of it.
+
+    ``errors="replace"`` for the same reason the diagnostics module uses it:
+    undecodable bytes are a thing a remote can send, and raising on them would
+    let a remote suppress its own answer.  The type check mirrors that module's,
+    so an executor returning something other than bytes fails the same way on
+    either stream rather than silently producing a different kind of value.
+    """
+
+    if type(raw) is not bytes:
+        raise TypeError("transport output must be bytes")
+    return raw.decode("utf-8", errors="replace")
+
+
 def run_remote_operation(
     executor: GitExecutor,
     executable: str,
@@ -278,9 +329,10 @@ def run_remote_operation(
         raise GitTransportExecutionError("invalid-result", "executor")
     return RemoteOperationResult(
         exit_status=result.exit_status,
-        # A remote chooses these bytes, so they are bounded and redacted before
-        # anyone can record or print them.
-        stdout=redact_transport_diagnostics(result.stdout),
+        # Protocol data: decoded, and otherwise exactly what the child wrote.
+        # Redacting it here strips the TAB the porcelain is separated by.
+        stdout=_decode_protocol_stream(result.stdout),
+        # Prose a remote chose, which reaches a log unexamined.
         stderr=redact_transport_diagnostics(result.stderr),
         local_failure=result.local_failure,
     )
