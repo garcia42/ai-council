@@ -10,9 +10,20 @@ from council_tools.git_process_contract import (
     GitCommand,
     GitCommandResult,
 )
+from council_tools import git_repository_read_runner as read_runner
+from council_tools import git_repository_write_runner as write_runner
+from council_tools.git_claim_observation import PORCELAIN_TRAILER
 from council_tools.git_process_executor import GitSubprocessExecutor
+from council_tools.git_repository_lease import (
+    BareRepositoryLease,
+    GitRepositoryLeaseError,
+    LeaseIdentity,
+    acquire_lease,
+    release_descriptor,
+)
 from council_tools.git_transport_execution import (
     FORBIDDEN_ARGUMENT_PREFIXES,
+    GIT_DIR_OPTION,
     REMOTE_ARGUMENT_INDEX,
     GitTransportExecutionError,
     RemoteOperationResult,
@@ -338,3 +349,269 @@ def _restore_environ(key, previous):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _source_repository(root, name="source.git"):
+    """A leased bare repository holding one commit, ready to push."""
+
+    lease = acquire_lease(root, name)
+
+    def git(*arguments, stdin=b""):
+        completed = subprocess.run(
+            [GIT, f"--git-dir={lease.selector}", *arguments],
+            input=stdin,
+            capture_output=True,
+            pass_fds=(lease.descriptor,),
+            env={
+                **BASE_CHILD_ENVIRONMENT,
+                "GIT_AUTHOR_NAME": "t",
+                "GIT_AUTHOR_EMAIL": "t@example.invalid",
+                "GIT_COMMITTER_NAME": "t",
+                "GIT_COMMITTER_EMAIL": "t@example.invalid",
+            },
+        )
+        if completed.returncode != 0:
+            raise AssertionError(completed.stderr.decode())
+        return completed.stdout.decode().strip()
+
+    git("init", "--bare", "-q", "--object-format=sha1")
+    blob = git("hash-object", "-w", "--stdin", stdin=b"claim")
+    tree = git("mktree", stdin=f"100644 blob {blob}\tclaim.json\n".encode())
+    return lease, git("commit-tree", tree, "-m", "claim")
+
+
+class RepositoryBindingVectorTest(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="transport-binding-"))
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        self.lease = acquire_lease(self.root, "bound.git")
+        self.addCleanup(release_descriptor, self.lease)
+
+    def test_the_binding_is_the_last_global_option(self):
+        # Measured: Git resolves the LAST --git-dir, so anything after the
+        # module's binding would override it.
+        command = build_remote_command(
+            GIT,
+            target(),
+            "push",
+            global_options=("--no-replace-objects",),
+            repository=self.lease,
+        )
+        self.assertEqual(
+            command.invocation.global_options,
+            ("--no-replace-objects", f"--git-dir={self.lease.selector}"),
+        )
+        self.assertEqual(
+            command.invocation.argv(),
+            (
+                "--no-replace-objects",
+                f"--git-dir={self.lease.selector}",
+                "push",
+                "file:///tmp/claim.git",
+            ),
+        )
+
+    def test_the_leases_descriptor_is_inherited_with_the_binding(self):
+        command = build_remote_command(GIT, target(), "push", repository=self.lease)
+        self.assertEqual(command.inherited_descriptors, (self.lease.descriptor,))
+
+    def test_without_a_lease_the_vector_is_exactly_what_it_was(self):
+        command = build_remote_command(
+            GIT, target(), "ls-remote", global_options=("--no-replace-objects",)
+        )
+        self.assertEqual(command.invocation.global_options, ("--no-replace-objects",))
+        self.assertEqual(command.inherited_descriptors, ())
+        self.assertNotIn(
+            "--git-dir", " ".join(command.invocation.argv())
+        )
+
+    def test_all_three_binding_spellings_agree(self):
+        # One spelling in three modules. Pinned together so a change to any of
+        # them cannot silently diverge from the others.
+        self.assertEqual(GIT_DIR_OPTION, read_runner.GIT_DIR_OPTION)
+        self.assertEqual(GIT_DIR_OPTION, write_runner.GIT_DIR_OPTION)
+
+
+class RepositoryRefusalTest(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="transport-refusal-"))
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+
+    def test_anything_that_is_not_a_lease_is_refused(self):
+        class Impostor:
+            selector = "/proc/self/fd/3"
+            descriptor = 3
+
+        for value in ("/tmp/claim.git", Path("/tmp/claim.git"), 3, object(), Impostor()):
+            with self.subTest(value=type(value).__name__):
+                with self.assertRaises(GitTransportExecutionError) as raised:
+                    build_remote_command(GIT, target(), "push", repository=value)
+                self.assertEqual(raised.exception.code, "invalid-repository")
+                self.assertEqual(raised.exception.field, "repository")
+
+    def test_a_refused_repository_never_reaches_the_executor(self):
+        executor = RecordingExecutor()
+        with self.assertRaises(GitTransportExecutionError):
+            run_remote_operation(
+                executor, GIT, target(), "push", repository="/tmp/claim.git"
+            )
+        self.assertIsNone(executor.command)
+
+    def test_a_caller_supplied_binding_is_still_refused(self):
+        lease = acquire_lease(self.root, "bound.git")
+        self.addCleanup(release_descriptor, lease)
+        for field, kwargs in (
+            ("arguments", {"arguments": (f"--git-dir={lease.selector}",)}),
+            ("global_options", {"global_options": (f"--git-dir={lease.selector}",)}),
+        ):
+            with self.subTest(field=field):
+                with self.assertRaises(GitTransportExecutionError) as raised:
+                    build_remote_command(GIT, target(), "push", **kwargs)
+                self.assertEqual(raised.exception.code, "forbidden-argument")
+                self.assertEqual(raised.exception.detail, "--git-dir")
+                # ...and it is refused whether or not the module is also
+                # inserting one of its own.
+                with self.assertRaises(GitTransportExecutionError):
+                    build_remote_command(
+                        GIT, target(), "push", repository=lease, **kwargs
+                    )
+
+
+class RepositoryBorrowTest(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="transport-borrow-"))
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        self.lease = acquire_lease(self.root, "bound.git")
+        self.addCleanup(release_descriptor, self.lease)
+
+    def test_the_lease_is_held_for_the_whole_operation(self):
+        observed = []
+
+        class Observer(RecordingExecutor):
+            def execute(inner, command):  # noqa: N805 - inner self, outer test
+                observed.append(self.lease.borrow_count)
+                return super().execute(command)
+
+        self.assertEqual(self.lease.borrow_count, 0)
+        run_remote_operation(Observer(), GIT, target(), "push", repository=self.lease)
+        self.assertEqual(observed, [1])
+        self.assertEqual(self.lease.borrow_count, 0)
+
+    def test_no_borrow_is_taken_when_there_is_no_lease(self):
+        run_remote_operation(RecordingExecutor(), GIT, target(), "ls-remote")
+        self.assertEqual(self.lease.borrow_count, 0)
+
+    def test_a_lease_whose_identity_drifted_never_reaches_the_executor(self):
+        executor = RecordingExecutor()
+        drifted = BareRepositoryLease(
+            descriptor=self.lease.descriptor,
+            path=self.lease.path,
+            identity=LeaseIdentity(
+                device=self.lease.identity.device + 1,
+                inode=self.lease.identity.inode,
+                owner_uid=self.lease.identity.owner_uid,
+                mode=self.lease.identity.mode,
+            ),
+        )
+        with self.assertRaises(GitRepositoryLeaseError) as raised:
+            run_remote_operation(executor, GIT, target(), "push", repository=drifted)
+        self.assertEqual(raised.exception.code, "identity-mismatch")
+        self.assertIsNone(executor.command)
+
+    def test_the_borrow_is_released_when_the_operation_raises(self):
+        class Exploding:
+            def execute(self, command):
+                raise RuntimeError("boom")
+
+        with self.assertRaises(RuntimeError):
+            run_remote_operation(
+                Exploding(), GIT, target(), "push", repository=self.lease
+            )
+        self.assertEqual(self.lease.borrow_count, 0)
+
+
+class RealPushBindingTest(unittest.TestCase):
+    """The exercising case: an operation that needs local objects to send.
+
+    ``ls-remote`` needs neither a local repository nor a readable answer, which
+    is why every earlier test of this module used it and why neither of the two
+    defects behind #153 was visible.
+    """
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="transport-push-"))
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        self.remote = self.root / "remote.git"
+        subprocess.run(
+            [GIT, "init", "--bare", "-q", str(self.remote)],
+            check=True,
+            env=dict(BASE_CHILD_ENVIRONMENT),
+        )
+        self.target = validate_remote_url(f"file://{self.remote}")
+        self.lease, self.commit = _source_repository(self.root)
+        self.addCleanup(release_descriptor, self.lease)
+        self.executor = GitSubprocessExecutor()
+        self.ref = "refs/heads/ai-council/claims/155"
+
+    def push(self, **kwargs):
+        return run_remote_operation(
+            self.executor,
+            GIT,
+            self.target,
+            "push",
+            (
+                "--porcelain",
+                "--no-verify",
+                f"--force-with-lease={self.ref}:",
+                f"{self.commit}:{self.ref}",
+            ),
+            **kwargs,
+        )
+
+    def remote_refs(self):
+        listed = subprocess.run(
+            [GIT, "ls-remote", self.target.url],
+            capture_output=True,
+            check=True,
+            env=dict(BASE_CHILD_ENVIRONMENT),
+        )
+        return listed.stdout.decode()
+
+    def test_a_bound_push_succeeds_and_the_remote_holds_the_object(self):
+        result = self.push(repository=self.lease)
+        self.assertEqual(result.exit_status, 0)
+        self.assertIsNone(result.local_failure)
+        # Read the decision back from the remote rather than inferring it from
+        # the exit status: a create and an already-current push both exit 0.
+        self.assertIn(f"{self.commit}\t{self.ref}", self.remote_refs())
+
+    def test_an_unbound_push_fails_and_creates_nothing(self):
+        result = self.push()
+        self.assertNotEqual(result.exit_status, 0)
+        self.assertIn("bad object", result.stderr)
+        self.assertEqual(self.remote_refs().strip(), "")
+
+    def test_the_unbound_failure_is_reported_as_a_remote_rejection(self):
+        # Measured: a fault entirely on this side arrives on stdout carrying the
+        # rejection flag. Under #151's rule that flag is honoured whatever
+        # summary follows it, so the only thing keeping it from reading as
+        # "another session holds the claim" is the absent trailer.
+        result = self.push()
+        self.assertIn("[remote rejected]", result.stdout)
+        self.assertNotIn(PORCELAIN_TRAILER, result.stdout.split("\n"))
+
+    def test_the_selector_alone_binds_nothing(self):
+        # The selector and the descriptor travel together; a test that passes
+        # only the selector proves nothing about the binding.
+        command = build_remote_command(
+            GIT, self.target, "push", repository=self.lease
+        )
+        unbound = GitCommand(
+            executable=command.executable,
+            invocation=command.invocation,
+            environment=command.environment,
+            inherited_descriptors=(),
+        )
+        result = self.executor.execute(unbound)
+        self.assertNotEqual(result.exit_status, 0)
+        self.assertIn(b"not a git repository", result.stderr)

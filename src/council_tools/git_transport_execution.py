@@ -36,6 +36,36 @@ child reports **neither** the hostile identity **nor** anything ambient, while
 still reporting a value the policy explicitly permitted — so a test that observed
 nothing at all could not pass.
 
+**A repository binding is inserted here or it does not exist.**  A remote
+operation that sends objects needs a local repository, and a caller cannot supply
+one: ``--git-dir`` is refused above, for the reason that a caller-supplied
+binding re-points the operation at a repository the identity policy never
+validated.  Refusing it left no sanctioned way to bind one at all, so the module
+could run only the subset of Git needing no local objects -- which is the subset
+every test of it happened to use.  It now takes an optional
+:class:`~council_tools.git_repository_lease.BareRepositoryLease`, the same handle
+both local runners take, and inserts the binding itself.  The caller refusal is
+unchanged and stays the primary control.
+
+Two measured facts decide how that binding is placed, on the pinned ``git
+2.39.5``:
+
+* **Git resolves the last ``--git-dir``, not the first.**  ``--git-dir=A
+  --git-dir=B`` reads B and ``--git-dir=B --git-dir=A`` reads A.  So the binding
+  goes **last** in the Git-global region, where nothing a caller supplied can
+  override it.  Both local runners insert theirs *first*; that position is
+  correct only because the refusal in front of it is total, and it is not the
+  position that would win on its own.
+* **The selector and the descriptor travel together.**
+  ``--git-dir=/proc/self/fd/N`` without ``N`` in
+  :attr:`~council_tools.git_process_contract.GitCommand.inherited_descriptors`
+  gives ``fatal: not a git repository: '/proc/self/fd/3'``, so passing the
+  selector alone binds nothing and a test that passes it alone measures nothing.
+
+The lease is **borrowed for the whole operation**, as the local runners borrow
+theirs: identity is revalidated as the borrow is taken, and cleanup waits on the
+borrow count, so the repository cannot be removed from under a running child.
+
 This module spawns nothing itself: every command goes through the executor, whose
 deadline and process-group termination are inherited unchanged.  It contacts no
 network host, obtains no credential, and reads no credential material.
@@ -43,6 +73,7 @@ network host, obtains no credential, and reads no credential material.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, Mapping
 
@@ -52,6 +83,7 @@ from council_tools.git_process_contract import (
     GitExecutor,
     RenderedInvocation,
 )
+from council_tools.git_repository_lease import BareRepositoryLease
 from council_tools.git_transport_diagnostics import redact_transport_diagnostics
 from council_tools.git_transport_identity import (
     RemoteTarget,
@@ -79,6 +111,11 @@ FORBIDDEN_ARGUMENT_PREFIXES: tuple[str, ...] = (
     "--namespace",
     "--upload-archive",
 )
+
+#: How a repository binding is spelled.  The two local runners each define this
+#: identically; a test pins all three together so a change to one cannot
+#: silently diverge from the others.
+GIT_DIR_OPTION = "--git-dir={selector}"
 
 
 class GitTransportExecutionError(ValueError):
@@ -117,11 +154,16 @@ def build_remote_command(
     *,
     environment: Mapping[str, str] | None = None,
     global_options: Any = (),
+    repository: Any = None,
 ) -> GitCommand:
     """Build the command for one remote operation.
 
     ``target`` must be a validated :class:`RemoteTarget`; text is refused, so the
     string placed in the vector is the string that was validated.
+
+    ``repository`` is an optional lease on a local repository.  Omitting it
+    builds exactly the vector this built before the option existed, so an
+    operation needing no local objects is unchanged.
     """
 
     if not isinstance(target, RemoteTarget):
@@ -129,6 +171,7 @@ def build_remote_command(
     if not isinstance(subcommand, str) or not subcommand or subcommand != subcommand.strip():
         raise GitTransportExecutionError("invalid-subcommand", "subcommand")
 
+    lease = _checked_repository(repository)
     checked_arguments = _checked_arguments(arguments, "arguments")
     checked_globals = _checked_arguments(global_options, "global_options")
 
@@ -138,9 +181,20 @@ def build_remote_command(
                 "argument-repeats-remote", f"arguments[{index}]"
             )
 
+    # Last, not first: Git resolves the last ``--git-dir`` in the vector, so a
+    # binding placed ahead of a caller-supplied one would be overridden by it.
+    # The caller refusal above already makes that unreachable; this is the
+    # position that would still hold if it were not.
+    bound_globals = checked_globals
+    descriptors: tuple[int, ...] = ()
+    if lease is not None:
+        bound_globals = (*checked_globals, GIT_DIR_OPTION.format(selector=lease.selector))
+        # Without the descriptor the selector resolves to nothing in the child.
+        descriptors = (lease.descriptor,)
+
     child_environment = transport_child_environment(environment)
     invocation = RenderedInvocation(
-        global_options=checked_globals,
+        global_options=bound_globals,
         subcommand=subcommand,
         subcommand_args=(target.url, *checked_arguments),
     )
@@ -148,7 +202,23 @@ def build_remote_command(
         executable=executable,
         invocation=invocation,
         environment=child_environment,
+        inherited_descriptors=descriptors,
     )
+
+
+def _checked_repository(repository: Any) -> BareRepositoryLease | None:
+    """Accept a lease or nothing; membership in the type, not duck typing.
+
+    An object that merely has ``selector`` and ``descriptor`` could name any
+    directory at all, and the whole point of a lease is that custody was
+    established when it was acquired and is revalidated when it is borrowed.
+    """
+
+    if repository is None:
+        return None
+    if type(repository) is not BareRepositoryLease:
+        raise GitTransportExecutionError("invalid-repository", "repository")
+    return repository
 
 
 def _checked_arguments(arguments: Any, field: str) -> tuple[str, ...]:
@@ -176,22 +246,34 @@ def run_remote_operation(
     *,
     environment: Mapping[str, str] | None = None,
     global_options: Any = (),
+    repository: Any = None,
 ) -> RemoteOperationResult:
     """Build the command, run it through ``executor``, and make its output safe.
 
     The deadline and the process-group termination belong to the executor and are
     inherited unchanged; nothing is spawned here.
+
+    A ``repository`` lease is held for the whole operation, the way both local
+    runners hold theirs: identity is revalidated as the borrow is taken, and
+    cleanup waits on the borrow count, so the repository cannot be removed from
+    under a running child.
     """
 
-    command = build_remote_command(
-        executable,
-        target,
-        subcommand,
-        arguments,
-        environment=environment,
-        global_options=global_options,
-    )
-    result = executor.execute(command)
+    lease = _checked_repository(repository)
+    # One build-and-execute path whether or not there is a lease: a second path
+    # is where the borrow gets forgotten.
+    holder = nullcontext(None) if lease is None else lease.borrow()
+    with holder as bound:
+        command = build_remote_command(
+            executable,
+            target,
+            subcommand,
+            arguments,
+            environment=environment,
+            global_options=global_options,
+            repository=bound,
+        )
+        result = executor.execute(command)
     if not isinstance(result, GitCommandResult):
         raise GitTransportExecutionError("invalid-result", "executor")
     return RemoteOperationResult(
