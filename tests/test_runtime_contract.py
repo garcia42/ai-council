@@ -152,7 +152,7 @@ _install_runtime_isolation_audit_hook()
 
 
 class RuntimeContractTest(unittest.TestCase):
-    def test_source_contracts_name_the_same_merge_approval_quorum(self):
+    def test_installed_council_skill_names_forecast_contract(self):
         for relative_path in (
             "runtime/council-operator-steps.md",
             "runtime/CLAUDE_FORECAST_CONTRACT.md",
@@ -165,8 +165,6 @@ class RuntimeContractTest(unittest.TestCase):
                 "independent blind-seat requirements remain a separate gate",
                 normalized,
             )
-
-    def test_installed_council_skill_names_forecast_contract(self):
         text = (RUNTIME_ROOT / "skills/council/SKILL.md").read_text(encoding="utf-8")
         for required in (
             "council-attempt",
