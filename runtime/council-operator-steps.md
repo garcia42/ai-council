@@ -74,8 +74,11 @@
    Report the actual result, including failures.
 
 6. **Report, in this order:**
-   - **Verdict table** — lens, APPROVE / CONCERN / BLOCK, one-line reason. Do not ship on
-     a BLOCK.
+   - **Verdict table** — lens, APPROVE / CONCERN / BLOCK, one-line reason. A merge is
+     eligible only when at least two of the code, theory, and operations lenses return
+     exactly `APPROVE` and none returns `BLOCK`. A qualified or conditional response is
+     not an `APPROVE`. The independent blind-seat requirements remain a separate gate;
+     that seat is not one of the three counted lenses.
    - **Independent blind seat** — its own section, labelled as having seen neither the
      lenses nor this machine. Its answer, then explicitly: where it agrees with the
      lenses, and where it does not. Agreement from an independent seat is evidence;

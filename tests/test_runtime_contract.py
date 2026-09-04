@@ -11,6 +11,10 @@ from unittest import mock
 
 
 RUNTIME_ROOT = Path(os.environ.get("COUNCIL_RUNTIME_ROOT", "/home/trader")) / ".claude"
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+APPROVAL_QUORUM_TEXT = (
+    "at least two of the code, theory, and operations lenses return exactly `APPROVE`"
+)
 _DENIED_RUNTIME_PATHS = tuple(
     Path(item).expanduser().resolve()
     for item in os.environ.get(
@@ -148,6 +152,20 @@ _install_runtime_isolation_audit_hook()
 
 
 class RuntimeContractTest(unittest.TestCase):
+    def test_source_contracts_name_the_same_merge_approval_quorum(self):
+        for relative_path in (
+            "runtime/council-operator-steps.md",
+            "runtime/CLAUDE_FORECAST_CONTRACT.md",
+        ):
+            text = (REPOSITORY_ROOT / relative_path).read_text(encoding="utf-8")
+            normalized = " ".join(text.split())
+            self.assertIn(APPROVAL_QUORUM_TEXT, normalized)
+            self.assertIn("none returns `BLOCK`", normalized)
+            self.assertIn(
+                "independent blind-seat requirements remain a separate gate",
+                normalized,
+            )
+
     def test_installed_council_skill_names_forecast_contract(self):
         text = (RUNTIME_ROOT / "skills/council/SKILL.md").read_text(encoding="utf-8")
         for required in (
