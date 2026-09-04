@@ -47,6 +47,9 @@ CRITERION_FIXTURE = (
 DUPLICATE_FIXTURE_ROOT = (
     Path(__file__).parent / "fixtures/duplicate-council-row-supersede"
 )
+APPROVAL_QUORUM_TEXT = (
+    "at least two of the code, theory, and operations lenses return exactly `APPROVE`"
+)
 
 
 class InstallerTest(unittest.TestCase):
@@ -227,6 +230,21 @@ class InstallerTest(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertNotIn("@@COUNCIL_TOOLS_", reporter)
         self.assertIn(install._repository_identity(install.REPO, require_clean=False)[0], reporter)
+
+    def test_install_projects_merge_approval_quorum_to_both_instruction_surfaces(self):
+        install.install(self.root, self.backups)
+        for relative_path in (
+            ".claude/skills/council/SKILL.md",
+            "CLAUDE.md",
+        ):
+            text = (self.root / relative_path).read_text(encoding="utf-8")
+            normalized = " ".join(text.split())
+            self.assertIn(APPROVAL_QUORUM_TEXT, normalized)
+            self.assertIn("none returns `BLOCK`", normalized)
+            self.assertIn(
+                "independent blind-seat requirements remain a separate gate",
+                normalized,
+            )
 
     def test_first_install_adopts_the_unmanaged_operator_procedure(self):
         install.install(self.root, self.backups)

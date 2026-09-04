@@ -1,5 +1,10 @@
 ### Council forecast scoring
 
+For every council-reviewed merge, at least two of the code, theory, and operations lenses return
+exactly `APPROVE` and none returns `BLOCK`. A qualified or conditional response is not an
+`APPROVE`. The independent blind-seat requirements remain a separate gate; that seat is not one of
+the three counted lenses.
+
 Every `/council` invocation follows the installed forecast contract in the council skill. It first
 records a price-free `council-attempt`, gives every seated reviewer one byte-identical material
 shared outcome, seals the returned probabilities, validates the completion record, and appends it
