@@ -1670,6 +1670,11 @@ class ForecastCliTest(unittest.TestCase):
         self.assertTrue(
             Path(initiated_payload["transactionEscrows"][0]).is_file()
         )
+        initiation = json.loads(
+            self.log.read_text(encoding="utf-8").splitlines()[-1]
+        )
+        self.assertEqual(initiation["kind"], "capture-initiation")
+        report_as_of = initiation["handlingStartedAt"]
 
         injected = self.run_cli(
             "capture-initiate",
@@ -1694,7 +1699,7 @@ class ForecastCliTest(unittest.TestCase):
             "--artifact-root",
             str(self.root / "artifacts"),
             "--as-of",
-            "2026-09-01T00:00:00Z",
+            report_as_of,
             "--json",
         )
         self.assertEqual(report.returncode, 0, report.stderr)
@@ -1716,7 +1721,7 @@ class ForecastCliTest(unittest.TestCase):
             "--artifact-root",
             str(self.root / "artifacts"),
             "--as-of",
-            "2026-09-01T00:00:00Z",
+            report_as_of,
         )
         self.assertEqual(human.returncode, 0, human.stderr)
         self.assertIn("activation=BLOCKED", human.stdout)
