@@ -139,6 +139,7 @@ def _binding(request):
             or not isinstance(v, str) or "\0" in v for k, v in environment.items()):
         raise JobRefused("environment must contain explicit string variables")
     return {"inputs": inputs, "executableSha256": _digest(executable),
+            "host": _host_identity(),
             "supervisorSha256": _digest(Path(__file__)), "uid": os.geteuid(),
             "gid": os.getegid(), "groups": sorted(os.getgroups()),
             "inheritedEnvironmentSha256": hashlib.sha256(_bytes(dict(os.environ))).hexdigest()}
@@ -185,6 +186,38 @@ def _available(state, states, capacities):
     return all(used[k] + v <= capacities[k] for k, v in state["request"]["resources"].items())
 
 
+def _host_identity():
+    return {"machineSha256": _digest(Path("/etc/machine-id")),
+            "bootId": Path("/proc/sys/kernel/random/boot_id").read_text().strip()}
+
+
+def reconcile_after_reboot(root: Path, job_id: str, reason: str):
+    """Release local claims only after the same host has destroyed all old processes."""
+    if not re.fullmatch(r"job-[0-9a-f]{32}", job_id) or not reason.strip():
+        raise JobRefused("exact job identifier and operator reason required")
+    with _transaction(root):
+        path = root / (job_id + ".json")
+        state = _load(path)
+        if state["state"] not in ("RUNNING", "UNKNOWN_EXECUTION", "UNKNOWN_DESCENDANTS"):
+            raise JobRefused("job has no unresolved admitted claim")
+        original = state["binding"].get("host")
+        current = _host_identity()
+        if (not original or original["machineSha256"] != current["machineSha256"] or
+                original["bootId"] == current["bootId"]):
+            raise JobRefused("same-host reboot proof required; old unbound jobs cannot be reconciled")
+        identities = [state.get("supervisor"), state.get("child"), *state.get("remainingChildren", [])]
+        if not state.get("supervisor") or any(
+                identity and identity["bootId"] != original["bootId"] for identity in identities):
+            raise JobRefused("recorded process boot identity differs")
+        state["reconciliation"] = {"previousState": state["state"], "at": _now(),
+                                   "operatorUid": os.geteuid(), "reason": reason,
+                                   "observedHost": current, "qualificationEffect": False}
+        # Preserve parent nativeExit, process identities, error and evidence hashes.
+        state["state"] = "RECONCILED_AFTER_REBOOT"
+        _save(path, state)
+        return state
+
+
 def _adopt_descendants():
     # Linux PR_SET_CHILD_SUBREAPER: orphaned grandchildren remain children of
     # this supervisor even when they create a new session/process group.
@@ -216,6 +249,23 @@ def _remaining_children():
     return children
 
 
+def _wait_main_child(child):
+    # Reap adopted orphans while the command runs. Leaving zombies until its
+    # exit changes process-liveness checks made by the command itself. Peek
+    # without consuming the main child's status; Popen owns its native exit.
+    while child.poll() is None:
+        while True:
+            try:
+                exited = os.waitid(os.P_ALL, 0, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+            except ChildProcessError:
+                break
+            if exited is None or exited.si_pid == child.pid:
+                break
+            os.waitpid(exited.si_pid, os.WNOHANG)
+        time.sleep(0.05)
+    return child.returncode
+
+
 def worker(root: Path, job_id: str):
     if not re.fullmatch(r"job-[0-9a-f]{32}", job_id):
         raise JobRefused("invalid job identifier")
@@ -227,7 +277,12 @@ def worker(root: Path, job_id: str):
                 raise JobRefused("worker does not own queued job")
             capacities = _load(root / "manager.json")["capacities"]
             if _available(state, _states(root), capacities):
-                current_binding = _binding(state["request"])
+                try:
+                    current_binding = _binding(state["request"])
+                except (JobRefused, OSError) as exc:
+                    state.update(state="REFUSED_INPUT_DRIFT", endedAt=_now(), error=str(exc))
+                    _save(path, state)
+                    return 2
                 if current_binding != state["binding"]:
                     state.update(state="REFUSED_INPUT_DRIFT", endedAt=_now(),
                                  driftFields=[key for key in current_binding
@@ -237,7 +292,7 @@ def worker(root: Path, job_id: str):
                 state.update(state="RUNNING", startedAt=_now())
                 _save(path, state)
                 break
-        time.sleep(0.25)
+        time.sleep(1)
     request = state["request"]
     environment = dict(os.environ, **request["environment"])
     _adopt_descendants()
@@ -249,7 +304,7 @@ def worker(root: Path, job_id: str):
             with _transaction(root):
                 state["child"] = _process_identity(child.pid)
                 _save(path, state)
-            native_exit = child.wait()
+            native_exit = _wait_main_child(child)
     except OSError as exc:
         # No native exit is invented when creation or logging failed.
         with _transaction(root):
@@ -287,16 +342,18 @@ def report(root: Path):
             if row["state"] == "FINISHED" and row["nativeExit"] != 0:
                 program["failedNativeExits"] += 1
         return {"schemaVersion": 1, "jobs": rows, "counts": dict(counts),
+                "pendingWrites": [p.name for p in sorted(root.glob("*.pending"))],
                 "programs": {k: dict(v) for k, v in programs.items()},
                 "authorizationEffect": False, "qualificationEffect": False}
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("init", "submit", "report", "worker"))
+    parser.add_argument("command", choices=("init", "submit", "report", "worker", "reconcile-after-reboot"))
     parser.add_argument("--root", required=True, type=Path)
     parser.add_argument("--spec", type=Path)
     parser.add_argument("--job-id")
+    parser.add_argument("--reason")
     args = parser.parse_args(argv)
     try:
         if args.command == "init":
@@ -306,6 +363,8 @@ def main(argv=None):
             result = submit(args.root, _load(args.spec))
         elif args.command == "worker":
             return worker(args.root, args.job_id or "")
+        elif args.command == "reconcile-after-reboot":
+            result = reconcile_after_reboot(args.root, args.job_id or "", args.reason or "")
         else:
             result = report(args.root)
     except (ValueError, OSError, TypeError) as exc:

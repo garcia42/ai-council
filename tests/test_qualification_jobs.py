@@ -7,6 +7,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 from council_tools import qualification_jobs as jobs
 
@@ -100,6 +101,71 @@ class QualificationJobTests(unittest.TestCase):
         with self.assertRaisesRegex(jobs.JobRefused, "exceeds"):
             jobs.submit(self.root, self.request(resources={"cpu": 3}))
         self.assertEqual(jobs.report(self.root)["counts"], {})
+
+    def test_adopted_zombie_is_reaped_before_main_child_exits(self):
+        orphan = self.root / "orphan.py"
+        orphan.write_text(
+            "import os,time,pathlib\n"
+            "if os.fork() == 0:\n"
+            " pathlib.Path('orphan.pid').write_text(str(os.getpid()))\n"
+            " time.sleep(.15)\n"
+            " os._exit(0)\n")
+        self.script.write_text(
+            "import os,pathlib,subprocess,sys,time\n"
+            "subprocess.run([sys.executable,'orphan.py'],check=True)\n"
+            "deadline=time.monotonic()+3\n"
+            "while not pathlib.Path('orphan.pid').exists() and time.monotonic()<deadline: time.sleep(.02)\n"
+            "pid=int(pathlib.Path('orphan.pid').read_text())\n"
+            "while time.monotonic()<deadline:\n"
+            " try: os.kill(pid,0)\n"
+            " except ProcessLookupError: sys.exit(7)\n"
+            " time.sleep(.02)\n"
+            "sys.exit(8)\n")
+        request = self.request()
+        request["inputs"].append(str(orphan))
+        row = self.wait_state(jobs.submit(self.root, request)["jobId"], "FINISHED")
+        self.assertEqual(row["nativeExit"], 7)
+        self.assertEqual(row["remainingChildren"], [])
+
+    def test_deleted_queued_input_is_explicitly_refused(self):
+        first = jobs.submit(self.root, self.request(.6, resources={"fixture": 1}))
+        self.wait_state(first["jobId"], "RUNNING")
+        second = jobs.submit(self.root, self.request(resources={"fixture": 1}))
+        self.script.unlink()
+        row = self.wait_state(second["jobId"], "REFUSED_INPUT_DRIFT")
+        self.assertIsNone(row["nativeExit"])
+        self.assertIsNone(row["child"])
+
+    def test_only_same_host_reboot_reconciles_without_rewriting_exit_or_evidence(self):
+        job_id = "job-" + "a" * 32
+        host = jobs._host_identity()
+        identity = dict(pid=999999, startTicks="1", bootId=host["bootId"])
+        row = dict(jobId=job_id, state="UNKNOWN_DESCENDANTS", binding={"host": host},
+                   supervisor=identity, child=identity, remainingChildren=[identity],
+                   nativeExit=7, outputSha256="retained-evidence",
+                   request={"programId": "test", "resources": {"fixture": 1}})
+        path = self.root / (job_id + ".json")
+        jobs._save(path, row, new=True)
+        for observed in (host, dict(machineSha256="other", bootId="new-boot")):
+            with mock.patch.object(jobs, "_host_identity", return_value=observed), self.assertRaises(jobs.JobRefused):
+                jobs.reconcile_after_reboot(self.root, job_id, "examined retained evidence")
+            self.assertEqual(jobs._load(path), row)
+        with mock.patch.object(jobs, "_host_identity", return_value=dict(host, bootId="new-boot")):
+            reconciled = jobs.reconcile_after_reboot(self.root, job_id, "examined retained evidence")
+            with self.assertRaises(jobs.JobRefused):
+                jobs.reconcile_after_reboot(self.root, job_id, "repeat")
+        self.assertEqual(reconciled["nativeExit"], 7)
+        self.assertEqual(reconciled["outputSha256"], "retained-evidence")
+        self.assertEqual(reconciled["remainingChildren"], [identity])
+        self.assertEqual(reconciled["reconciliation"]["previousState"], "UNKNOWN_DESCENDANTS")
+        self.assertFalse(reconciled["reconciliation"]["qualificationEffect"])
+        self.assertTrue(jobs._available(row, [reconciled], {"fixture": 1}))
+
+    def test_pending_write_is_reported_and_preserved(self):
+        pending = self.root / "job-interrupted.json.pending"
+        pending.write_text("uncommitted evidence")
+        self.assertEqual(jobs.report(self.root)["pendingWrites"], [pending.name])
+        self.assertEqual(pending.read_text(), "uncommitted evidence")
 
     def test_successful_parent_cannot_free_capacity_with_a_detached_child_alive(self):
         self.script.write_text(

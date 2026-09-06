@@ -150,3 +150,8 @@
    ```
    Surface any non-zero result in the council report. Exit 1 is an invalid ledger; exit 2
    is `BLOCKED_DEGRADED` and blocks a decision-shaped gate until a required seat completes.
+
+For runtime replacement, seal this council's completion under the existing pin before
+installing anything. Verify a passing rehearsal of the exact reviewed runtime candidate,
+install those identical bytes, then run the newly pinned report and blind tally. Preserve
+other in-flight councils' pins until their completions are sealed.
