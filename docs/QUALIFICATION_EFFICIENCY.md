@@ -71,3 +71,19 @@ automatic stale-lock expiry or retry. Reconcile the exact process tree and retai
 before any manual intervention; do not create another manager to evade the unresolved claim.
 The report exposes incomplete work without changing run-guard limits, resetting counters,
 renewing a session, replaying a command or granting a new activation authority.
+
+## Status reconciliation
+
+`python3 -m council_tools.status_view --spec view.json --evidence-root /evidence`
+derives status axes from a retained existing contract; it creates no competing activation
+contract. The version-1 spec has `schemaVersion`, a `contract` artifact reference and
+`observations`. Each observation names `contractPointer`, `artifact`, `evidencePointer`,
+`disposition` and `reason`. Both artifacts use `{path, bytes, sha256}`. Dispositions are
+operator statements: `RECONCILE`, `EVIDENCE_NEWER`, or `NOT_COMPARABLE`.
+
+The report retains declared and observed text separately. Differing scopes or a newer
+runtime receipt may explain a difference; it is not automatically a contradiction. Missing
+observations remain UNOBSERVED. A hash-valid file can still be stale, and the tool makes
+no freshness, installation, approval or runtime-readiness inference. Review unresolved
+differences before repeating qualification based on an outdated prose status. Infrastructure
+work uses the separate prospective template in `INFRASTRUCTURE_FIXTURE_AUTHORIZATION.md`.
