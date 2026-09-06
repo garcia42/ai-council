@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 from collections import Counter
 from contextlib import contextmanager
+import ctypes
 from datetime import datetime, timezone
 import fcntl
 import hashlib
@@ -179,9 +180,40 @@ def _available(state, states, capacities):
     used = Counter()
     for row in states:
         # No heartbeat timeout: an unknown orphan holds its admission until reconciled.
-        if row["state"] in ("RUNNING", "UNKNOWN_EXECUTION"):
+        if row["state"] in ("RUNNING", "UNKNOWN_EXECUTION", "UNKNOWN_DESCENDANTS"):
             used.update(row["request"]["resources"])
     return all(used[k] + v <= capacities[k] for k, v in state["request"]["resources"].items())
+
+
+def _adopt_descendants():
+    # Linux PR_SET_CHILD_SUBREAPER: orphaned grandchildren remain children of
+    # this supervisor even when they create a new session/process group.
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(36, 1, 0, 0, 0) != 0:
+        raise JobRefused("cannot establish descendant custody")
+
+
+def _remaining_children():
+    while True:
+        try:
+            pid, _ = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            return []
+        if pid == 0:
+            break
+    children = []
+    for path in Path("/proc").iterdir():
+        if not path.name.isdigit():
+            continue
+        try:
+            fields = (path / "stat").read_text().rsplit(")", 1)[1].split()
+            if int(fields[1]) == os.getpid():
+                identity = _process_identity(int(path.name))
+                if identity is not None:
+                    children.append(identity)
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+    return children
 
 
 def worker(root: Path, job_id: str):
@@ -208,11 +240,12 @@ def worker(root: Path, job_id: str):
         time.sleep(0.25)
     request = state["request"]
     environment = dict(os.environ, **request["environment"])
+    _adopt_descendants()
     try:
         with (root / (job_id + ".output.log")).open("xb") as log:
             child = subprocess.Popen(request["argv"], cwd=request["cwd"], env=environment,
                                      stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
-                                     close_fds=True)
+                                     close_fds=True, start_new_session=True)
             with _transaction(root):
                 state["child"] = _process_identity(child.pid)
                 _save(path, state)
@@ -223,11 +256,17 @@ def worker(root: Path, job_id: str):
             state.update(state="UNKNOWN_EXECUTION", error=str(exc), observedAt=_now())
             _save(path, state)
         return 2
+    deadline = time.monotonic() + 1
+    descendants = _remaining_children()
+    while descendants and time.monotonic() < deadline:
+        time.sleep(0.05)
+        descendants = _remaining_children()
     with _transaction(root):
-        state.update(state="FINISHED", nativeExit=native_exit, endedAt=_now(),
+        state.update(state="UNKNOWN_DESCENDANTS" if descendants else "FINISHED",
+                     remainingChildren=descendants, nativeExit=native_exit, endedAt=_now(),
                      outputSha256=_digest(root / (job_id + ".output.log")))
         _save(path, state)
-    return 0
+    return 2 if descendants else 0
 
 
 def report(root: Path):
