@@ -23,8 +23,7 @@ class QualificationJobTests(unittest.TestCase):
 
     def stop_remaining(self):
         for row in jobs.report(self.root)["jobs"]:
-            for key in ("child", "supervisor"):
-                identity = row[key]
+            for identity in [row["child"], row["supervisor"], *row.get("remainingChildren", [])]:
                 if identity and jobs._process_identity(identity["pid"]) == identity:
                     try:
                         os.kill(identity["pid"], signal.SIGTERM)
@@ -101,3 +100,16 @@ class QualificationJobTests(unittest.TestCase):
         with self.assertRaisesRegex(jobs.JobRefused, "exceeds"):
             jobs.submit(self.root, self.request(resources={"cpu": 3}))
         self.assertEqual(jobs.report(self.root)["counts"], {})
+
+    def test_successful_parent_cannot_free_capacity_with_a_detached_child_alive(self):
+        self.script.write_text(
+            "import subprocess,sys\n"
+            "subprocess.Popen([sys.executable,'-c','import time;time.sleep(5)'],start_new_session=True)\n")
+        first = jobs.submit(self.root, self.request(resources={"fixture": 1}))
+        row = self.wait_state(first["jobId"], "UNKNOWN_DESCENDANTS")
+        self.assertEqual(row["nativeExit"], 0)
+        self.assertTrue(row["remainingChildren"])
+        second = jobs.submit(self.root, self.request(resources={"fixture": 1}))
+        time.sleep(0.1)
+        other = next(r for r in jobs.report(self.root)["jobs"] if r["jobId"] == second["jobId"])
+        self.assertEqual(other["state"], "QUEUED")

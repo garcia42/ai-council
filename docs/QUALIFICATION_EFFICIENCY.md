@@ -66,7 +66,10 @@ timestamps and log hash, and atomically fsyncs its state. Observer exit does not
 `report` counts each job ID once per program. A completed native zero is process evidence,
 not qualification. The canonical receipt verifier still decides whether tests and proofs
 are complete. A dead/reused PID or reboot produces `UNKNOWN_SUPERVISOR_LOST`, never zero.
-Admitted claims remain held after supervisor loss or ambiguous execution. There is no
+The Linux supervisor adopts orphaned descendants, including children that create another
+session. A parent exit with a surviving descendant records the actual parent exit and
+`UNKNOWN_DESCENDANTS`, retaining the claim. Admitted claims also remain held after
+supervisor loss or ambiguous execution. There is no
 automatic stale-lock expiry or retry. Reconcile the exact process tree and retained evidence
 before any manual intervention; do not create another manager to evade the unresolved claim.
 The report exposes incomplete work without changing run-guard limits, resetting counters,
