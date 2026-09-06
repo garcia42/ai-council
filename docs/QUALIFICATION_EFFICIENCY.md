@@ -90,3 +90,31 @@ observations remain UNOBSERVED. A hash-valid file can still be stale, and the to
 no freshness, installation, approval or runtime-readiness inference. Review unresolved
 differences before repeating qualification based on an outdated prose status. Infrastructure
 work uses the separate prospective template in `INFRASTRUCTURE_FIXTURE_AUTHORIZATION.md`.
+
+## Bounded recovery and installation
+
+These three additive modules have separate development-only CLI entry points deliberately;
+they neither replace nor extend the pinned ledger writer CLI.
+
+The supervisor reaps adopted zombies while the main child runs. Queued workers poll once
+per second; admission is capacity-based, not FIFO, and later small jobs can run first.
+Pending atomic-write files are surfaced in the report and preserved, never silently deleted.
+
+For local jobs recorded with host identity, the only supported claim release is:
+`python3 -m council_tools.qualification_jobs reconcile-after-reboot --root /jobs
+--job-id job-EXACT --reason "retained evidence examined after host reboot"`.
+The tool requires the same machine identity and a different kernel boot ID, with every
+recorded process bound to the old boot. It records the operator, reason, prior state and
+new boot without changing the native exit or evidence. It does not retry a command or
+turn unknown execution into qualification. Same-boot process inspection cannot prove a
+descendant never escaped; it therefore cannot release the claim. Older records without
+host binding remain unreconcilable. A copied/cloned machine identity is outside this
+single-host local-file trust model. Resources representing remote effects are unsupported.
+Do not reboot a shared host to unblock development without separate operational authority.
+This efficiency rollout performs no reboot or claim release.
+
+For a Council runtime update, finish and seal every affected in-flight council under its
+existing pin first. Then verify the exact reviewed runtime candidate's own copied-runtime
+rehearsal, install those identical bytes, and run the pinned forecast report and blind tally.
+Do not install the mainline checkout if its unrelated changes exceed the reviewed runtime
+range. Installation never activates prospective capture or T&R forecasting.
