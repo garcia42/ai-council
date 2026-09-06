@@ -35,6 +35,14 @@
 
 2. **Classify the change.** This decides whether the blind seat is seated:
 
+   For an operational change, include one bounded path in the review packet: producer,
+   handoff, consumer, failure, recovery, actual CLI and execution identities. Link prior
+   unresolved findings and source-bound operator closure evidence where available
+   (`docs/QUALIFICATION_EFFICIENCY.md`). Ask seats to check adjacent paths exposed by
+   the repair. Operator family links and closure dispositions never replace original
+   findings, current verdicts, or independent qualification. Review the named candidate;
+   do not attribute a defect introduced by a later repair to an earlier review.
+
    | Shape | Three lenses | Blind seat |
    |---|---|---|
    | Bug fix, mechanical refactor, test-only | yes | **no** — it cannot see the code; a diff is the lazy brief its skill warns about |
