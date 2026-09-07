@@ -711,7 +711,7 @@ def command_capture_activate(args: argparse.Namespace) -> int:
 
 
 def command_capture_renew_evidence(args: argparse.Namespace) -> int:
-    _require_write_authority(args.log, args.coordination_lock)
+    _require_ledger_write_authority(args.log, args.coordination_lock)
     spec = _load_spec(args.spec, "capture evidence renewal spec")
     expected_commit = getattr(args, "_runtime_source_commit", None)
     expected_sha = getattr(args, "_runtime_source_sha256", None)

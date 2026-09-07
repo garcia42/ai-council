@@ -1,4 +1,5 @@
 import copy
+import argparse
 import io
 import json
 import os
@@ -20,10 +21,11 @@ from council_tools.capture_runtime import (
     CaptureRuntimeError, append_capture_evidence_renewal,
     append_evidence_bound_capture_activation, capture_report,
 )
-from council_tools.capture_schema import CaptureSchemaError, validate_v2_ledger
+from council_tools.capture_schema import CaptureSchemaError, make_capture_evidence_renewal, validate_v2_ledger
+from council_tools.evidence_renewal import evaluate_renewal_chain
 from council_tools.evidence_backup import SnapshotIntegrityError, create_evidence_snapshot, restore_evidence_snapshot
 from council_tools.finding_audit import rehearse_audit_protocol
-from council_tools.forecasts import audit
+from council_tools.forecasts import LedgerError, audit, derived_ledger_lock_path
 from tests.test_activation_evidence import EvidenceFixture, COMMIT, SOURCE_SHA, _json
 
 
@@ -108,6 +110,11 @@ class EvidenceRenewalTest(unittest.TestCase):
         row, evidence = self.append(spec, data)
         self.assertTrue(evidence["activationVerdict"]["ready"])
         self.assertTrue(evidence["currentHealth"]["healthy"])
+        self.assertEqual(evidence["policySha256"], self.original["policyRef"]["sha256"])
+        self.assertEqual(evidence["currentEvidence"]["policySha256"], json.loads(data)["policyRef"]["sha256"])
+        self.assertEqual(evidence["currentEvidence"]["manifestSha256"], spec["approvalManifest"]["sha256"])
+        self.assertEqual(evidence["currentEvidence"]["renewalId"], row["renewalId"])
+        self.assertEqual(evidence["currentEvidence"]["currentHealth"], evidence["currentHealth"])
         self.assertTrue(self.log.read_bytes().startswith(self.original_ledger))
         after = self.report("2026-08-24T12:01:00Z")
         self.assertTrue(after["activationReadiness"]["currentlyHealthy"])
@@ -205,7 +212,87 @@ class EvidenceRenewalTest(unittest.TestCase):
             artifact_store=ArtifactStore(self.root/'restore/artifact-root'), as_of="2026-08-24T12:01:00Z")
         self.assertTrue(restored['activationReadiness']['currentlyHealthy'])
 
-    def test_snapshot_waits_for_whole_renewal_transaction(self):
+    def test_malformed_policy_types_refuse_without_traceback_or_partial_report(self):
+        for malformed in [None, [], 42, {'issuedAt': None}, {'issuedAt': 123},
+                          {'expiresAt': []}, {'expiresAt': {}}]:
+            with self.subTest(malformed=malformed):
+                spec, data = self.renewal()
+                manifest = json.loads(data)
+                policy = json.loads(self.store.read_verified(manifest['policyRef']))
+                policy = {**policy, **malformed} if isinstance(malformed, dict) else malformed
+                manifest['policyRef'] = self.store.capture(_json(policy))
+                data = _json(manifest)
+                spec['approvalManifest'] = self.store.capture(data)
+                with self.assertRaises(CaptureRuntimeError):
+                    self.append(spec, data)
+                self.assertEqual(self.log.read_bytes(), self.original_ledger)
+                row = make_capture_evidence_renewal(spec, prior_rows=[self.activation],
+                    clock=lambda: '2026-08-24T12:00:00Z')
+                self.log.write_bytes(self.original_ledger + _json(row) + b'\n')
+                self.assertFalse(self.report('2026-08-24T12:01:00Z')['activationReadiness']['currentlyHealthy'])
+                self.log.write_bytes(self.original_ledger)
+
+    def test_broken_accepted_history_requires_exact_restore_before_next_renewal(self):
+        spec, data = self.renewal()
+        row, _ = self.append(spec, data)
+        second, second_data = self.renewal(2)
+        accepted = self.log.read_bytes()
+        (self.store.root / spec['approvalManifest']['path']).unlink()
+        with self.assertRaisesRegex(CaptureRuntimeError, 'renewal-artifact-unavailable'):
+            self.append(second, second_data, '2026-08-25T12:00:00Z')
+        self.assertEqual(accepted, self.log.read_bytes())
+        evidence = evaluate_renewal_chain(self.activation, [row], reader=self.store,
+                                         as_of='2026-08-24T12:01:00Z')
+        self.assertEqual(evidence['failedRenewalId'], row['renewalId'])
+        self.assertIsNone(evidence['effectiveRenewalId'])
+        self.store.capture(data)
+        self.append(second, second_data, '2026-08-25T12:00:00Z')
+
+    def test_historical_as_of_explicitly_refuses_future_renewal_boundary(self):
+        spec, data = self.renewal()
+        self.append(spec, data)
+        with self.assertRaisesRegex(CaptureSchemaError, 'ledger row 2:'):
+            self.report('2026-08-23T12:01:00Z')
+
+    def test_stale_at_issuance_preserves_underlying_control_blocker(self):
+        spec, data = self.renewal()
+        with self.assertRaisesRegex(CaptureRuntimeError, 'durability-expired'):
+            self.append(spec, data, '2026-08-26T12:00:00Z')
+        self.assertEqual(self.log.read_bytes(), self.original_ledger)
+
+    def test_competing_writers_from_same_head_allow_exactly_one_append(self):
+        spec, data = self.renewal()
+        barrier = threading.Barrier(2)
+        def attempt():
+            barrier.wait(timeout=5)
+            try:
+                self.append(spec, data)
+                return 'appended'
+            except CaptureSchemaError as exc:
+                self.assertIn('predecessor manifest mismatch', str(exc))
+                return 'refused'
+        with ThreadPoolExecutor(2) as pool:
+            futures = [pool.submit(attempt) for _ in range(2)]
+            self.assertCountEqual([f.result(timeout=10) for f in futures], ['appended', 'refused'])
+        self.assertEqual(len(self.log.read_text().splitlines()), 2)
+        self.assertTrue(self.log.read_bytes().startswith(self.original_ledger))
+
+    def test_cli_authorizes_derived_lock_before_loading_spec(self):
+        live = self.root / 'simulated-live'
+        live.mkdir()
+        target = live / 'ledger-lock'
+        target.write_bytes(b'untouched')
+        derived_ledger_lock_path(self.log).unlink()
+        derived_ledger_lock_path(self.log).symlink_to(target)
+        args = argparse.Namespace(log=self.log, coordination_lock=self.lock)
+        with mock.patch.object(cli, 'LIVE_WRITE_ROOTS', (live,)), \
+                mock.patch.object(cli.socket, 'gethostname', return_value='unauthorized-host'):
+            with self.assertRaisesRegex(LedgerError, 'authorized only'):
+                cli.command_capture_renew_evidence(args)
+        self.assertEqual(target.read_bytes(), b'untouched')
+        self.assertEqual(self.log.read_bytes(), self.original_ledger)
+
+    def test_racing_snapshot_refuses_changed_source_and_fresh_snapshot_restores(self):
         spec, data = self.renewal()
         entered = threading.Event()
         release = threading.Event()

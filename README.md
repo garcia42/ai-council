@@ -22,6 +22,12 @@ report revalidates the original activation historically and the complete renewal
 current health follows the latest valid renewal. Expired original evidence remains retained.
 Bad new append attempts change no ledger rows. Broken accepted proof reports unhealthy;
 malformed ledger boundaries cause report refusal rather than fallback to older healthy proof.
+This includes an `as_of` earlier than an accepted renewal: the reporter validates the supplied
+ledger, rather than reconstructing a historical prefix. Use a retained snapshot for a historical
+ledger. A missing artifact from any accepted renewal must be restored byte-for-byte from the
+retained backup before another renewal can be accepted; a newer certificate cannot repair the
+missing history. Top-level evidence identities describe the original activation; `currentEvidence`
+binds current health to the effective renewal's manifest, policies, and certificates.
 
 All capture and backup commands must use the same explicit artifact root outside Git and
 the shared evidence lock. A backup racing an atomic ledger replacement may refuse with

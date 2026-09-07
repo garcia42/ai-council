@@ -499,7 +499,7 @@ def _report_rows(
             prior.append(original)
             report_rows.append(row)
             continue
-        if kind == "capture-activation":
+        if kind in ("capture-activation", "capture-evidence-renewal"):
             raise CaptureSchemaError(f"ledger row {line_number}: {error}") from error
         run_id = row.get("runId")
         if not isinstance(run_id, str) or not run_id.strip():
@@ -746,7 +746,9 @@ def append_capture_evidence_renewal(
         append_at = _clock_utc(clock, "capture evidence renewal")
         _preflight_raw_payload(payload)
         row = make_capture_evidence_renewal(payload, prior_rows=prior, clock=lambda: append_at)
-        activation = next(item for item in prior if item.get("kind") == "capture-activation")
+        activation = next((item for item in prior if item.get("kind") == "capture-activation"), None)
+        if activation is None:
+            raise CaptureRuntimeError("renewal requires an existing activation")
         if (activation["runtimeSourceCommit"] != expected_runtime_commit
                 or activation["runtimeSourceSha256"] != expected_source_sha256):
             raise CaptureRuntimeError("renewal source differs from activated runtime")
