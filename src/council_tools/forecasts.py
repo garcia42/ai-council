@@ -1652,12 +1652,27 @@ def audit(
 
     due_outcomes = set()
     old_overdue = set()
+    unresolvable_overdue = set()
     for outcome_id, items in outcome_predictions.items():
         deadline = _parse_date(items[0]["resolutionDate"], "resolutionDate")
         if deadline <= today:
             due_outcomes.add(outcome_id)
             if outcome_id not in resolutions and (today - deadline).days > 14:
-                old_overdue.add(outcome_id)
+                # An outcome with no issued fingerprint cannot be resolved by ANY
+                # argument to `resolve`: command_resolve looks the fingerprint up
+                # and raises before the true/false/void branch is reached, so
+                # `void` fails identically and no flag bypasses it. Counting such
+                # an outcome toward the debt that gates finalization makes that
+                # gate unclearable through the supported path, leaving a rolling
+                # override as the only remedy -- which is indistinguishable from
+                # having no gate. These outcomes are already excluded from Brier
+                # scoring, so counting them here was inconsistent as well.
+                # They are tracked separately rather than dropped, so the
+                # backlog stays visible.
+                if outcome_id in issued_outcomes:
+                    old_overdue.add(outcome_id)
+                else:
+                    unresolvable_overdue.add(outcome_id)
 
     resolved_outcomes = {
         outcome_id
@@ -1794,6 +1809,8 @@ def audit(
         "excludedValidPredictions": len(excluded_valid),
         "allPredictionStates": all_states,
         "legacyIneligiblePredictions": legacy_ineligible,
+        "unresolvableOverdueOutcomes": len(unresolvable_overdue),
+        "unresolvableOverdueOutcomeIds": sorted(unresolvable_overdue),
         "attempts": len(attempts_by_run),
         "orphanAttempts": orphan_attempts,
         "councilRows": council_rows,

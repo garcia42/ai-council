@@ -300,8 +300,19 @@ def _print_human(result: dict) -> None:
         "due={eligibleDueOutcomes} resolved={resolvedOutcomes} void={voidOutcomes} "
         "void_rate={voidRateOfEligibleOutcomes} "
         "unresolved={unresolvedDueOutcomes} old_overdue={oldOverdueOutcomes} "
+        "unresolvable_overdue={unresolvableOverdueOutcomes} "
         "debt={gradingDebtState} score={scoreStatus}".format(**result)
     )
+    if result["unresolvableOverdueOutcomes"]:
+        # These are overdue and ungradeable: `resolve` refuses any outcome with
+        # no issued fingerprint, so they cannot be cleared through the supported
+        # path. They are excluded from the debt gate deliberately; print them so
+        # the backlog stays visible rather than becoming invisible.
+        print(
+            "unresolvable_overdue_ids={}".format(
+                ",".join(result["unresolvableOverdueOutcomeIds"])
+            )
+        )
     for item in result["seatScores"]:
         brier = "n/a" if item["brier"] is None else f"{item['brier']:.4f}"
         print(
