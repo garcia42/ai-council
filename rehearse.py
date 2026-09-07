@@ -167,6 +167,7 @@ def rehearse(source_root: Path, *, today: str) -> dict:
             "tests.test_finding_audit",
             "tests.test_offhost_durability",
             "tests.test_activation_evidence",
+            "tests.test_evidence_renewal",
             "tests.test_capture_integration",
             "tests.test_install",
             "tests.test_legacy_report",

@@ -1,5 +1,42 @@
 # AI Council
 
+### Renewing capture evidence
+
+`capture-renew-evidence` appends fresh proof for the **same activated runtime** without
+replacing its activation, cohort, audit assignments, or scores. It accepts `--spec`,
+`--approval-manifest-file`, `--artifact-root`, `--log`, and `--coordination-lock`.
+Live use requires the installed source-pinned reporter. Explicit non-live rehearsal paths
+can supply `--runtime-source-commit` and `--runtime-source-sha256` instead.
+
+The spec contains exactly `activationId`, `previousManifestSha256`, `approvalManifest`
+(a content-addressed artifact reference), `operator`, and `evidenceRef` (the approval
+reference). Renewal IDs and timestamps are system-owned. Retain the manifest using
+`capture-artifact --control-artifact` under the same evidence lock before requesting renewal.
+The manifest must name the original activation ID; its policy may change only its ID and
+validity dates. The audit protocol, durability policy, source, and control parameters remain
+identical, and validity windows may not grow longer than their original durations.
+
+Generate and verify fresh audit and off-host snapshot/readback/restore evidence before the
+current certificates expire, then append the renewal through the installed command. The
+report revalidates the original activation historically and the complete renewal chain;
+current health follows the latest valid renewal. Expired original evidence remains retained.
+Bad new append attempts change no ledger rows. Broken accepted proof reports unhealthy;
+malformed ledger boundaries cause report refusal rather than fallback to older healthy proof.
+This includes an `as_of` earlier than an accepted renewal: the reporter validates the supplied
+ledger, rather than reconstructing a historical prefix. Use a retained snapshot for a historical
+ledger. A missing artifact from any accepted renewal must be restored byte-for-byte from the
+retained backup before another renewal can be accepted; a newer certificate cannot repair the
+missing history. Top-level evidence identities describe the original activation; `currentEvidence`
+binds current health to the effective renewal's manifest, policies, and certificates.
+
+All capture and backup commands must use the same explicit artifact root outside Git and
+the shared evidence lock. A backup racing an atomic ledger replacement may refuse with
+`source-changed` and publish nothing; start a fresh snapshot attempt after the completed
+renewal. This command does not schedule backups, perform cloud transfers, or authorize a
+source migration. Capture and renewal still require their separately approved evidence.
+Once renewal rows exist, rollback must retain a reader that understands their kind; do not
+install an older reader over the extended ledger.
+
 **An evidence layer for finding out whether a multi-agent review council is actually useful.**
 
 AI Council records what each reviewer saw, what it returned, how the operator dispositioned its

@@ -23,6 +23,7 @@ V1_SCHEMA_VERSION = 1
 
 V2_KINDS = (
     "capture-activation",
+    "capture-evidence-renewal",
     "capture-initiation",
     "council-attempt-v2",
     "council-seats-finished",
@@ -62,7 +63,7 @@ _FORECAST_REQUEST_BEGIN = "-----BEGIN COUNCIL FORECAST REQUEST V1-----"
 _FORECAST_REQUEST_END = "-----END COUNCIL FORECAST REQUEST V1-----"
 _FINDING_ID = re.compile(r"^finding-[0-9a-f]{32}$")
 _FINDING_GROUP_ID = re.compile(r"^finding-group-[0-9a-f]{32}$")
-_ID_PREFIXES = {"activation", "initiation", "run", "outcome", "prediction", "invalidation"}
+_ID_PREFIXES = {"activation", "initiation", "run", "outcome", "prediction", "invalidation", "renewal"}
 # Keep this module standalone-loadable for the copied-runtime rehearsal.  These
 # patterns intentionally mirror ``artifacts.secret_detectors``; schema tests
 # enforce parity over every detector family and caller-supplied tokens.
@@ -1228,6 +1229,10 @@ def _validate_predictions(
 
 
 _RECORD_KEYS = {
+    "capture-evidence-renewal": {
+        "schemaVersion", "kind", "renewalId", "activationId", "renewedAt",
+        "previousManifestSha256", "approvalManifest", "operator", "evidenceRef",
+    },
     "capture-activation": {
         "schemaVersion",
         "kind",
@@ -1374,6 +1379,32 @@ def _validate_activation(row: Mapping[str, Any], prior_rows: list[Mapping[str, A
         _audit_protocol_digest(row["auditProtocol"])
     if _rows_of_kind(prior_rows, "capture-activation"):
         raise CaptureSchemaError("capture ledger already has an activation")
+
+
+def _validate_evidence_renewal(row: Mapping[str, Any], prior_rows: list[Mapping[str, Any]]) -> None:
+    _ensure_record_header(row, "capture-evidence-renewal")
+    renewal_id = _require_id(row["renewalId"], "renewal", "renewalId")
+    activation_id = _require_id(row["activationId"], "activation", "activationId")
+    activation = _one_by(prior_rows, "capture-activation", "activationId", activation_id)
+    if activation is None or "approvalManifest" not in activation:
+        raise CaptureSchemaError("renewal requires an evidence-bound activation")
+    renewals = _rows_of_kind(prior_rows, "capture-evidence-renewal")
+    if any(item["renewalId"] == renewal_id for item in renewals):
+        raise CaptureSchemaError("duplicate renewalId")
+    predecessor = renewals[-1] if renewals else activation
+    previous = _require_digest(row["previousManifestSha256"], "previousManifestSha256")
+    if previous != predecessor["approvalManifest"]["sha256"]:
+        raise CaptureSchemaError("renewal predecessor manifest mismatch")
+    _validate_artifact_ref(row["approvalManifest"], "approvalManifest")
+    if any(row["approvalManifest"]["sha256"] == item["approvalManifest"]["sha256"]
+           for item in [activation, *renewals]):
+        raise CaptureSchemaError("renewal reuses an existing manifest")
+    renewed = _parse_timestamp(row["renewedAt"], "renewedAt")
+    previous_time = predecessor.get("renewedAt", activation["activatedAt"])
+    if renewed <= _parse_timestamp(previous_time, "previous evidence time"):
+        raise CaptureSchemaError("renewal must follow predecessor evidence time")
+    _require_text(row["operator"], "operator")
+    _require_text(row["evidenceRef"], "evidenceRef")
 
 
 def _validate_initiation(row: Mapping[str, Any], prior_rows: list[Mapping[str, Any]]) -> None:
@@ -1740,6 +1771,7 @@ _VALIDATORS: dict[
     str, Callable[[Mapping[str, Any], list[Mapping[str, Any]]], None]
 ] = {
     "capture-activation": _validate_activation,
+    "capture-evidence-renewal": _validate_evidence_renewal,
     "capture-initiation": _validate_initiation,
     "council-attempt-v2": _validate_attempt,
     "council-seats-finished": _validate_seats_finished,
@@ -1752,6 +1784,7 @@ _VALIDATORS: dict[
 def _boundary_time(row: Mapping[str, Any]) -> datetime | None:
     field_by_kind = {
         "capture-activation": "activatedAt",
+        "capture-evidence-renewal": "renewedAt",
         "capture-initiation": "handlingStartedAt",
         "council-attempt-v2": "seatsLaunchedAt",
         "council-seats-finished": "seatsFinishedAt",
@@ -1854,6 +1887,26 @@ def make_capture_activation(
         "activatedAt": _clock_timestamp(clock, "activatedAt"),
         **deepcopy(dict(payload)),
     }
+    validate_v2_record(row, prior_rows)
+    return row
+
+
+def make_capture_evidence_renewal(
+    payload: Mapping[str, Any],
+    *,
+    prior_rows: Iterable[Mapping[str, Any]],
+    clock: Clock,
+    id_factory: IdFactory = new_v2_id,
+) -> dict[str, Any]:
+    payload = _require_payload_keys(
+        payload,
+        required={"activationId", "previousManifestSha256", "approvalManifest", "operator", "evidenceRef"},
+        optional=None,
+        kind="capture-evidence-renewal",
+    )
+    row = {"schemaVersion": SCHEMA_VERSION, "kind": "capture-evidence-renewal",
+           "renewalId": id_factory("renewal"), "renewedAt": _clock_timestamp(clock, "renewedAt"),
+           **deepcopy(dict(payload))}
     validate_v2_record(row, prior_rows)
     return row
 
