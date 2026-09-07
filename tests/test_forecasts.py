@@ -1,5 +1,6 @@
 import fcntl
 import hashlib
+import io
 import json
 import tempfile
 import threading
@@ -1520,6 +1521,81 @@ class ForecastLedgerTest(unittest.TestCase):
             resolved_by="Inspect the new council attempt record",
         )
         append_ledger_row(self.log, new_attempt)
+
+    def _overdue_without_issuance(self, index):
+        """Write a legacy-format council row: predictions, but no issuance.
+
+        Legacy rows carry no schemaVersion/runId, so audit() reads them through
+        `_legacy_prediction` and derives the outcomeId from the claim text rather
+        than reading a stored one. They never pair with an attempt, so they get
+        no entry in `issued_outcomes` and no fingerprint -- which is exactly what
+        `resolve` refuses. Written raw because the current writer is fail-closed
+        and will not create this shape; the live ledger carries 11 of them from
+        before that validation existed.
+        """
+        row = {
+            "kind": "council",
+            "ts": "2026-08-20T12:00:00Z",
+            "question": f"Legacy council question {index}",
+            "predictions": [
+                {
+                    "seat": seat,
+                    "claim": f"Unresolvable outcome {index} occurs",
+                    "resolutionDate": "2026-09-01",
+                    "resolvedBy": f"Inspect unresolvable outcome {index}",
+                    "probability": 50,
+                }
+                for seat in ("code", "theory", "ops")
+            ],
+        }
+        with io.open(self.log, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(row, sort_keys=True) + "\n")
+
+    def _gradeable_overdue(self, index):
+        a = attempt(
+            claim=f"Gradeable outcome {index} occurs",
+            resolved_by=f"Inspect gradeable outcome {index}",
+            resolution_date="2026-09-01",
+        )
+        append_ledger_row(self.log, a)
+        append_ledger_row(self.log, completion(a))
+        return a["sharedOutcome"]["outcomeId"]
+
+    def test_overdue_outcomes_without_issuance_do_not_block_finalization(self):
+        # `resolve` refuses any outcome with no issued fingerprint before the
+        # true/false/void branch is reached, so counting these toward the debt
+        # gate would make it unclearable through the supported path and leave a
+        # rolling override as the only remedy.
+        for index in range(3):
+            self._overdue_without_issuance(index)
+        result = audit(self.log, self.events, today=date(2026, 10, 1))
+        self.assertEqual(result["oldOverdueOutcomes"], 0)
+        self.assertNotEqual(result["gradingDebtState"], "BLOCK_FINALIZATION")
+
+    def test_unresolvable_overdue_outcomes_stay_visible(self):
+        for index in range(3):
+            self._overdue_without_issuance(index)
+        result = audit(self.log, self.events, today=date(2026, 10, 1))
+        self.assertEqual(result["unresolvableOverdueOutcomes"], 3)
+        reported = result["unresolvableOverdueOutcomeIds"]
+        self.assertEqual(len(reported), 3)
+        for outcome_id in reported:
+            # Visible in the ledger, and genuinely unresolvable: no fingerprint
+            # is exactly the condition command_resolve refuses on.
+            self.assertIn(outcome_id, result["knownOutcomeIds"])
+            self.assertNotIn(outcome_id, result["outcomeFingerprints"])
+
+    def test_issued_overdue_outcomes_still_block_alongside_unresolvable_ones(self):
+        # The gate must keep firing on outcomes that CAN be graded, so the fix
+        # cannot be a blanket relaxation.
+        for index in range(3):
+            self._overdue_without_issuance(index)
+        gradeable = {self._gradeable_overdue(index) for index in range(3)}
+        result = audit(self.log, self.events, today=date(2026, 10, 1))
+        self.assertEqual(result["oldOverdueOutcomes"], 3)
+        self.assertEqual(result["unresolvableOverdueOutcomes"], 3)
+        self.assertEqual(result["gradingDebtState"], "BLOCK_FINALIZATION")
+        self.assertTrue(gradeable <= set(result["outcomeFingerprints"]))
 
     def test_logged_override_preserves_but_overrides_debt_block(self):
         for index in range(3):
