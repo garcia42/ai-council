@@ -1,0 +1,12 @@
+[Unit]
+Description=AI Council bounded evidence renewal and verified off-host restore
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/trader/ai-council-sessions/usefulness-activation-20260907
+Environment=PYTHONDONTWRITEBYTECODE=1
+UMask=0077
+ExecStart=/usr/bin/python3 -B /home/trader/ai-council-sessions/usefulness-activation-20260907/operations/capture_evidence_cycle.py renew --config /var/lib/ai-council-evidence/live-capture-20260907/config.json --config-sha256 c62138f762af8fb3f88284ecc943a4be36ce23ad7703623880d74e06245d7409
+TimeoutStartSec=31min
+KillMode=control-group
+NoNewPrivileges=true
