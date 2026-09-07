@@ -724,6 +724,7 @@ def _with_attempt_allowlist(criterion_text: str) -> str:
     required_kinds = (
         "council-attempt",
         "capture-activation",
+        "capture-evidence-renewal",
         "capture-initiation",
         "council-attempt-v2",
         "council-seats-finished",

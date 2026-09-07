@@ -217,6 +217,7 @@ class InstallerTest(unittest.TestCase):
         for kind in (
             "council-attempt",
             "capture-activation",
+            "capture-evidence-renewal",
             "capture-initiation",
             "council-attempt-v2",
             "council-seats-finished",

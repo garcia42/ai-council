@@ -25,6 +25,7 @@ from .activation_evidence import evaluate_activation_evidence
 from .capture_runtime import (
     append_capture_activation,
     append_evidence_bound_capture_activation,
+    append_capture_evidence_renewal,
     append_capture_initiation,
     append_capture_invalidation,
     append_capture_resolution,
@@ -709,6 +710,36 @@ def command_capture_activate(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_capture_renew_evidence(args: argparse.Namespace) -> int:
+    _require_write_authority(args.log, args.coordination_lock)
+    spec = _load_spec(args.spec, "capture evidence renewal spec")
+    expected_commit = getattr(args, "_runtime_source_commit", None)
+    expected_sha = getattr(args, "_runtime_source_sha256", None)
+    if _is_live_write_path(args.log):
+        installed_root = getattr(args, "_runtime_source_root", None)
+        if not expected_commit or not expected_sha or not installed_root:
+            raise LedgerError("live evidence renewal requires the installed source-pinned wrapper")
+        root = Path(installed_root)
+        if (not root.is_absolute()
+                or (root / "src/council_tools/cli.py").resolve() != Path(__file__).resolve()):
+            raise LedgerError("live evidence renewal runtime source root does not match loaded code")
+    else:
+        expected_commit = args.runtime_source_commit or expected_commit
+        expected_sha = args.runtime_source_sha256 or expected_sha
+    if not expected_commit or not expected_sha:
+        raise LedgerError("evidence renewal requires runtime source bindings")
+    escrows_before = _transaction_escrow_paths(args.log)
+    row, evidence = append_capture_evidence_renewal(
+        args.log, spec, manifest_data=Path(args.approval_manifest_file).read_bytes(),
+        artifact_store=ArtifactStore(args.artifact_root),
+        expected_runtime_commit=expected_commit, expected_source_sha256=expected_sha,
+        coordination_lock=args.coordination_lock)
+    print(json.dumps({"renewalId": row["renewalId"], "activationId": row["activationId"],
+                      "activationEvidence": evidence,
+                      "transactionEscrows": _new_transaction_escrows(escrows_before, args.log)}, sort_keys=True))
+    return 0
+
+
 def command_activation_readiness(args: argparse.Namespace) -> int:
     expected_commit = (
         args.runtime_source_commit
@@ -1299,6 +1330,16 @@ def build_parser() -> argparse.ArgumentParser:
     activate.add_argument("--artifact-root")
     coordinated(activate, anchor_field="log", context_fields=("log",))
     activate.set_defaults(func=command_capture_activate)
+
+    renew = sub.add_parser("capture-renew-evidence")
+    renew.add_argument("--log", default=DEFAULT_LOG)
+    renew.add_argument("--spec", required=True)
+    renew.add_argument("--approval-manifest-file", required=True)
+    renew.add_argument("--artifact-root", required=True)
+    renew.add_argument("--runtime-source-commit")
+    renew.add_argument("--runtime-source-sha256")
+    coordinated(renew, anchor_field="log", context_fields=("log",))
+    renew.set_defaults(func=command_capture_renew_evidence)
 
     readiness = sub.add_parser("activation-readiness")
     readiness.add_argument("--manifest-file", required=True)

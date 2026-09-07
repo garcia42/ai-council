@@ -39,6 +39,7 @@ OUTCOME_CLASSES = {"exogenous", "intervention-sensitive"}
 INVALID_V2_RECORD_KIND = "invalid-v2-record"
 RECOGNIZED_RECORD_KINDS = V2_PRIMARY_KINDS | {
     "capture-activation",
+    "capture-evidence-renewal",
     "capture-invalidation",
     "finding-audit-case-v2",
     "council-seats-finished",

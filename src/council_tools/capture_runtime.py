@@ -31,6 +31,7 @@ from .activation_evidence import (
     evaluate_activation_evidence,
     parse_activation_manifest_v2,
 )
+from .evidence_renewal import evaluate_renewal_chain
 from .capture_schema import (
     CaptureSchemaError,
     V2_KINDS,
@@ -40,6 +41,7 @@ from .capture_schema import (
     forecast_request_binding_v2,
     forecast_request_identity_v2,
     make_capture_activation,
+    make_capture_evidence_renewal,
     make_capture_initiation,
     make_capture_invalidation,
     make_council_attempt_v2,
@@ -724,6 +726,38 @@ def append_evidence_bound_capture_activation(
             _append_locked(transaction, row)
         except FindingAuditError as exc:
             raise CaptureRuntimeError("activation audit protocol is invalid") from exc
+    return row, evidence
+
+
+def append_capture_evidence_renewal(
+    path: str | Path,
+    payload: Mapping[str, Any],
+    *,
+    manifest_data: bytes,
+    artifact_store: ArtifactStore,
+    expected_runtime_commit: str,
+    expected_source_sha256: str,
+    clock: Clock = utc_now,
+    coordination_lock: str | Path | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Renew current proof under the activation gateway's transaction boundary."""
+    with evidence_write_lock(coordination_lock), _capture_transaction(Path(path)) as transaction:
+        _raw, prior = _validated_rows(transaction)
+        append_at = _clock_utc(clock, "capture evidence renewal")
+        _preflight_raw_payload(payload)
+        row = make_capture_evidence_renewal(payload, prior_rows=prior, clock=lambda: append_at)
+        activation = next(item for item in prior if item.get("kind") == "capture-activation")
+        if (activation["runtimeSourceCommit"] != expected_runtime_commit
+                or activation["runtimeSourceSha256"] != expected_source_sha256):
+            raise CaptureRuntimeError("renewal source differs from activated runtime")
+        if artifact_store.read_verified(row["approvalManifest"]) != manifest_data:
+            raise CaptureRuntimeError("renewal manifest file differs from retained artifact")
+        renewals = [item for item in prior if item.get("kind") == "capture-evidence-renewal"]
+        evidence = evaluate_renewal_chain(
+            activation, [*renewals, row], reader=artifact_store, as_of=append_at)
+        if evidence["appendReady"] is not True:
+            raise CaptureRuntimeError("capture evidence renewal blocked: " + ",".join(evidence["blockers"]))
+        _append_locked(transaction, row)
     return row, evidence
 
 
@@ -1756,17 +1790,10 @@ def capture_report(
     ):
         activation = activation_rows[0]
         try:
-            manifest_data = artifact_store.read_verified(
-                activation["approvalManifest"]
-            )
-            activation_evidence = evaluate_activation_evidence(
-                manifest_data,
-                reader=artifact_store,
-                expected_runtime_commit=activation["runtimeSourceCommit"],
-                expected_source_sha256=activation["runtimeSourceSha256"],
-                activation_time=activation["activatedAt"],
-                as_of=as_of,
-            )
+            activation_evidence = evaluate_renewal_chain(
+                activation,
+                [row for row in validation_prior if row.get("kind") == "capture-evidence-renewal"],
+                reader=artifact_store, as_of=as_of)
         except (ArtifactError, KeyError, TypeError, ValueError):
             activation_evidence = {
                 "appendReady": False,
