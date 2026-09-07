@@ -1,0 +1,9 @@
+[Unit]
+Description=Notify operator of Council capture evidence failure
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -B /home/trader/ai-council-sessions/usefulness-activation-20260907/operations/capture_notify.py
+TimeoutStartSec=20
+NoNewPrivileges=true
+UMask=0077

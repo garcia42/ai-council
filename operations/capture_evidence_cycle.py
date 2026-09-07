@@ -232,6 +232,8 @@ def cycle(config, mode):
         '--artifact-root',str(store.root),'--runtime-source-commit',config['runtimeCommit'],
         '--runtime-source-sha256',config['runtimeSha256'])
     save(run/'readiness.json',readiness)
+    if readiness.get('appendReady') is not True:
+        raise CycleError('activation readiness refused; retain evidence')
     if mode=='prepare':
         spec={'cohortName':'council-usefulness-prospective-2026','captureVersion':'capture-v2.0.0',
             'runtimeSourceCommit':config['runtimeCommit'],'runtimeSourceSha256':config['runtimeSha256'],

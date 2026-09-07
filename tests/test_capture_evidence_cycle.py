@@ -64,6 +64,15 @@ class EvidenceCycleTest(unittest.TestCase):
         with self.assertRaisesRegex(ops.CycleError,'reconciliation'):
             ops.check_previous(self.root,self.config)
 
+    def test_unready_prepare_retains_failure_without_prepared_marker(self):
+        with mock.patch('council_tools.gcs_durability.GcsVersionedObjectStore',side_effect=lambda **kwargs:FakeVersionedStore(self.configuration)),mock.patch.object(ops,'wrapper',return_value={'appendReady':False}):
+            with self.assertRaisesRegex(ops.CycleError,'readiness refused'):
+                ops.cycle(self.config,'prepare')
+        first=next((self.root/'cycles').iterdir())
+        self.assertTrue((first/'readiness.json').exists())
+        self.assertFalse((first/'prepared.json').exists())
+        self.assertFalse((first/'complete.json').exists())
+
     def test_expiry_and_cycle_count_refuse_before_work(self):
         with self.assertRaisesRegex(ops.CycleError,'expired'):
             ops.check_previous(self.root,{**self.config,'expiresAt':'2000-01-01T00:00:00Z'})

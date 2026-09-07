@@ -3,21 +3,21 @@
 ## Fixed bindings
 
 - Principal/study owner: the user. Execution/backup operator: `manny-capture-maintenance`, the pinned scheduled process on manny.
-- Installed runtime: `/home/trader/ai-council-sessions/capture-renewal-20260907`, commit `4ca5c08b97e1ef10ed2c3c5d585a6747275c658c`.
+- Installed runtime: `/home/trader/council-tools`, commit `4ca5c08b97e1ef10ed2c3c5d585a6747275c658c`.
 - Writer: `python3 -B /home/trader/.claude/knowledge/council-eval/predictions_report.py`.
 - Ledger: `/home/trader/.claude/knowledge/futures-panel-log.jsonl`.
 - V2 resolutions: `/home/trader/.claude/knowledge/council-eval/capture_resolved.jsonl`.
 - Artifact root: `/var/lib/ai-council-evidence/live-capture-20260907/artifacts`.
 - Coordination lock: `/home/trader/.local/state/council-tools/evidence.lock`.
-- Configuration, actual activation ID/time and approved manifest digest: `config.json` and `ACTIVE.json` in the same evidence root. Never invent an activation ID from this document.
+- Configuration, actual activation ID/time and approved manifest digest: `config-v2.json` and `ACTIVE.json` in the same evidence root. Never invent an activation ID from this document.
 
 The reviewer assignments in `OWNERSHIP.json` are operational assignments, not proof that any finding has been checked. Each sampled case gets two fresh adjudicator sessions that did not produce its original review. Keep the alias map from them. Retain actual model/version/definition identity digests and exact output artifacts; never replace unavailable reviewers with invented grades. Shared base-model errors may remain correlated even across fresh sessions.
 
 ## Before every genuine council
 
-Run the installed V1 report and blind tally as usual. Also run `capture-report --json` with explicit `--log`, `--events`, and `--artifact-root` above. Inspect `activationReadiness.currentlyHealthy`, not just native exit: a valid unhealthy report can exit zero. Refuse decision finalization on invalid or unhealthy evidence; preserve incident containment/rollback exceptions. Inspect `systemctl status council-capture-evidence.service` and its timer on unhealthy evidence.
+Run the installed V1 report and blind tally as usual. Also run `capture-report --json` with explicit `--log`, `--events`, and `--artifact-root` above. Inspect `activationReadiness.currentlyHealthy`, not just native exit: a valid unhealthy report can exit zero. Refuse decision finalization on invalid or unhealthy evidence; preserve incident containment/rollback exceptions. Inspect `systemctl --user status council-capture-evidence.service` and its timer on unhealthy evidence.
 
-For a new invocation, first run `capture-initiate --log <ledger> --activation-id <actual ID> --idempotency-key <unique stable invocation key> --coordination-lock <lock>`. This is before preparing prompts. Persist its returned runId/initiationId. A retry of this command uses the same key; another council attempt gets another key but retains its underlying decisionFamilyId. Record active human handling time honestly; model waiting time is separate. Do not subtract inconvenient preparation or repair effort.
+For a new invocation, first run `capture-initiate --log <ledger> --activation-id <actual ID> --idempotency-key <unique stable invocation key> --coordination-lock <lock>`. This is before preparing prompts. Persist its returned runId/initiationId. A retry of this command uses the same key; another council attempt gets another key but retains its underlying decisionFamilyId (use the required family- prefix, for example family-issue-184). Record active human handling time honestly; model waiting time is separate. Do not subtract inconvenient preparation or repair effort.
 
 ## Preserve original inputs and answers
 
@@ -38,6 +38,10 @@ At each council, inspect whether a selected-family audit case was emitted. Weekl
 
 Grade matured exogenous outcomes using durable evidence and independent review. Use V2's separate sidecar and stable IDs; V1 forecasts stay in V1. Resolve only after the full specified resolution date. A recorded operator action is not evidence that the action helped, and several seats repeating a finding are not several prevented incidents.
 
+## Activation handoff
+
+The activating operator owns this handoff. Create the V2 resolution sidecar only if absent. Append activation through the installed writer with the reviewed manifest. Re-read the live ledger under the evidence lock and match the actual activation ID and manifest digest to the prepared cycle. Only after that verification, exclusively create ACTIVE.json (actual ID/time, manifest, source and prospective study anchor) and the prepare cycle complete.json (state ACTIVATION_CONFIRMED, actual ID, manifest digest and acknowledgment time). Never mark a failed cycle successful. If interrupted after the append, reconcile that existing immutable row; do not append a replacement activation. Verify both records, current capture health and routing, then perform the first renewal using systemctl --user start council-capture-evidence.service. Enable the timer only after that real service invocation succeeds.
+
 ## Evidence renewal and failure recovery
 
 The system timer runs the hash-bound maintenance driver every 12 hours. It generates fresh protocol rehearsal and off-host generation-pinned restore proof, then requests renewal through the installed wrapper. It cannot change original cohort, source or frozen controls. A fresh manifest alone cannot repair missing accepted history.
@@ -48,6 +52,10 @@ The initial schedule expires September 15 UTC and has a 16-cycle ceiling. Review
 
 ## Exact-prompt launcher detail
 
-For the V2 blind seat use the reviewed `operations/capture_blind.py`, not the old `ask_blind.sh` wrapper. Include the independent role text and complete V2 output instructions in the retained prompt itself; the launcher sends those bytes verbatim. Before capturing the prompt, choose a stable absolute local filename and instruct the seat that its only permitted tool action is `sha256sum` on that exact file. It obtains inputArtifactSha256 from that tool result; putting the prompt's own digest inside itself would create a circular binding. The launcher checks the prompt hash before/after, runs a fresh blindness probe in an isolated CODEX_HOME, retains original answers/transcripts, and rejects a wrong digest. Inspect the transcript: any tool access beyond hashing its own prompt invalidates the claimed blind independence. This is a constrained tool policy verified by transcript, not an OS claim that all other reads were impossible.
+For the V2 blind seat use the reviewed `operations/capture_blind.py`, not the old `ask_blind.sh` wrapper. Include the independent role text and complete V2 output instructions in the retained prompt itself; the launcher sends those bytes verbatim. Before capturing the prompt, choose a stable absolute local filename and instruct the seat that its only permitted tool action is `/usr/bin/sha256sum` on that exact file. It obtains inputArtifactSha256 from that tool result; putting the prompt's own digest inside itself would create a circular binding. The launcher checks the prompt hash before/after, runs a fresh blindness probe in an isolated CODEX_HOME, retains original answers/transcripts, and rejects a wrong digest. Inspect the transcript: any tool access beyond hashing its own prompt invalidates the claimed blind independence. The launcher applies a named filesystem permission profile to model commands: minimal system files and the exact prompt are readable; unrelated host files and credentials are inaccessible, host processes are hidden behind private proc, and command networking is disabled. A retained negative-access test must pass before any provider call. The launcher clears inherited environment values, disables web search and ignores user configuration/rules. The authenticated provider client still uses its established login; these restrictions apply to model tools. Transcript inspection remains required and is recorded as pending, not falsely attested.
 
 House seats similarly hash their own retained input file, in addition to their ordinary approved read-only review tools. Their agent/system context is described by the retained agent-definition digest and actual launcher metadata. The original user prompt is the input artifact. Never silently add a late hash-binding instruction or other user message after that artifact has been captured. Use the actual returned answer bytes, not a repaired JSON object, for output capture.
+
+The timer has explicit September 8–14 UTC calendar dates and cannot keep firing after the initial window. OnFailure invokes a single bounded Pushover notification; its journal records acceptance or failure without credentials. /usr/bin/gcloud and an explicit PATH are checked by ExecStartPre before a cycle directory is created. The runtime source /home/trader/council-tools and the operational source /home/trader/ai-council-sessions/usefulness-activation-20260907 are live dependencies: never rebase, edit or remove them while installed.
+
+At the September 14 checkpoint, active human handling-time and causal net-value claims remain NO VERDICT unless separately measured. Store per-run operator effort, false-positive/rework costs and missed-defect evidence in supporting receipts; system wall-clock duration must not substitute for active effort. Review capture exclusions, member growth, remaining cycle allowance and failed notifications. Pending rubric agreement and the lack of a counterfactual comparison remain explicit limits.
