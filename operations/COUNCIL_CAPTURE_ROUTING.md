@@ -1,34 +1,28 @@
-# Council usefulness routing during the prospective restart
+# Council routing after usefulness-capture retirement
 
-Before the fresh activation, finish or preserve issued old reviews using the
-historical V2 workflow. At cutover, disable old maintenance, prove every old
-collection writer quiescent, then hold the shared evidence lock exclusively
-from the final issuance digest through installation and closed-route
-verification.
+V2 usefulness capture was retired by principal decision on 2026-09-10. Both
+activated studies are historical evidence. Preserve their ledgers, sidecars,
+artifacts, controls, activation records, maintenance-cycle receipts and failed
+namespaces read-only. Do not resume either maintenance service, issue a new V2
+attempt, repair or backfill a V2 run, or treat a later V1 Council as V2 data.
 
-After the reviewed runtime is installed, every new `/council` invocation uses
-the installed wrapper with `--study council-fresh-20260910`. Read that study's
-actual activation from its ledger; an `ACTIVE.json` file is a convenience
-record and never activation authority. Use its exact fresh ledger, V2 sidecar,
-artifact root and the shared evidence lock. A V1-only review is missing data and
-remains in the denominator; never fall back to V1 or backfill a completion.
+New Councils use the original V1 workflow against `--study council-legacy`:
 
-Use `--study council-legacy` only for reports, external snapshots, or governed
-historical outcome resolutions. New collection and repair are closed. Run the
-global `study-operations-report` before and after every Council so separate
-study results and cumulative operational gates are both visible.
+```text
+python3 /home/trader/.claude/knowledge/council-eval/predictions_report.py \
+  --study council-legacy attempt ...
+python3 /home/trader/.claude/knowledge/council-eval/predictions_report.py \
+  --study council-legacy complete ...
+```
 
-Calls already underway when activation is appended retain their original issuance and
-format; do not rewrite them. Count any resulting missingness honestly. Do not make a
-synthetic council just to claim that capture has begun.
+Continue to run the ordinary V1 report and blind-seat tally before and after a
+Council. Historical outcome resolutions remain allowed in the sidecar belonging
+to the study that issued the outcome. Do not run `study-operations-report` as a
+future-Council gate: it remains useful only as a historical view of the two V2
+studies, including their final unhealthy or incomplete state.
 
-The old September 8-14 timer and September 15 maintenance expiry belong to the
-historical activation. Do not reuse them for the fresh study. The principal
-approved `2026-09-11..17 00,12:30:00 UTC` (00:30 and 12:30 UTC), expiry at
-`2026-09-18T00:00:00Z`, a 16-cycle ceiling, 1,024 objects, 2,049 calls, 64 MiB,
-30 minutes and a $2 planning allowance. Install the separate fresh unit/config
-only after their final hashes are reviewed.
-
-The historical issuance ledger is sealed at cutover. Governed resolutions of
-already-issued V1/V2 outcomes remain permitted in their existing sidecars;
-they do not reopen collection or alter the fresh study's score.
+The retirement authority and exact activation IDs are recorded outside both
+evidence roots at `/var/lib/ai-council-evidence/CAPTURE_RETIRED.json`. Both
+maintenance services are condition-fenced by that marker and both timers remain
+disabled. Removing the marker, drop-ins, or routing is a new activation decision;
+it requires explicit principal authority and a new reviewed activation plan.

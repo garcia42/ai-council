@@ -1,6 +1,20 @@
 # Council usefulness capture operating runbook
 
-## Prospective restart routing
+## Retired on 2026-09-10
+
+This runbook is retained as historical evidence. Do not execute its activation,
+renewal, restart, repair or backfill procedures. The principal retired V2
+usefulness capture after both the original and fresh studies had activated. New
+Councils use the V1 workflow described in `COUNCIL_CAPTURE_ROUTING.md` and are
+outside the V2 completeness denominator. Preserve all V2 stores and interrupted
+cycles read-only.
+
+The durable retirement record is
+`/var/lib/ai-council-evidence/CAPTURE_RETIRED.json`. Both maintenance services
+are condition-fenced by that record and both timers are disabled. Reversing any
+of those controls is a new activation, not maintenance.
+
+## Historical prospective restart routing
 
 The historical activation below is retained evidence and is closed to new
 collection after the option D cutover. New reviews use the installed wrapper

@@ -1,53 +1,22 @@
 ## Steps
 
-### Active study routing after the prospective restart
+### Routing after V2 usefulness-capture retirement
 
-Before every Council command, run the installed cumulative operations report
-and select the study explicitly. New review collection uses:
+V2 usefulness capture was retired by principal decision on 2026-09-10. Both V2
+studies and every failed or interrupted cycle are historical, read-only
+evidence. Do not restart their services, enable their timers, initiate or repair
+V2 capture, or backfill a V1 review as V2.
 
-```
-python3 /home/trader/.claude/knowledge/council-eval/predictions_report.py \
-  --study council-fresh-20260910 <capture-command> ...
-```
+New Councils use the original V1 `attempt` and `complete` commands with explicit
+`--study council-legacy`. Run the ordinary V1 report and blind-seat tally before
+and after the review. A post-retirement V1 Council is outside the ended V2
+completeness denominator.
 
-The historical store is `--study council-legacy`. It is closed to initiation,
-attempt, completion, activation, renewal, artifacts, overrides, supersession and
-repair. Use it only for read-only reports, an external snapshot, or a governed
-resolution of an already-issued V1/V2 outcome. Never omit `--study` on a live
-mutation and never fall back to V1 in the fresh study.
-
-Run `study-operations-report` without a study selector. Supply the installed
-blind-criterion digest and the old issuance digest from the actual closure
-receipt. Both digests must match the final release config. Its study results stay separate while grading obligations, blind-seat
-availability and spending remain cumulative.
-
-The approved fresh maintenance timer is
-`2026-09-11..17 00,12:30:00 UTC` (00:30 and 12:30 UTC), expires at
-`2026-09-18T00:00:00Z`, and has a 16-cycle ceiling. The per-cycle limits are
-1,024 objects, 2,049 adapter calls, 64 MiB and 30 minutes. Use the separate
-`council-fresh-capture-evidence.service` and `.timer`; never retarget the
-historical unit.
-
-Install the fresh service, non-persistent timer and fresh alert unit with the
-timer disabled. Run the real prepare cycle and generation-pinned GCS restore
-before the final cutover lock. Missed timer slots are deliberately skipped.
-
-At cutover, open file descriptor 8 on the lock's parent directory and file
-descriptor 9 on the shared evidence lock. Hold exclusive `flock`s on both
-continuously from the final old-ledger digest through
-installation, replacement of these instructions, activation, and verified
-closed-route refusal. Pass the inherited descriptors only to `capture-activate`
-as `--preheld-coordination-parent-fd 8 --preheld-coordination-lock-fd 9`;
-other Council commands would try to
-reacquire the lock and must not run inside the hold. Read the activation row
-directly for the in-lock acknowledgment. Release both descriptors only after the
-installed route is verified. Then run the immediate renewal and enable the
-fresh timer only after it succeeds. A rollback stops and disables the fresh
-timer, restores the predecessor while both collection routes remain held, and
-does not authorize resuming the old default writer. The fresh
-maintenance unit and config require their own exact source/config hashes and a
-principal-approved future window. Never reuse the September 8-14 timer or the
-September 15 expiry for a fresh activation.
+The retirement record is
+`/var/lib/ai-council-evidence/CAPTURE_RETIRED.json`. Both maintenance services
+are condition-fenced by it and both timers must remain disabled. Reversing the
+marker, fencing, routing, or V2 study state is a new runtime activation requiring
+explicit principal authority and a reviewed activation plan.
 
 1. **Establish what is under review -- commit it first.** A council reviews a *named
    commit range*, never a working tree. `git diff` alone shows neither staged changes nor

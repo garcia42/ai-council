@@ -25,8 +25,8 @@ def test_routes_separate_evidence_but_share_existing_lock(account_home):
     old = resolve_study_route("council-legacy")
     fresh = resolve_study_route("council-fresh-20260910")
     lookup.assert_called_with(os.getuid())
-    assert old.collection_state == "closed"
-    assert fresh.collection_state == "active"
+    assert old.collection_state == "v1-only"
+    assert fresh.collection_state == "closed"
     assert old.log == str(home / ".claude/knowledge/futures-panel-log.jsonl")
     assert old.artifact_root == (
         "/var/lib/ai-council-evidence/live-capture-20260907/artifacts"
@@ -48,7 +48,7 @@ def test_routes_separate_evidence_but_share_existing_lock(account_home):
     )
     assert list(home.iterdir()) == []
     with pytest.raises(dataclasses.FrozenInstanceError):
-        fresh.collection_state = "closed"
+        fresh.collection_state = "active"
 
 
 def test_fresh_artifact_root_stays_outside_account_git_worktree(account_home):

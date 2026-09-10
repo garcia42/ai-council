@@ -2627,14 +2627,50 @@ class StudyRoutingCliTest(unittest.TestCase):
             ["ticket-seal", "--contract", absent, "--reviews", absent, "--run-id", "test", "--prose", absent, "--out-body", self.old.log],
         ]
 
-    def test_closed_study_denies_issuance_artifacts_and_auxiliary_mutations(self):
+    def test_retired_fresh_study_denies_issuance_artifacts_and_auxiliary_mutations(self):
         for args in self.blocked_commands():
             with self.subTest(command=args[0]):
-                result = self.run_main("--study", self.old.study_id, *args)
+                result = self.run_main("--study", self.fresh.study_id, *args)
                 self.assertEqual(result.returncode, 1, result.stderr)
-                self.assertTrue("closed" in result.stderr or "does not support" in result.stderr, result.stderr)
+                self.assertTrue(
+                    "closed" in result.stderr
+                    or "does not support" in result.stderr
+                    or "conflicts" in result.stderr,
+                    result.stderr,
+                )
         self.assertEqual(list(self.home.iterdir()), [])
-        self.assertFalse(Path(self.old.artifact_root).exists())
+        self.assertFalse(Path(self.fresh.artifact_root).exists())
+
+    def test_v1_only_study_allows_original_attempt_and_completion_dispatch(self):
+        absent = str(self.root / "absent.json")
+        for command, handler in (
+            ("attempt", "command_attempt"),
+            ("complete", "command_complete"),
+        ):
+            with self.subTest(command=command), mock.patch.object(
+                cli, handler, return_value=0
+            ) as selected_handler:
+                result = self.run_main(
+                    "--study", self.old.study_id, command, "--spec", absent
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                selected_handler.assert_called_once()
+                self.assertEqual(selected_handler.call_args.args[0].log, self.old.log)
+
+    def test_v1_only_study_denies_v2_capture(self):
+        absent = str(self.root / "absent.json")
+        result = self.run_main(
+            "--study",
+            self.old.study_id,
+            "capture-attempt",
+            "--spec",
+            absent,
+            "--decision-before-file",
+            absent,
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("V2 capture is retired", result.stderr)
+        self.assertFalse(Path(self.old.log).exists())
 
     def test_unselected_live_mutations_refuse_before_file_access(self):
         for args in self.blocked_commands():
@@ -2653,35 +2689,32 @@ class StudyRoutingCliTest(unittest.TestCase):
                 self.assertEqual(result.returncode, 1, result.stderr)
                 recover.assert_not_called()
 
-    def test_new_study_refuses_v1_issuance(self):
+    def test_retired_fresh_study_refuses_v1_issuance(self):
         result = self.run_main("--study", self.fresh.study_id, "attempt", "--spec", str(self.root / "missing"))
         self.assertEqual(result.returncode, 1)
-        self.assertIn("requires V2", result.stderr)
+        self.assertIn("closed", result.stderr)
         self.assertFalse(Path(self.fresh.log).exists())
 
-    def test_control_artifact_routes_without_log_and_rejects_run_fields(self):
+    def test_retired_fresh_study_refuses_control_artifacts(self):
         source = self.root / "control.txt"
         source.write_text("public fixture control")
         result = self.run_main("--study", self.fresh.study_id, "capture-artifact", "--file", str(source), "--control-artifact")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        ref = json.loads(result.stdout)
-        self.assertEqual((Path(self.fresh.artifact_root) / ref["path"]).read_bytes(), source.read_bytes())
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("closed", result.stderr)
         self.assertFalse(Path(self.fresh.log).exists())
-        rejected = self.run_main("--study", self.fresh.study_id, "capture-artifact", "--file", str(source), "--control-artifact", "--log", self.fresh.log)
-        self.assertEqual(rejected.returncode, 1)
-        self.assertIn("cannot be combined", rejected.stderr)
 
-    def test_selected_writes_retain_host_and_installed_source_guards(self):
+    def test_v1_only_writes_retain_host_guard(self):
         with mock.patch.object(cli.socket, "gethostname", return_value="other-host"):
-            result = self.run_main("--study", self.fresh.study_id, "capture-initiate", "--activation-id", "activation-" + "a" * 32, "--idempotency-key", "new")
+            result = self.run_main(
+                "--study",
+                self.old.study_id,
+                "attempt",
+                "--spec",
+                str(self.root / "missing"),
+            )
         self.assertEqual(result.returncode, 1)
         self.assertIn("authorized only on manny", result.stderr)
-        spec = self.root / "activation.json"
-        spec.write_text("{}")
-        result = self.run_main("--study", self.fresh.study_id, "capture-activate", "--spec", str(spec))
-        self.assertEqual(result.returncode, 1)
-        self.assertIn("installed source-pinned wrapper", result.stderr)
-        self.assertFalse(Path(self.fresh.log).exists())
+        self.assertFalse(Path(self.old.log).exists())
 
     def test_historical_v1_resolution_preserves_issuance_bytes(self):
         attempt = make_attempt(question="Retain history?", expected_seats=["code", "theory", "ops"], claim="The external fixture occurs", resolution_date="2026-07-02", resolved_by="Inspect fixture", decision_link="Historical decision", materiality="Preserve accounting", action_if_true="Keep", action_if_false="Review", evidence_cutoff_at="2026-07-01T00:00:00Z", ts="2026-07-01T00:01:00Z")

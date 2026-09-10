@@ -85,7 +85,7 @@ def resolve_study_route(
     if study_id == "council-legacy":
         route = StudyRoute(
             study_id=study_id,
-            collection_state="closed",
+            collection_state="v1-only",
             log=str(knowledge / "futures-panel-log.jsonl"),
             v1_events=str(knowledge / "council-eval/predictions_resolved.jsonl"),
             v2_events=str(knowledge / "council-eval/capture_resolved.jsonl"),
@@ -98,7 +98,7 @@ def resolve_study_route(
         study_evidence = Path(FRESH_EVIDENCE_ROOT)
         route = StudyRoute(
             study_id=study_id,
-            collection_state="active",
+            collection_state="closed",
             log=str(study_knowledge / "panel.jsonl"),
             v1_events=str(study_knowledge / "predictions_resolved.jsonl"),
             v2_events=str(study_knowledge / "capture_resolved.jsonl"),

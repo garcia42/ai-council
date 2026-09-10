@@ -236,8 +236,12 @@ def _select_study(args: argparse.Namespace) -> None:
         _STUDY_RESOLUTION_COMMANDS | {"evidence-snapshot"}
     ):
         raise LedgerError("selected study is closed to new collection and repair")
-    if route.collection_state == "active" and writes and args.command in _STUDY_V1_COMMANDS:
-        raise LedgerError("new study requires V2 capture; V1 issuance and mutation are disabled")
+    if (
+        route.collection_state == "v1-only"
+        and writes
+        and args.command in _STUDY_CAPTURE_COMMANDS
+    ):
+        raise LedgerError("selected study permits V1 Council records only; V2 capture is retired")
     args._selected_study = route
 
 def _path_candidates(raw_path: str | Path) -> tuple[Path, Path]:
