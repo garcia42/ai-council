@@ -40,6 +40,7 @@ _STORE_FIELDS = (
 )
 _STUDIES = ("council-legacy", "council-fresh-20260910")
 LEGACY_ARTIFACT_ROOT = "/var/lib/ai-council-evidence/live-capture-20260907/artifacts"
+FRESH_EVIDENCE_ROOT = "/var/lib/ai-council-evidence/fresh-capture-20260910-v2"
 
 
 def _canonical_path(raw: str, field: str) -> None:
@@ -94,15 +95,15 @@ def resolve_study_route(
         )
     else:
         study_knowledge = knowledge / "council-eval/studies" / study_id
-        study_runtime = runtime / "studies" / study_id
+        study_evidence = Path(FRESH_EVIDENCE_ROOT)
         route = StudyRoute(
             study_id=study_id,
             collection_state="active",
             log=str(study_knowledge / "panel.jsonl"),
             v1_events=str(study_knowledge / "predictions_resolved.jsonl"),
             v2_events=str(study_knowledge / "capture_resolved.jsonl"),
-            artifact_root=str(study_runtime / "artifacts"),
-            control_store=str(study_runtime / "controls"),
+            artifact_root=str(study_evidence / "artifacts"),
+            control_store=str(study_evidence / "controls"),
             coordination_lock=lock,
         )
 

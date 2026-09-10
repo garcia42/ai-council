@@ -13,7 +13,9 @@ $1.60 total, within the approved $2 planning allowance.
 
 The fresh study is `council-fresh-20260910`. Its ledger and sidecars are under
 `/home/trader/.claude/knowledge/council-eval/studies/council-fresh-20260910`;
-its artifacts, controls, cycles and config are under
+its artifacts, controls and cycles are under
+`/var/lib/ai-council-evidence/fresh-capture-20260910-v2`, outside the account's Git
+worktree. Its hash-bound config is under
 `/home/trader/.local/state/council-tools/studies/council-fresh-20260910`.
 Both studies retain the single lock
 `/home/trader/.local/state/council-tools/evidence.lock`.

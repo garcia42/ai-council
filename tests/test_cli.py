@@ -2542,8 +2542,11 @@ class StudyRoutingCliTest(unittest.TestCase):
             study_routes.pwd, "getpwuid", return_value=SimpleNamespace(pw_dir=str(self.home))
         ))
         artifacts = str(self.root / "legacy-artifacts")
+        fresh_evidence = str(self.root / "fresh-evidence")
         self.stack.enter_context(mock.patch.object(study_routes, "LEGACY_ARTIFACT_ROOT", artifacts))
         self.stack.enter_context(mock.patch.object(cli, "LEGACY_ARTIFACT_ROOT", artifacts))
+        self.stack.enter_context(mock.patch.object(study_routes, "FRESH_EVIDENCE_ROOT", fresh_evidence))
+        self.stack.enter_context(mock.patch.object(cli, "FRESH_EVIDENCE_ROOT", fresh_evidence))
         self.old = study_routes.resolve_study_route("council-legacy")
         self.fresh = study_routes.resolve_study_route("council-fresh-20260910")
         for name, value in {

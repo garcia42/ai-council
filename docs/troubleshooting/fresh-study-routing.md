@@ -17,6 +17,9 @@ The global `--study` option, before the subcommand, selects exactly
 the latter permits V2 collection. Ledger and sidecar paths for the fresh study
 are under `.claude/knowledge/council-eval/studies/council-fresh-20260910`.
 Its artifacts and controls are under
+`/var/lib/ai-council-evidence/fresh-capture-20260910-v2`, outside the account Git
+worktree; `ArtifactStore` rejects a root below any Git boundary. The hash-bound
+maintenance config remains under
 `.local/state/council-tools/studies/council-fresh-20260910`.
 Paths use the OS account home, not the `HOME` environment variable. Both studies
 retain `.local/state/council-tools/evidence.lock`.
@@ -94,3 +97,9 @@ records. Never rename families, backfill observations or silently use V1 capture
 2026-09-10: Implemented the principal-selected prospective restart. Collection
 state in code describes the intended policy; it is not a closure receipt or live
 activation evidence. Deployment and the new study clocks remain separate gates.
+
+2026-09-10: Moved fresh artifact, control and cycle custody to `/var/lib` after
+the first real prepare correctly refused the original path beneath the account
+Git worktree. A 22-byte synthetic artifact written by an incompletely isolated
+test remains in the first external namespace; the final route uses the pristine
+`fresh-capture-20260910-v2` namespace. Neither failed namespace was replayed.

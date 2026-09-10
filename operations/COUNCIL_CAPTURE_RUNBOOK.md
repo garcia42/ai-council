@@ -9,8 +9,10 @@ use `--study council-legacy`. Never use an omitted selector or V1 fallback.
 
 The fresh store paths are source-defined by `council_tools.study_routes` under
 `.claude/knowledge/council-eval/studies/council-fresh-20260910` for the ledger
-and sidecars, and `.local/state/council-tools/studies/council-fresh-20260910`
-for artifacts and controls. Both studies use
+and sidecars, and `/var/lib/ai-council-evidence/fresh-capture-20260910-v2`
+for artifacts, controls and maintenance-cycle receipts. The hash-bound config
+remains under `.local/state/council-tools/studies/council-fresh-20260910`.
+Both studies use
 `.local/state/council-tools/evidence.lock`.
 
 Before sealing the old issuance digest, disable its timer, finish or preserve
@@ -48,9 +50,10 @@ Neither transient authorizes a Council or a fallback to the historical route.
 Render `council-fresh-capture-evidence.service` only after the final reviewed
 commit is known. It runs
 `/home/trader/council-tools/operations/capture_evidence_cycle.py` with the
-fresh config under
-`/home/trader/.local/state/council-tools/studies/council-fresh-20260910` and its
-exact SHA-256. The config also binds the exact external blind-criterion path
+fresh config under `.local/state/council-tools/studies/council-fresh-20260910`
+and its exact SHA-256. The config points maintenance custody at
+`/var/lib/ai-council-evidence/fresh-capture-20260910-v2`. It also binds the exact
+external blind-criterion path
 and SHA-256 used by `study-operations-report`. Install the separate fresh
 service, non-persistent timer and alert unit disabled; never overwrite or
 retarget the historical units. Hash and retain the rendered config, driver,

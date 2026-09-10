@@ -35,6 +35,12 @@ def test_routes_separate_evidence_but_share_existing_lock(account_home):
     assert fresh.log == str(fresh_knowledge / "panel.jsonl")
     assert fresh.v1_events == str(fresh_knowledge / "predictions_resolved.jsonl")
     assert fresh.v2_events == str(fresh_knowledge / "capture_resolved.jsonl")
+    assert fresh.artifact_root == (
+        "/var/lib/ai-council-evidence/fresh-capture-20260910-v2/artifacts"
+    )
+    assert fresh.control_store == (
+        "/var/lib/ai-council-evidence/fresh-capture-20260910-v2/controls"
+    )
     for field in ("log", "v1_events", "v2_events", "artifact_root", "control_store"):
         assert getattr(old, field) != getattr(fresh, field)
     assert old.coordination_lock == fresh.coordination_lock == str(
@@ -43,6 +49,16 @@ def test_routes_separate_evidence_but_share_existing_lock(account_home):
     assert list(home.iterdir()) == []
     with pytest.raises(dataclasses.FrozenInstanceError):
         fresh.collection_state = "closed"
+
+
+def test_fresh_artifact_root_stays_outside_account_git_worktree(account_home):
+    home, _ = account_home
+    (home / ".git").mkdir()
+
+    route = resolve_study_route("council-fresh-20260910")
+
+    assert not Path(route.artifact_root).is_relative_to(home)
+    assert not Path(route.control_store).is_relative_to(home)
 
 
 def test_home_environment_cannot_redirect_study(account_home, monkeypatch):

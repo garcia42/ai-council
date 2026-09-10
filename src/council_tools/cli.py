@@ -17,7 +17,11 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from .artifacts import ArtifactStore, SecretDetectedError, secret_detectors
-from .study_routes import LEGACY_ARTIFACT_ROOT, resolve_study_route
+from .study_routes import (
+    FRESH_EVIDENCE_ROOT,
+    LEGACY_ARTIFACT_ROOT,
+    resolve_study_route,
+)
 from .capture_schema import strict_json_loads
 from .ticket_qualification import (
     phase_one_material,
@@ -144,10 +148,11 @@ _OTHER_WRITE_FIELDS = {
 
 
 def _is_study_write_path(path: str | Path) -> bool:
-    # The historical external artifact root is outside the default home roots.
+    # External study roots are outside the default account-home roots.
     return _is_live_write_path(path) or any(
-        _is_within(candidate, Path(LEGACY_ARTIFACT_ROOT))
+        _is_within(candidate, root)
         for candidate in _path_candidates(path)
+        for root in (Path(LEGACY_ARTIFACT_ROOT), Path(FRESH_EVIDENCE_ROOT))
     )
 
 
