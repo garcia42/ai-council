@@ -23,6 +23,8 @@ format; do not rewrite them. Count any resulting missingness honestly. Do not ma
 synthetic council just to claim that capture has begun.
 
 The old September 8-14 timer and September 15 maintenance expiry belong to the
-historical activation. Do not reuse them for the fresh study. Install a new
-unit/config only after the principal approves its exact future dates, cycle
-ceiling, limits and planning allowance.
+historical activation. Do not reuse them for the fresh study. The principal
+approved `2026-09-11..17 00,12:30:00 UTC`, expiry at
+`2026-09-18T00:00:00Z`, a 16-cycle ceiling, 1,024 objects, 2,049 calls, 64 MiB,
+30 minutes and a $2 planning allowance. Install the separate fresh unit/config
+only after their final hashes are reviewed.

@@ -1,0 +1,15 @@
+[Unit]
+Description=Fresh AI Council bounded evidence renewal and verified off-host restore
+OnFailure=council-capture-alert.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/trader/council-tools
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStartPre=/usr/bin/gcloud version
+UMask=0077
+ExecStart=/usr/bin/python3 -B /home/trader/council-tools/operations/capture_evidence_cycle.py renew --config /home/trader/.local/state/council-tools/studies/council-fresh-20260910/config-v1.json --config-sha256 @CONFIG_SHA256@
+TimeoutStartSec=31min
+KillMode=control-group
+NoNewPrivileges=true

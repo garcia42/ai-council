@@ -21,12 +21,26 @@ Rollback keeps collection held. Release the lock only after the installed fresh
 route and exact maintenance config are verified.
 
 Do not reuse the historical September 8-14 timer, September 15 expiry, config,
-root, ACTIVE.json or unit hash for the fresh study. The new timer/config must
-bind the reviewed runtime and operations source, fresh paths, approved future
-window and the limits 1,024 objects, 2,049 adapter calls, 64 MiB and 30 minutes.
+root, ACTIVE.json or unit hash for the fresh study. The approved fresh timer is
+`2026-09-11..17 00,12:30:00 UTC`; its authorization expires at
+`2026-09-18T00:00:00Z` and its first checkpoint is September 17. The 16-cycle
+ceiling covers preparation, the immediate service renewal and 14 scheduled
+renewals. The new timer/config must bind the reviewed runtime and operations
+source, fresh paths, and the limits 1,024 objects, 2,049 adapter calls, 64 MiB
+and 30 minutes. Reserve $1.60 within the approved $2 planning allowance.
 Real off-host preparation and restore proof must pass before fresh activation.
 Run each study report plus the global cumulative operations report before and
 after every fresh Council.
+
+Render `council-fresh-capture-evidence.service` only after the final reviewed
+commit is known. It runs
+`/home/trader/council-tools/operations/capture_evidence_cycle.py` with the
+fresh config under
+`/home/trader/.local/state/council-tools/studies/council-fresh-20260910` and its
+exact SHA-256. Install the separate
+`council-fresh-capture-evidence.timer`; never overwrite or retarget the
+historical unit. Hash and retain the rendered config and both rendered units
+in the release packet reviewed by every seat.
 
 ## Historical fixed bindings
 

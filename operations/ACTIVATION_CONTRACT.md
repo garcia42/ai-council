@@ -1,5 +1,30 @@
 # Usefulness activation contract — 2026-09-07
 
+## Fresh prospective restart contract — approved 2026-09-10
+
+The principal approved the exact fresh maintenance window in
+`PRINCIPAL_FRESH_WINDOW_APPROVAL.json`: scheduled renewals run on
+`2026-09-11..17 00,12:30:00 UTC`, authorization expires at
+`2026-09-18T00:00:00Z`, and the first checkpoint is September 17. The ceiling
+is 16 cycles: one preparation, one immediate service renewal, and 14 scheduled
+renewals. Each cycle is limited to 1,024 objects, 2,049 adapter calls,
+67,108,864 bytes and 1,800 seconds. Reserve $0.10 per attempted cycle, or
+$1.60 total, within the approved $2 planning allowance.
+
+The fresh study is `council-fresh-20260910`. Its ledger and sidecars are under
+`/home/trader/.claude/knowledge/council-eval/studies/council-fresh-20260910`;
+its artifacts, controls, cycles and config are under
+`/home/trader/.local/state/council-tools/studies/council-fresh-20260910`.
+Both studies retain the single lock
+`/home/trader/.local/state/council-tools/evidence.lock`.
+
+The new `council-fresh-capture-evidence.service` runs only from the final
+reviewed `/home/trader/council-tools` commit and an exact hash-bound fresh
+config. Its timer is `council-fresh-capture-evidence.timer`. The historical
+unit is disabled before the old issuance seal and is never retargeted.
+
+## Historical activation contract
+
 > Historical activation only. The option D prospective restart preserves this
 > contract and its BLOCKED evidence but does not reuse its ledger, timer dates,
 > September 15 expiry, config digest, ACTIVE.json or maintenance root. A fresh

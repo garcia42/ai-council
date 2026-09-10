@@ -1,0 +1,10 @@
+[Unit]
+Description=Refresh fresh AI Council evidence every twelve hours through September 17 UTC
+
+[Timer]
+OnCalendar=2026-09-11..17 00,12:30:00 UTC
+Persistent=true
+Unit=council-fresh-capture-evidence.service
+
+[Install]
+WantedBy=timers.target

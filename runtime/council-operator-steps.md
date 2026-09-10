@@ -21,6 +21,13 @@ blind-criterion digest and the old issuance digest from the actual closure
 receipt. Its study results stay separate while grading obligations, blind-seat
 availability and spending remain cumulative.
 
+The approved fresh maintenance timer is
+`2026-09-11..17 00,12:30:00 UTC`, expires at
+`2026-09-18T00:00:00Z`, and has a 16-cycle ceiling. The per-cycle limits are
+1,024 objects, 2,049 adapter calls, 64 MiB and 30 minutes. Use the separate
+`council-fresh-capture-evidence.service` and `.timer`; never retarget the
+historical unit.
+
 At cutover, hold the shared evidence lock continuously from the final old-ledger
 digest through installation, replacement of these instructions, and verified
 closed-route refusal. A rollback restores the predecessor while collection

@@ -1,5 +1,6 @@
 [Unit]
-Description=Refresh AI Council evidence every twelve hours
+# Historical council-legacy timer. Never retarget this file to the fresh study.
+Description=Historical AI Council evidence refresh every twelve hours
 
 [Timer]
 OnCalendar=2026-09-08..14 00,12:30:00 UTC

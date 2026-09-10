@@ -1,5 +1,6 @@
 [Unit]
-Description=AI Council bounded evidence renewal and verified off-host restore
+# Historical council-legacy unit. Never retarget this file to the fresh study.
+Description=Historical AI Council bounded evidence renewal and verified off-host restore
 OnFailure=council-capture-alert.service
 
 [Service]
