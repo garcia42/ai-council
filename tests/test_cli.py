@@ -2582,6 +2582,23 @@ class StudyRoutingCliTest(unittest.TestCase):
             result = self.run_main("--study", self.fresh.study_id, "capture-report", "--json")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(report.call_args.args, (self.fresh.log, self.fresh.v2_events))
+        self.assertIsNone(report.call_args.kwargs["log_prefix_bytes"])
+        self.assertIsNone(report.call_args.kwargs["log_prefix_sha256"])
+
+    def test_legacy_capture_report_is_bound_to_retirement_prefix(self):
+        with mock.patch.object(cli, "capture_report", return_value={}) as report:
+            result = self.run_main(
+                "--study", self.old.study_id, "capture-report", "--json"
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            report.call_args.kwargs["log_prefix_bytes"],
+            self.old.capture_log_prefix_bytes,
+        )
+        self.assertEqual(
+            report.call_args.kwargs["log_prefix_sha256"],
+            self.old.capture_log_prefix_sha256,
+        )
 
     def test_explicit_old_default_equals_and_abbreviations_cannot_be_discarded(self):
         for options in (["--log", self.old.log], ["--log=" + self.old.log], ["--lo=" + self.old.log]):

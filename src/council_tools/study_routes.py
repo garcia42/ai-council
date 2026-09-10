@@ -28,6 +28,8 @@ class StudyRoute:
     artifact_root: str
     control_store: str
     coordination_lock: str
+    capture_log_prefix_bytes: int | None = None
+    capture_log_prefix_sha256: str | None = None
 
 
 _STORE_FIELDS = (
@@ -41,6 +43,10 @@ _STORE_FIELDS = (
 _STUDIES = ("council-legacy", "council-fresh-20260910")
 LEGACY_ARTIFACT_ROOT = "/var/lib/ai-council-evidence/live-capture-20260907/artifacts"
 FRESH_EVIDENCE_ROOT = "/var/lib/ai-council-evidence/fresh-capture-20260910-v2"
+LEGACY_CAPTURE_PREFIX_BYTES = 4_589_514
+LEGACY_CAPTURE_PREFIX_SHA256 = (
+    "f9ccbfd5808a86888f84f0d228a38e586510560e411304f43c33392c5c855ba0"
+)
 
 
 def _canonical_path(raw: str, field: str) -> None:
@@ -92,6 +98,8 @@ def resolve_study_route(
             artifact_root=LEGACY_ARTIFACT_ROOT,
             control_store=str(runtime / "capture-control"),
             coordination_lock=lock,
+            capture_log_prefix_bytes=LEGACY_CAPTURE_PREFIX_BYTES,
+            capture_log_prefix_sha256=LEGACY_CAPTURE_PREFIX_SHA256,
         )
     else:
         study_knowledge = knowledge / "council-eval/studies" / study_id

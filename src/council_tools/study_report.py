@@ -124,10 +124,20 @@ def study_operations_report(
                 field: Path(getattr(route, field)).read_bytes()
                 for field in ("log", "v1_events", "v2_events")
             }
-        if hashlib.sha256(snapshots[old.study_id]["log"]).hexdigest() != legacy_ledger_sha256:
+        prefix_bytes = old.capture_log_prefix_bytes
+        prefix_sha256 = old.capture_log_prefix_sha256
+        if prefix_bytes is None or prefix_sha256 is None:
+            raise StudyReportError("legacy capture retirement boundary is missing")
+        legacy_prefix = snapshots[old.study_id]["log"][:prefix_bytes]
+        if (
+            len(legacy_prefix) != prefix_bytes
+            or (prefix_bytes > 0 and not legacy_prefix.endswith(b"\n"))
+            or hashlib.sha256(legacy_prefix).hexdigest() != prefix_sha256
+            or prefix_sha256 != legacy_ledger_sha256
+        ):
             raise StudyReportError("closed issuance ledger differs from closure receipt")
         old_tally, fresh_tally, combined = _combine_blind(
-            criterion, _rows(snapshots[old.study_id]["log"]),
+            criterion, _rows(legacy_prefix),
             _rows(snapshots[fresh.study_id]["log"]),
         )
         studies = {}
@@ -135,6 +145,8 @@ def study_operations_report(
             forecast = audit(route.log, route.v1_events, as_of=clock)
             capture = capture_report(
                 route.log, route.v2_events, artifact_store=ArtifactStore(route.artifact_root), as_of=clock,
+                log_prefix_bytes=route.capture_log_prefix_bytes,
+                log_prefix_sha256=route.capture_log_prefix_sha256,
             )
             if forecast["invalidRecords"] or capture["ledger"]["invalidV2RecordCount"]:
                 raise StudyReportError("a study contains invalid forecast evidence")

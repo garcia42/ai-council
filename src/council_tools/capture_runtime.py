@@ -413,7 +413,11 @@ def _capture_transaction(
 
 
 def _report_rows(
-    path: Path, *, now: datetime | str
+    path: Path,
+    *,
+    now: datetime | str,
+    prefix_bytes: int | None = None,
+    prefix_sha256: str | None = None,
 ) -> tuple[list[dict[str, Any]], list[Mapping[str, Any]], list[dict[str, Any]]]:
     """Classify identifiable bad V2 lifecycle rows without erasing them.
 
@@ -424,7 +428,11 @@ def _report_rows(
     incomplete denominator member.
     """
 
-    loaded = _load_report_jsonl_snapshot(path)
+    loaded = _load_report_jsonl_snapshot(
+        path,
+        prefix_bytes=prefix_bytes,
+        prefix_sha256=prefix_sha256,
+    )
     report_rows: list[dict[str, Any]] = []
     prior: list[Mapping[str, Any]] = []
     invalid: list[dict[str, Any]] = []
@@ -535,12 +543,32 @@ def _report_rows(
 
 def _load_report_jsonl_snapshot(
     path: Path,
+    *,
+    prefix_bytes: int | None = None,
+    prefix_sha256: str | None = None,
 ) -> list[tuple[int, dict[str, Any], str]]:
     """Secret-scan and decode one exact report input byte snapshot."""
 
     if not path.exists():
         return []
     durable_bytes = path.read_bytes()
+    if (prefix_bytes is None) != (prefix_sha256 is None):
+        raise CaptureRuntimeError("capture report prefix binding is incomplete")
+    if prefix_bytes is not None:
+        if (
+            not isinstance(prefix_bytes, int)
+            or isinstance(prefix_bytes, bool)
+            or prefix_bytes < 0
+            or prefix_bytes > len(durable_bytes)
+            or (
+                prefix_bytes > 0
+                and durable_bytes[prefix_bytes - 1 : prefix_bytes] != b"\n"
+            )
+        ):
+            raise CaptureRuntimeError("capture report prefix boundary is invalid")
+        durable_bytes = durable_bytes[:prefix_bytes]
+        if hashlib.sha256(durable_bytes).hexdigest() != prefix_sha256:
+            raise CaptureRuntimeError("capture report prefix digest differs")
     _reject_secret_bytes(durable_bytes)
     loaded = forecasts_module._load_jsonl_bytes_with_raw_identity(
         durable_bytes, label=path.name
@@ -1773,10 +1801,17 @@ def capture_report(
     *,
     artifact_store: ArtifactStore,
     as_of: datetime | str,
+    log_prefix_bytes: int | None = None,
+    log_prefix_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Produce the capture-only report from strict mixed-ledger inputs."""
 
-    raw, validation_prior, invalid = _report_rows(Path(log_path), now=as_of)
+    raw, validation_prior, invalid = _report_rows(
+        Path(log_path),
+        now=as_of,
+        prefix_bytes=log_prefix_bytes,
+        prefix_sha256=log_prefix_sha256,
+    )
     _provenance_invalid_count, finding_summaries = _annotate_report_provenance(
         raw, invalid, artifact_store=artifact_store
     )
@@ -1910,6 +1945,8 @@ def capture_report(
         "recordCountReconciles": (
             validated_v2_count + invalid_v2_count + non_v2_count == len(raw)
         ),
+        "sourcePrefixBytes": log_prefix_bytes,
+        "sourcePrefixSha256": log_prefix_sha256,
         "invalidV2Records": invalid,
         "invalidResolutionRecordCount": resolution_provenance[
             "invalidLedgerResolutionEventCount"

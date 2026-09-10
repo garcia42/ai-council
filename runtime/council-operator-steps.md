@@ -12,6 +12,9 @@ New Councils use the original V1 `attempt` and `complete` commands with explicit
 and after the review. A post-retirement V1 Council is outside the ended V2
 completeness denominator.
 
+V1 reporting reads the full legacy ledger; V2 reporting verifies only its
+source-bound retirement prefix. A mismatch is evidence drift and fails closed.
+
 The retirement record is
 `/var/lib/ai-council-evidence/CAPTURE_RETIRED.json`. Both maintenance services
 are condition-fenced by it and both timers must remain disabled. Reversing the

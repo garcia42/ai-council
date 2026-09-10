@@ -9,6 +9,11 @@ Councils use the V1 workflow described in `COUNCIL_CAPTURE_ROUTING.md` and are
 outside the V2 completeness denominator. Preserve all V2 stores and interrupted
 cycles read-only.
 
+The legacy ledger remains the V1 append target. V2 analysis reads only its
+retirement-time prefix, bound by byte count and SHA-256; V1 analysis reads the
+whole append-only file. This boundary preserves cumulative V1 governance without
+allowing later V1 rows to change the ended V2 result.
+
 The durable retirement record is
 `/var/lib/ai-council-evidence/CAPTURE_RETIRED.json`. Both maintenance services
 are condition-fenced by that record and both timers are disabled. Reversing any

@@ -230,6 +230,8 @@ def _select_study(args: argparse.Namespace) -> None:
     for field, route_field in field_map.items():
         if field not in explicit:
             setattr(args, field, getattr(route, route_field))
+    args._capture_log_prefix_bytes = route.capture_log_prefix_bytes
+    args._capture_log_prefix_sha256 = route.capture_log_prefix_sha256
 
     writes = _command_write_paths(args)
     if route.collection_state == "closed" and writes and args.command not in (
@@ -1176,6 +1178,8 @@ def command_capture_report(args: argparse.Namespace) -> int:
         args.events,
         artifact_store=ArtifactStore(args.artifact_root),
         as_of=args.as_of or _now(),
+        log_prefix_bytes=getattr(args, "_capture_log_prefix_bytes", None),
+        log_prefix_sha256=getattr(args, "_capture_log_prefix_sha256", None),
     )
     safe = _json_safe(report)
     if args.json:

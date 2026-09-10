@@ -21,6 +21,12 @@ to the study that issued the outcome. Do not run `study-operations-report` as a
 future-Council gate: it remains useful only as a historical view of the two V2
 studies, including their final unhealthy or incomplete state.
 
+The legacy file is a mixed append-only ledger. Ordinary V1 reporting reads the
+whole file, including new post-retirement Councils. Historical V2 reporting is
+cryptographically bound to the retirement-time byte prefix and ignores later V1
+appends. A missing, truncated, non-line-aligned or digest-mismatched prefix fails
+closed; later V1 rows cannot silently enter the ended V2 denominator.
+
 The retirement authority and exact activation IDs are recorded outside both
 evidence roots at `/var/lib/ai-council-evidence/CAPTURE_RETIRED.json`. Both
 maintenance services are condition-fenced by that marker and both timers remain

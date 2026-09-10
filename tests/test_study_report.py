@@ -1,4 +1,5 @@
 import fcntl
+import dataclasses
 import hashlib
 import json
 import tempfile
@@ -10,6 +11,7 @@ from unittest import mock
 from council_tools import study_report as report
 from council_tools.capture_runtime import append_capture_activation
 from council_tools.data_health import DataHealthError
+from council_tools.forecasts import append_ledger_row
 from council_tools.study_routes import StudyRoute
 
 
@@ -42,14 +44,22 @@ class StudyReportTest(unittest.TestCase):
         lock = self.root/'evidence.lock'
         lock.write_bytes(b'')
         self.routes = {}
-        for study, state in [('council-legacy', 'closed'), ('council-fresh-20260910', 'active')]:
+        for study, state in [('council-legacy', 'v1-only'), ('council-fresh-20260910', 'closed')]:
             root = self.root/study
             root.mkdir()
             paths = [root/name for name in ('log', 'v1_events', 'v2_events')]
             for path in paths:
                 path.write_bytes(b'')
-            self.routes[study] = StudyRoute(study, state, *(str(path) for path in paths),
-                                            str(root/'artifacts'), str(root/'controls'), str(lock))
+            self.routes[study] = StudyRoute(
+                study,
+                state,
+                *(str(path) for path in paths),
+                str(root/'artifacts'),
+                str(root/'controls'),
+                str(lock),
+                0 if study == 'council-legacy' else None,
+                hashlib.sha256(b'').hexdigest() if study == 'council-legacy' else None,
+            )
 
     def invoke(self, legacy_digest=None):
         with mock.patch.object(report, 'resolve_study_route', side_effect=self.routes.__getitem__):
@@ -86,7 +96,11 @@ class StudyReportTest(unittest.TestCase):
     def test_criterion_and_issuance_digests_fail_closed(self):
         with self.assertRaisesRegex(report.StudyReportError, 'criterion digest'):
             report._load_criterion(CRITERION, '0'*64)
-        Path(self.routes['council-legacy'].log).write_bytes(b'{}\n')
+        self.routes['council-legacy'] = dataclasses.replace(
+            self.routes['council-legacy'],
+            capture_log_prefix_bytes=1,
+            capture_log_prefix_sha256='0' * 64,
+        )
         with self.assertRaisesRegex(report.StudyReportError, 'closure receipt'):
             self.invoke()
 
@@ -108,13 +122,66 @@ class StudyReportTest(unittest.TestCase):
                 'runtimeSourceCommit': 'a'*40, 'runtimeSourceSha256': 'b'*64,
                 'artifactRootPolicy': 'private-content-addressed-v1',
             }, clock=lambda: '2026-09-10T00:00:00Z', coordination_lock=route.coordination_lock)
+        legacy_path = Path(self.routes['council-legacy'].log)
+        legacy_prefix = legacy_path.read_bytes()
+        self.routes['council-legacy'] = dataclasses.replace(
+            self.routes['council-legacy'],
+            capture_log_prefix_bytes=len(legacy_prefix),
+            capture_log_prefix_sha256=hashlib.sha256(legacy_prefix).hexdigest(),
+        )
         before = {p: p.read_bytes() for p in self.root.rglob('*') if p.is_file()}
-        result = self.invoke(hashlib.sha256(Path(self.routes['council-legacy'].log).read_bytes()).hexdigest())
+        result = self.invoke(hashlib.sha256(legacy_prefix).hexdigest())
         self.assertEqual(result['exitCode'], 3)
         self.assertFalse(result['freshStudyCurrentlyHealthy'])
         self.assertEqual(set(result['studies']), set(self.routes))
         self.assertEqual(before, {p: p.read_bytes() for p in self.root.rglob('*') if p.is_file()})
         self.assertFalse(Path(self.routes['council-fresh-20260910'].artifact_root).exists())
+
+    def test_post_retirement_v1_append_does_not_change_capture_denominator(self):
+        from tests.test_forecasts import attempt, completion
+
+        for route in self.routes.values():
+            append_capture_activation(
+                route.log,
+                {
+                    'cohortName': route.study_id,
+                    'captureVersion': 'capture-v2.0.0',
+                    'runtimeSourceCommit': 'a' * 40,
+                    'runtimeSourceSha256': 'b' * 64,
+                    'artifactRootPolicy': 'private-content-addressed-v1',
+                },
+                clock=lambda: '2026-09-10T00:00:00Z',
+                coordination_lock=route.coordination_lock,
+            )
+        legacy_path = Path(self.routes['council-legacy'].log)
+        legacy_prefix = legacy_path.read_bytes()
+        prefix_digest = hashlib.sha256(legacy_prefix).hexdigest()
+        self.routes['council-legacy'] = dataclasses.replace(
+            self.routes['council-legacy'],
+            capture_log_prefix_bytes=len(legacy_prefix),
+            capture_log_prefix_sha256=prefix_digest,
+        )
+        v1_attempt = attempt(
+            question='Retire V2?',
+            claim='V1 remains usable after retirement',
+            resolution_date='2026-09-17',
+        )
+        append_ledger_row(legacy_path, v1_attempt)
+        append_ledger_row(legacy_path, completion(v1_attempt))
+
+        result = self.invoke(prefix_digest)
+
+        legacy = result['studies']['council-legacy']
+        self.assertEqual(legacy['forecast']['councilRows'], 1)
+        self.assertEqual(legacy['capture']['ledger']['rawRecordCount'], 1)
+        self.assertEqual(
+            legacy['capture']['ledger']['sourcePrefixBytes'], len(legacy_prefix)
+        )
+        self.assertEqual(
+            legacy['capture']['ledger']['sourcePrefixSha256'], prefix_digest
+        )
+        self.assertNotEqual(hashlib.sha256(legacy_path.read_bytes()).hexdigest(), prefix_digest)
+        self.assertEqual(result['legacyIssuanceClosureSha256'], prefix_digest)
 
     def test_old_debt_and_blind_degradation_block_even_when_fresh_healthy(self):
         forecast = {'invalidRecords': [], 'gradingDebtState': 'BLOCK_FINALIZATION', 'oldOverdueOutcomes': 3}

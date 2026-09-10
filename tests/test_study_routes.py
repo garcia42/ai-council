@@ -6,7 +6,12 @@ from unittest import mock
 
 import pytest
 
-from council_tools.study_routes import StudyRouteError, resolve_study_route
+from council_tools.study_routes import (
+    LEGACY_CAPTURE_PREFIX_BYTES,
+    LEGACY_CAPTURE_PREFIX_SHA256,
+    StudyRouteError,
+    resolve_study_route,
+)
 
 
 @pytest.fixture
@@ -46,6 +51,10 @@ def test_routes_separate_evidence_but_share_existing_lock(account_home):
     assert old.coordination_lock == fresh.coordination_lock == str(
         home / ".local/state/council-tools/evidence.lock"
     )
+    assert old.capture_log_prefix_bytes == LEGACY_CAPTURE_PREFIX_BYTES
+    assert old.capture_log_prefix_sha256 == LEGACY_CAPTURE_PREFIX_SHA256
+    assert fresh.capture_log_prefix_bytes is None
+    assert fresh.capture_log_prefix_sha256 is None
     assert list(home.iterdir()) == []
     with pytest.raises(dataclasses.FrozenInstanceError):
         fresh.collection_state = "active"
@@ -81,6 +90,8 @@ def test_explicit_selected_paths_are_accepted(account_home):
     paths = dataclasses.asdict(route)
     del paths["study_id"]
     del paths["collection_state"]
+    del paths["capture_log_prefix_bytes"]
+    del paths["capture_log_prefix_sha256"]
     assert resolve_study_route(route.study_id, paths) == route
 
 
