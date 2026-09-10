@@ -2,67 +2,95 @@
 
 ## Problem
 
-Starting a new prospective study needs distinct evidence paths. Reusing a
-historical default can mix new observations with the closed study or send a
-resolution to the wrong sidecar.
+A prospective restart needs distinct evidence stores without losing historical
+resolution obligations, failed attempts or operational counters.
 
 ## Root cause
 
-The existing CLI defaults select the historical store. Explicit path arguments
-can override them independently; the defaults do not express study identity.
+Historical CLI defaults independently selected ledger and artifact paths. A new
+study name alone did not prevent an old default from receiving new observations.
 
-## Current implementation
+## Implementation
 
-`council_tools.study_routes.resolve_study_route` returns an immutable path value
-for exactly two IDs. `council-legacy` describes closed collection and retains
-the historical ledger, sidecars, external artifact root and control store.
-`council-fresh-20260910` describes the prospective collection route: ledger and
-sidecars under `.claude/knowledge/council-eval/studies/council-fresh-20260910`,
-artifacts and controls under `.local/state/council-tools/studies/council-fresh-20260910`.
-Home-relative paths come from the OS account record, not the `HOME` environment
-variable. Both routes retain `.local/state/council-tools/evidence.lock`.
+The global `--study` option, before the subcommand, selects exactly
+`council-legacy` or `council-fresh-20260910`. The former is closed to collection;
+the latter permits V2 collection. Ledger and sidecar paths for the fresh study
+are under `.claude/knowledge/council-eval/studies/council-fresh-20260910`.
+Its artifacts and controls are under
+`.local/state/council-tools/studies/council-fresh-20260910`.
+Paths use the OS account home, not the `HOME` environment variable. Both studies
+retain `.local/state/council-tools/evidence.lock`.
 
-Supplied store fields use `log`, `v1_events`, `v2_events`, `artifact_root`,
-`control_store` and `coordination_lock`. Omitted fields take the selected value;
-an explicit field must match it exactly. Unknown IDs or fields, noncanonical
-path strings and symlink redirections fail with `StudyRouteError`. Selecting a
-route creates no directories and writes no evidence.
+Explicit path arguments must exactly match the selected route, even when an
+argument equals an old default. Unknown studies, conflicting repeated arguments
+and symlink aliases refuse before command dispatch. Closed collection permits
+read-only reporting, historical V1/V2 sidecar resolutions and snapshots to an
+external destination. It rejects new attempts, completions, renewal, activation,
+artifacts, overrides and retrospective repair. Fresh collection rejects V1
+issuance. A missing selector refuses protected live mutations; explicit local
+fixtures remain usable. Auxiliary destination writers do not support selected
+study mode and cannot use its absence to write into protected stores.
 
-## Diagnosis and integration
+Selection leaves existing host, installed-source, clock and transaction checks
+in force. Path checks are point-in-time admission checks, not a claim of
+hostile-filesystem custody. Existing descriptor-pinned transactions and the
+shared evidence lock remain necessary. Old writers must actually be quiesced
+at cutover; installing new CLI code cannot fence an already-running old process.
 
-The helper alone does **not** route CLI calls, close historical collection or
-activate a study. Its `collection_state` describes the proposed write policy,
-not an observed activation or retirement receipt. It does not provide a live
-writer authorization boundary. CLI integration must preserve whether each path
-option was explicitly supplied and distinguish V1 and V2 `--events` arguments.
-It must enforce closed-study mutation policy before dispatch and retain existing
-host, source, outcome and transaction checks.
+The evidence maintenance driver validates its `study`, ledger, both sidecars,
+artifact root and shared lock before creating a cycle. It passes the same study
+to the installed wrapper. Closed or mismatched maintenance targets refuse;
+wholly external fixtures remain permitted.
 
-Path selection checks are a point-in-time check, not filesystem custody or a
-race-proof mutation authorization. Existing dirfd-pinned writer transactions
-and evidence locks remain necessary. Hardlink identity, live control custody,
-command classification and direct-library writers are outside this helper's
-guarantees. A source digest binds these fixed route definitions only when the
-exact reviewed package is installed through the existing installation gate.
+## Diagnosis steps
 
-## Prevention and activation gates
+Use the installed wrapper with `--study council-legacy report --json` and
+`--study council-legacy capture-report` for historical views. Use the fresh
+selector for prospective results. An empty study has no activation and its
+capture report refuses; creating its paths is not activation.
 
-Test wrong-study arguments even when equal to an old default, and test aliases
-both in explicit paths and in selected defaults. Before installation, complete
-CLI write enforcement, cumulative operational-accounting handling, assignment
-repair integration and exact-source qualification. Rehearse old collection
-refusal, permitted historical resolutions with unchanged issuance bytes, fresh
-activation, one-writer exclusion and rollback. Preserve old evidence and all
-spend; do not deploy this helper as a partially completed restart.
+After actual closure and fresh activation, invoke the installed wrapper's
+`study-operations-report --criterion-sha256 HASH --legacy-ledger-sha256 HASH`
+without a study selector. Supply the installed blind criterion hash and the
+closed issuance hash retained in the actual cutover receipt. This source-pinned
+report requires both ledgers and all sidecars and reads under their shared lock.
+It verifies the closed issuance digest and executes the exact hash-verified
+installed criterion bytes. Missing or invalid inputs refuse with exit 1.
+
+Research reports remain separate. The operational view sums historical and fresh
+blind counts, carries consecutive required non-runs across the boundary, rejects
+cross-study run/brief identity reuse, and preserves existing grading-debt gates.
+Old health remains visible as historical evidence. Old debt, cumulative blind
+degradation or unhealthy fresh capture blocks finalization with exit 3. Exit 0
+requires all of these gates to pass. Spending remains in the separate cumulative
+budget receipts; this report does not reset or replace that accounting.
+
+## Solutions and prevention
+
+Install this combined routing, inherited audit assignment repair, maintenance
+binding and operational reporting only after exact-source tests, release Council
+and copied-store cutover/rollback rehearsal. Update the operational runbook to
+call both per-study views and the cumulative report before and after reviews.
+Do not deploy the route helper alone or resume an old driver after closure.
+
+At cutover, retain the old health result honestly, quiesce all collection writers,
+seal actual issuance bytes, then install the final reviewed runtime before a
+fresh evidence-gated activation. Historical resolutions may continue in their
+own sidecars. Preserve old failures, families, assignments, spending and immutable
+records. Never rename families, backfill observations or silently use V1 capture.
 
 ## Related files
 
 - `src/council_tools/study_routes.py`
-- `tests/test_study_routes.py`
 - `src/council_tools/cli.py`
-- `src/council_tools/safe_files.py`
+- `src/council_tools/study_report.py`
+- `src/council_tools/capture_runtime.py`
+- `operations/capture_evidence_cycle.py`
+- `tests/test_study_routes.py`, `tests/test_cli.py`, `tests/test_study_report.py`
+- `tests/test_capture_evidence_cycle.py`
 
 ## History
 
-2026-09-10: Added source-pinned route resolution for the principal-selected
-restart of both studies. CLI integration and live activation remain separate.
+2026-09-10: Implemented the principal-selected prospective restart. Collection
+state in code describes the intended policy; it is not a closure receipt or live
+activation evidence. Deployment and the new study clocks remain separate gates.

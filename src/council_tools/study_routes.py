@@ -39,6 +39,7 @@ _STORE_FIELDS = (
     "coordination_lock",
 )
 _STUDIES = ("council-legacy", "council-fresh-20260910")
+LEGACY_ARTIFACT_ROOT = "/var/lib/ai-council-evidence/live-capture-20260907/artifacts"
 
 
 def _canonical_path(raw: str, field: str) -> None:
@@ -87,7 +88,7 @@ def resolve_study_route(
             log=str(knowledge / "futures-panel-log.jsonl"),
             v1_events=str(knowledge / "council-eval/predictions_resolved.jsonl"),
             v2_events=str(knowledge / "council-eval/capture_resolved.jsonl"),
-            artifact_root="/var/lib/ai-council-evidence/live-capture-20260907/artifacts",
+            artifact_root=LEGACY_ARTIFACT_ROOT,
             control_store=str(runtime / "capture-control"),
             coordination_lock=lock,
         )

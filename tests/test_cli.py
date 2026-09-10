@@ -1,11 +1,12 @@
 import hashlib
+import io
 import json
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager, redirect_stdout, redirect_stderr
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -13,7 +14,7 @@ from unittest import mock
 import install
 
 from council_tools import capture_runtime, cli
-from council_tools import safe_files
+from council_tools import safe_files, study_routes
 from council_tools.artifacts import ArtifactStore
 from council_tools.forecasts import append_ledger_row, make_attempt, new_id
 from tests.test_forecasts import (
@@ -2443,6 +2444,191 @@ class TicketQualificationCliTest(unittest.TestCase):
         result = self.seal(seats={"seatId": "claude"})
         self.assertEqual(result.returncode, 1)
         self.assertTrue(result.stderr.strip())
+
+
+class StudyRoutingCliTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir="/var/tmp")
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.home = self.root / "account"
+        self.home.mkdir()
+        self.stack = ExitStack()
+        self.addCleanup(self.stack.close)
+        self.stack.enter_context(mock.patch.object(
+            study_routes.pwd, "getpwuid", return_value=SimpleNamespace(pw_dir=str(self.home))
+        ))
+        artifacts = str(self.root / "legacy-artifacts")
+        self.stack.enter_context(mock.patch.object(study_routes, "LEGACY_ARTIFACT_ROOT", artifacts))
+        self.stack.enter_context(mock.patch.object(cli, "LEGACY_ARTIFACT_ROOT", artifacts))
+        self.old = study_routes.resolve_study_route("council-legacy")
+        self.fresh = study_routes.resolve_study_route("council-fresh-20260910")
+        for name, value in {
+            "DEFAULT_LOG": self.old.log, "DEFAULT_EVENTS": self.old.v1_events,
+            "DEFAULT_CAPTURE_EVENTS": self.old.v2_events,
+            "DEFAULT_ARTIFACT_ROOT": self.old.artifact_root,
+            "DEFAULT_CONTROL_STORE": self.old.control_store,
+            "DEFAULT_COORDINATION_LOCK": self.old.coordination_lock,
+            "LIVE_WRITE_ROOTS": (self.home / ".claude/knowledge", self.home / ".local/state/council-tools"),
+        }.items():
+            self.stack.enter_context(mock.patch.object(cli, name, value))
+        self.stack.enter_context(mock.patch.object(cli.socket, "gethostname", return_value="manny"))
+
+    def run_main(self, *arguments, **pins):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(sys, "argv", ["council", *arguments]), redirect_stdout(out), redirect_stderr(err):
+            try:
+                result = cli.main(**pins)
+            except SystemExit as exc:
+                result = exc.code
+        return SimpleNamespace(returncode=result, stdout=out.getvalue(), stderr=err.getvalue())
+
+    def test_selected_report_binds_fresh_paths_without_creating_files(self):
+        with mock.patch.object(cli, "audit", return_value={"invalidRecords": [], "gradingDebtState": "OK"}) as audit:
+            result = self.run_main("--study", self.fresh.study_id, "report", "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(audit.call_args.args, (self.fresh.log, self.fresh.v1_events))
+        self.assertFalse(Path(self.fresh.log).exists())
+        self.assertEqual(list(self.home.iterdir()), [])
+
+    def test_selected_v2_report_binds_its_own_sidecar(self):
+        with mock.patch.object(cli, "capture_report", return_value={}) as report:
+            result = self.run_main("--study", self.fresh.study_id, "capture-report", "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(report.call_args.args, (self.fresh.log, self.fresh.v2_events))
+
+    def test_explicit_old_default_equals_and_abbreviations_cannot_be_discarded(self):
+        for options in (["--log", self.old.log], ["--log=" + self.old.log], ["--lo=" + self.old.log]):
+            with self.subTest(options=options), mock.patch.object(cli, "command_report") as handler:
+                result = self.run_main("--study", self.fresh.study_id, "report", *options)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("conflicts", result.stderr)
+                handler.assert_not_called()
+
+    def test_conflicting_repeated_path_refuses_even_if_last_is_correct(self):
+        result = self.run_main("--study", self.fresh.study_id, "report", "--log", self.old.log, "--log", self.fresh.log)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("conflicting repeated", result.stderr)
+
+    def test_alias_and_unknown_study_refuse_before_dispatch(self):
+        alias = self.root / "alias"
+        alias.symlink_to(self.fresh.log)
+        for selector, args in [("unknown", []), (self.fresh.study_id, ["--log", str(alias)])]:
+            with self.subTest(selector=selector), mock.patch.object(cli, "command_report") as handler:
+                result = self.run_main("--study", selector, "report", *args)
+                self.assertEqual(result.returncode, 1)
+                handler.assert_not_called()
+
+    def blocked_commands(self):
+        absent = str(self.root / "absent.json")
+        return [
+            ["capture-initiate", "--activation-id", "activation-" + "a" * 32, "--idempotency-key", "key"],
+            ["capture-attempt", "--spec", absent, "--decision-before-file", absent],
+            ["capture-complete", "--spec", absent, "--decision-before-file", absent],
+            ["capture-seats-finished", "--spec", absent],
+            ["capture-invalidate", "--spec", absent],
+            ["capture-activate", "--spec", absent],
+            ["capture-renew-evidence", "--spec", absent, "--approval-manifest-file", absent, "--artifact-root", self.old.artifact_root],
+            ["capture-artifact", "--file", absent, "--control-artifact"],
+            ["attempt", "--spec", absent],
+            ["complete", "--spec", absent],
+            ["record", "--row", absent],
+            ["override-debt", "--reason", "test", "--operator", "test", "--expires", "2099-01-01"],
+            ["supersede", "--line", "1", "--confirm-raw-line-sha256", "a" * 64, "--duplicate-of-line", "2", "--confirm-duplicate-of-raw-line-sha256", "b" * 64, "--reason", "test", "--operator", "test", "--reference", "test"],
+            ["repair-tail", "--path", self.old.log, "--backup-dir", str(self.root / "backup"), "--confirm-final-line", "1"],
+            ["prepare-brief", "--run-id", "run-test", "--source", absent, "--destination", self.old.log, "--expected-sha256", "a" * 64],
+            ["evidence-restore", absent, self.old.artifact_root, "--repository-root", str(self.root)],
+            ["ticket-seal", "--contract", absent, "--reviews", absent, "--run-id", "test", "--prose", absent, "--out-body", self.old.log],
+        ]
+
+    def test_closed_study_denies_issuance_artifacts_and_auxiliary_mutations(self):
+        for args in self.blocked_commands():
+            with self.subTest(command=args[0]):
+                result = self.run_main("--study", self.old.study_id, *args)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertTrue("closed" in result.stderr or "does not support" in result.stderr, result.stderr)
+        self.assertEqual(list(self.home.iterdir()), [])
+        self.assertFalse(Path(self.old.artifact_root).exists())
+
+    def test_unselected_live_mutations_refuse_before_file_access(self):
+        for args in self.blocked_commands():
+            with self.subTest(command=args[0]):
+                result = self.run_main(*args)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("require explicit --study", result.stderr)
+        self.assertEqual(list(self.home.iterdir()), [])
+
+    def test_recovery_spec_and_mapped_rehearsal_paths_are_checked(self):
+        spec = self.root / "recovery.json"
+        spec.write_text(json.dumps({"ledger": {"path": self.old.log}, "replacementBrief": {"destinationPath": str(self.root / "brief")}, "artifactDir": str(self.root / "recovery")}))
+        for args in ([], ["--rehearsal-root", str(self.home / ".claude/knowledge")]):
+            with self.subTest(args=args), mock.patch.object(cli, "recover_blind_brief") as recover:
+                result = self.run_main("recover-brief", "--spec", str(spec), "--confirm-operator-approved-rewrite", *args)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                recover.assert_not_called()
+
+    def test_new_study_refuses_v1_issuance(self):
+        result = self.run_main("--study", self.fresh.study_id, "attempt", "--spec", str(self.root / "missing"))
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("requires V2", result.stderr)
+        self.assertFalse(Path(self.fresh.log).exists())
+
+    def test_control_artifact_routes_without_log_and_rejects_run_fields(self):
+        source = self.root / "control.txt"
+        source.write_text("public fixture control")
+        result = self.run_main("--study", self.fresh.study_id, "capture-artifact", "--file", str(source), "--control-artifact")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        ref = json.loads(result.stdout)
+        self.assertEqual((Path(self.fresh.artifact_root) / ref["path"]).read_bytes(), source.read_bytes())
+        self.assertFalse(Path(self.fresh.log).exists())
+        rejected = self.run_main("--study", self.fresh.study_id, "capture-artifact", "--file", str(source), "--control-artifact", "--log", self.fresh.log)
+        self.assertEqual(rejected.returncode, 1)
+        self.assertIn("cannot be combined", rejected.stderr)
+
+    def test_selected_writes_retain_host_and_installed_source_guards(self):
+        with mock.patch.object(cli.socket, "gethostname", return_value="other-host"):
+            result = self.run_main("--study", self.fresh.study_id, "capture-initiate", "--activation-id", "activation-" + "a" * 32, "--idempotency-key", "new")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("authorized only on manny", result.stderr)
+        spec = self.root / "activation.json"
+        spec.write_text("{}")
+        result = self.run_main("--study", self.fresh.study_id, "capture-activate", "--spec", str(spec))
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("installed source-pinned wrapper", result.stderr)
+        self.assertFalse(Path(self.fresh.log).exists())
+
+    def test_historical_v1_resolution_preserves_issuance_bytes(self):
+        attempt = make_attempt(question="Retain history?", expected_seats=["code", "theory", "ops"], claim="The external fixture occurs", resolution_date="2026-07-02", resolved_by="Inspect fixture", decision_link="Historical decision", materiality="Preserve accounting", action_if_true="Keep", action_if_false="Review", evidence_cutoff_at="2026-07-01T00:00:00Z", ts="2026-07-01T00:01:00Z")
+        append_ledger_row(self.old.log, attempt)
+        append_ledger_row(self.old.log, completion(attempt))
+        before = Path(self.old.log).read_bytes()
+        result = self.run_main("--study", self.old.study_id, "resolve", attempt["sharedOutcome"]["outcomeId"], "true", "--evidence", "fixture proof", "--resolver", "fixture", "--method", "deterministic")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(Path(self.old.log).read_bytes(), before)
+        self.assertEqual(len(Path(self.old.v1_events).read_text().splitlines()), 1)
+        self.assertFalse(Path(self.old.v2_events).exists())
+
+    def test_historical_v2_resolution_preserves_issuance_bytes(self):
+        from tests.test_capture_integration import CaptureIntegrationTest
+        fixture = CaptureIntegrationTest()
+        fixture.setUp()
+        self.addCleanup(fixture.tearDown)
+        fixture.finish()
+        target = Path(self.old.log)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(fixture.ledger.read_bytes())
+        before = target.read_bytes()
+        outcome_id = json.loads(before.splitlines()[-1])["sharedOutcome"]["outcomeId"]
+        result = self.run_main("--study", self.old.study_id, "capture-resolve", outcome_id, "true", "--evidence", "fixture proof", "--resolver", "fixture", "--method", "deterministic")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(target.read_bytes(), before)
+        self.assertEqual(len(Path(self.old.v2_events).read_text().splitlines()), 1)
+        self.assertFalse(Path(self.old.v1_events).exists())
+
+    def test_snapshot_cannot_write_into_a_live_study(self):
+        result = self.run_main("--study", self.old.study_id, "evidence-snapshot", "--target", self.fresh.artifact_root, "--repository-root", str(self.root))
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("outside live stores", result.stderr)
 
 
 if __name__ == "__main__":

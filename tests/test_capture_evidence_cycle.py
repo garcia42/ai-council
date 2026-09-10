@@ -64,6 +64,31 @@ class EvidenceCycleTest(unittest.TestCase):
         with self.assertRaisesRegex(ops.CycleError,'reconciliation'):
             ops.check_previous(self.root,self.config)
 
+    def test_wrapper_passes_selection_before_command(self):
+        with mock.patch.object(ops.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, b'{}', b'')) as run:
+            ops.wrapper({**self.config, 'wrapper': '/fixture/wrapper.py', 'study': 'council-fresh-20260910'}, 'report', '--json')
+        self.assertEqual(run.call_args.args[0][-4:], ['--study', 'council-fresh-20260910', 'report', '--json'])
+
+    def test_live_maintenance_without_selection_refuses_before_cycle_creation(self):
+        with mock.patch('council_tools.cli._is_study_write_path', return_value=True):
+            with self.assertRaisesRegex(ops.CycleError, 'explicit study'):
+                ops.cycle(self.config, 'prepare')
+        self.assertFalse((self.root/'cycles').exists())
+
+    def test_closed_and_mismatched_maintenance_refuse_before_cycle_creation(self):
+        from council_tools.study_routes import StudyRouteError
+        for result in (mock.Mock(collection_state='closed'), StudyRouteError('conflicting path')):
+            with self.subTest(result=result), mock.patch('council_tools.study_routes.resolve_study_route') as resolve:
+                if isinstance(result, Exception):
+                    resolve.side_effect = result
+                else:
+                    resolve.return_value = result
+                with self.assertRaises((ops.CycleError, StudyRouteError)):
+                    ops.cycle({**self.config, 'study': 'council-legacy'}, 'prepare')
+                self.assertEqual(resolve.call_args.args[1]['artifact_root'], str(self.root/'artifacts'))
+                self.assertEqual(resolve.call_args.args[1]['v2_events'], self.config['events'])
+        self.assertFalse((self.root/'cycles').exists())
+
     def test_unready_prepare_retains_failure_without_prepared_marker(self):
         with mock.patch('council_tools.gcs_durability.GcsVersionedObjectStore',side_effect=lambda **kwargs:FakeVersionedStore(self.configuration)),mock.patch.object(ops,'wrapper',return_value={'appendReady':False}):
             with self.assertRaisesRegex(ops.CycleError,'readiness refused'):

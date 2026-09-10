@@ -980,12 +980,15 @@ def append_council_attempt_v2(
                 launched_at = _clock_utc(clock, "council attempt")
                 if launched_at <= assigned_at:
                     launched_at = assigned_at + timedelta(microseconds=1)
-                prior_assignments = [
-                    item["auditAssignment"]
-                    for item in prior
-                    if item.get("kind") == "council-attempt-v2"
-                    and isinstance(item.get("auditAssignment"), Mapping)
-                ]
+                prior_assignments = []
+                for item in prior:
+                    assignment = item.get("auditAssignment")
+                    if item.get("kind") == "council-attempt-v2" and isinstance(
+                        assignment, Mapping
+                    ):
+                        # Retries embed the same original logical assignment.
+                        if assignment not in prior_assignments:
+                            prior_assignments.append(assignment)
                 family_id = str(payload.get("decisionFamilyId", ""))
                 first_observation = not any(
                     item.get("activationId") == activation["activationId"]

@@ -17,6 +17,7 @@ from council_tools.artifacts import (
     compute_git_blob_oid,
 )
 from council_tools.capture_schema import (
+    CaptureSchemaError,
     blind_brief_identity,
     forecast_request_binding_v2,
     forecast_request_identity_v2,
@@ -692,6 +693,134 @@ class CaptureIntegrationTest(unittest.TestCase):
         self.assertEqual(report["prospectiveAudit"]["assignedFamilyCount"], 1)
         self.assertEqual(report["prospectiveAudit"]["selectedFamilyCount"], 1)
         self.assertEqual(report["prospectiveAudit"]["auditCaseCount"], 1)
+
+    def append_fresh_audited_attempt(self, family, ordinal, related_outcomes):
+        initiation, recorded = append_capture_initiation(
+            self.ledger,
+            {
+                "activationId": self.activation["activationId"],
+                "idempotencyKey": f"audit-retry-{ordinal}",
+            },
+            clock=at(f"2026-08-23T10:{5 + ordinal * 2:02d}:00Z"),
+            coordination_lock=self.lock,
+        )
+        self.assertTrue(recorded)
+        payload = copy.deepcopy(self.attempt_payload)
+        payload["initiationId"] = initiation["initiationId"]
+        payload["decisionFamilyId"] = family
+        outcome = payload["sharedOutcome"]
+        outcome["relatedOutcomeIds"] = related_outcomes
+        request = forecast_request_binding_v2(
+            initiation["runId"],
+            outcome_id_v2(initiation["runId"], outcome["claim"]),
+            outcome_fingerprint_v2(
+                outcome["claim"], outcome["resolutionDate"],
+                outcome["resolvedBy"], outcome["decisionLink"],
+            ),
+            payload["evidenceCutoffAt"], outcome["claim"],
+            outcome["resolutionDate"], outcome["resolvedBy"],
+            outcome["materiality"], outcome["actionIfTrue"],
+            outcome["actionIfFalse"],
+        )
+        bindings = (
+            f"commit={RUNTIME_COMMIT};source-sha256={RUNTIME_SOURCE_SHA};"
+            f"blob={self.baseline_blob};sha256={self.decision_ref['sha256']}\n"
+            f"{request}"
+        )
+        inputs = {seat: f"{seat} prompt\n{bindings}\n".encode()
+                  for seat in self.inputs}
+        refs = {seat: self.store.capture(data) for seat, data in inputs.items()}
+        outcome["decisionLink"] = (
+            f"commit={RUNTIME_COMMIT};blob={self.baseline_blob};"
+            f"sha256={self.decision_ref['sha256']};"
+            f"inputManifestSha256={seat_input_manifest_sha256(refs)}"
+        )
+        before = self.ledger.read_bytes()
+        try:
+            return append_council_attempt_v2(
+                self.ledger, payload, artifact_store=self.store,
+                decision_before_bytes=self.baseline_bytes,
+                seat_input_artifacts=refs, visible_inputs=inputs,
+                clock=at(f"2026-08-23T10:{6 + ordinal * 2:02d}:00Z"),
+                coordination_lock=self.lock,
+            )
+        finally:
+            self.assertTrue(self.ledger.read_bytes().startswith(before))
+
+    def audit_retry_protocol(self):
+        protocol = make_audit_protocol(
+            frozen_protocol_artifact=self.store.capture(b"audit retry fixture")
+        )
+        activation = {
+            **self.activation,
+            "approvalManifest": self.store.capture(b"fixture approval"),
+            "auditProtocol": protocol,
+        }
+        self.ledger.write_text(
+            "".join(json.dumps(row) + "\n"
+                    for row in (activation, self.initiation)),
+            encoding="utf-8",
+        )
+        return protocol
+
+    def test_third_and_later_family_attempts_inherit_one_logical_assignment(self):
+        protocol = self.audit_retry_protocol()
+        families = {}
+        for index in range(1000):
+            family = f"family-audit-retry-{index}"
+            selected = deterministic_family_selection(
+                protocol, activation_id=self.activation["activationId"],
+                decision_family_id=family,
+            )["selected"]
+            families.setdefault(selected, family)
+            if len(families) == 2:
+                break
+        self.assertEqual(set(families), {False, True})
+        originals, outcomes = {}, []
+        for retry in range(4):
+            for selected in (False, True):
+                with self.subTest(retry=retry, selected=selected):
+                    attempt = self.append_fresh_audited_attempt(
+                        families[selected], retry * 2 + int(selected), outcomes[:]
+                    )
+                    outcomes.append(attempt["sharedOutcome"]["outcomeId"])
+                    inherited = attempt["auditAssignment"]
+                    self.assertIs(inherited["selected"], selected)
+                    if retry == 0:
+                        originals[selected] = inherited
+                    self.assertEqual(inherited, originals[selected])
+        raw, rows = validate_capture_ledger(
+            self.ledger, now="2026-08-23T11:00:00Z"
+        )
+        self.assertEqual(len(raw), len(rows))
+        self.assertEqual(sum(row["kind"] == "council-attempt-v2" for row in rows), 8)
+        report = capture_report(
+            self.ledger, self.events, artifact_store=self.store,
+            as_of="2026-08-23T11:00:00Z",
+        )
+        self.assertEqual(report["prospectiveAudit"]["assignedFamilyCount"], 2)
+        self.assertEqual(report["prospectiveAudit"]["selectedFamilyCount"], 1)
+
+    def test_conflicting_inherited_audit_history_still_refuses_without_append(self):
+        self.audit_retry_protocol()
+        family = "family-audit-conflict"
+        first = self.append_fresh_audited_attempt(family, 0, [])
+        self.append_fresh_audited_attempt(
+            family, 1, [first["sharedOutcome"]["outcomeId"]]
+        )
+        rows = [json.loads(line) for line in self.ledger.read_text().splitlines()]
+        rows[-1]["auditAssignment"]["assignedAt"] = "2026-08-23T10:06:00.500000Z"
+        self.ledger.write_text(
+            "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+        )
+        before = self.ledger.read_bytes()
+        with self.assertRaisesRegex(
+            CaptureSchemaError, "repeated decision family must inherit"
+        ):
+            self.append_fresh_audited_attempt(
+                family, 2, [first["sharedOutcome"]["outcomeId"]]
+            )
+        self.assertEqual(self.ledger.read_bytes(), before)
 
     def test_main_ledger_resolution_without_sidecar_never_grades_v2(self):
         completion, _summary = self.finish()

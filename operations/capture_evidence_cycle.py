@@ -98,7 +98,8 @@ def check_previous(root, config):
 
 
 def wrapper(config, *args):
-    p = subprocess.run([sys.executable,'-B',config['wrapper'],*args],capture_output=True,timeout=120)
+    selection = ['--study', config['study']] if config.get('study') is not None else []
+    p = subprocess.run([sys.executable,'-B',config['wrapper'],*selection,*args],capture_output=True,timeout=120)
     if p.returncode:
         raise CycleError('installed wrapper refused '+args[0]+' (exit '+str(p.returncode)+')')
     return json.loads(p.stdout)
@@ -114,8 +115,28 @@ def load_runtime(config):
         digest.update(str(path.relative_to(root)).encode()+b'\0'+path.read_bytes()+b'\0')
     if digest.hexdigest() != config['runtimeSha256']:
         raise CycleError('runtime source changed')
-    wrapper(config,'report','--json')
     sys.path.insert(0,str(root/'src'))
+    validate_study_config(config)
+    wrapper(config,'report','--json')
+
+
+def validate_study_config(config):
+    """Fence direct maintenance writes as well as wrapper invocations."""
+    from council_tools.cli import _is_study_write_path
+    from council_tools.study_routes import resolve_study_route
+
+    paths = {
+        'log': config['log'], 'v2_events': config['events'],
+        'v1_events': config['v1Events'], 'coordination_lock': config['evidenceLock'],
+        'artifact_root': str(Path(config['root'])/'artifacts'),
+    }
+    if config.get('study') is None:
+        if any(_is_study_write_path(path) for path in paths.values()):
+            raise CycleError('live maintenance requires explicit study selection')
+        return
+    route = resolve_study_route(config['study'], paths)
+    if route.collection_state != 'active':
+        raise CycleError('maintenance cannot reopen a closed study')
 
 
 def policy_from_document(document):
@@ -128,6 +149,7 @@ def policy_from_document(document):
 
 
 def cycle(config, mode):
+    validate_study_config(config)
     from council_tools.artifacts import ArtifactStore
     from council_tools.activation_evidence import AUDIT_CONTROL_KEY, CONTROL_KEYS
     from council_tools.evidence_backup import create_evidence_snapshot

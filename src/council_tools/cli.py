@@ -15,6 +15,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from .artifacts import ArtifactStore, SecretDetectedError, secret_detectors
+from .study_routes import LEGACY_ARTIFACT_ROOT, resolve_study_route
 from .capture_schema import strict_json_loads
 from .ticket_qualification import (
     phase_one_material,
@@ -99,6 +100,138 @@ LIVE_WRITE_ROOTS = (
     LIVE_RUNTIME_SOURCE_ROOT,
 )
 DEFAULT_AUTHORITY_HOST = "manny"
+
+
+class _ExplicitStudyPath(argparse.Action):
+    """Keep supplied values distinct from defaults, including argparse aliases."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        supplied = dict(getattr(namespace, "_supplied_study_paths", {}))
+        if self.dest in supplied and supplied[self.dest] != values:
+            raise argparse.ArgumentError(self, "conflicting repeated study path")
+        supplied[self.dest] = values
+        namespace._supplied_study_paths = supplied
+        setattr(namespace, self.dest, values)
+
+
+_STUDY_READ_COMMANDS = frozenset({
+    "report", "capture-report", "recording-coverage", "activation-readiness",
+})
+_STUDY_RESOLUTION_COMMANDS = frozenset({"resolve", "capture-resolve"})
+_STUDY_CAPTURE_COMMANDS = frozenset({
+    "capture-initiate", "capture-attempt", "capture-seats-finished",
+    "capture-complete", "capture-invalidate", "capture-activate",
+    "capture-renew-evidence", "capture-artifact",
+})
+_STUDY_V1_COMMANDS = frozenset({
+    "record", "attempt", "complete", "supersede", "override-debt",
+})
+_STUDY_COMMANDS = (
+    _STUDY_READ_COMMANDS | _STUDY_RESOLUTION_COMMANDS
+    | _STUDY_CAPTURE_COMMANDS | _STUDY_V1_COMMANDS | {"evidence-snapshot"}
+)
+_OTHER_READ_COMMANDS = frozenset({
+    "ticket-projection", "evidence-verify", "plan-brief-recovery", "study-operations-report",
+})
+_OTHER_WRITE_FIELDS = {
+    "repair-tail": ("path", "backup_dir"),
+    "evidence-restore": ("target",),
+    "prepare-brief": ("destination",),
+    "ticket-seal": ("out_body",),
+}
+
+
+def _is_study_write_path(path: str | Path) -> bool:
+    # The historical external artifact root is outside the default home roots.
+    return _is_live_write_path(path) or any(
+        _is_within(candidate, Path(LEGACY_ARTIFACT_ROOT))
+        for candidate in _path_candidates(path)
+    )
+
+
+def _recovery_write_paths(args: argparse.Namespace) -> list[str]:
+    spec = _load_spec(args.spec, "brief recovery spec")
+    ledger = spec.get("ledger")
+    brief = spec.get("replacementBrief")
+    if not isinstance(ledger, dict) or not isinstance(brief, dict):
+        raise LedgerError("invalid brief recovery write paths")
+    values = [ledger.get("path"), brief.get("destinationPath"), spec.get("artifactDir")]
+    paths = []
+    for value in values:
+        if not isinstance(value, str) or not Path(value).is_absolute() or ".." in Path(value).parts:
+            raise LedgerError("invalid brief recovery write paths")
+        target = Path(value)
+        if args.rehearsal_root is not None:
+            target = Path(args.rehearsal_root) / target.relative_to("/")
+        paths.append(str(target))
+    return paths
+
+
+def _command_write_paths(args: argparse.Namespace) -> list[str]:
+    if args.command in _STUDY_READ_COMMANDS | _OTHER_READ_COMMANDS:
+        return []
+    if args.command in {"record", "complete", "supersede"} and args.check_only:
+        return []
+    if args.command == "recover-brief":
+        return _recovery_write_paths(args)
+    if args.command == "evidence-snapshot":
+        # Snapshotting reads a study under its lock; the new copy is the output.
+        fields = ("target",)
+    elif args.command in _OTHER_WRITE_FIELDS:
+        fields = _OTHER_WRITE_FIELDS[args.command]
+    elif args.command in _STUDY_RESOLUTION_COMMANDS or args.command == "override-debt":
+        fields = ("events", "coordination_lock")
+    elif args.command in _STUDY_COMMANDS:
+        fields = ("log", "artifact_root", "coordination_lock")
+    else:
+        raise LedgerError("command has no study admission policy")
+    return [getattr(args, field) for field in fields if getattr(args, field, None) is not None]
+
+
+def _select_study(args: argparse.Namespace) -> None:
+    """Bind paths and reject forbidden writes before any command dispatch."""
+
+    if args.study is None:
+        if any(_is_study_write_path(path) for path in _command_write_paths(args)):
+            raise LedgerError("live council writes require explicit --study selection")
+        return
+
+    route = resolve_study_route(args.study)
+    if args.command not in _STUDY_COMMANDS:
+        raise LedgerError("command does not support selected study routing")
+    if args.command == "evidence-snapshot" and _is_study_write_path(args.target):
+        raise LedgerError("study snapshot target must be outside live stores")
+
+    field_map = {
+        field: field for field in ("log", "artifact_root", "control_store", "coordination_lock")
+        if hasattr(args, field)
+    }
+    if hasattr(args, "events"):
+        field_map["events"] = (
+            "v2_events" if args.command in {"capture-report", "capture-resolve", "evidence-snapshot"}
+            else "v1_events"
+        )
+    if args.command == "capture-artifact" and args.control_artifact:
+        if any(getattr(args, field) is not None for field in ("log", "run_id", "operator", "evidence_ref")):
+            raise LedgerError("--control-artifact cannot be combined with run incident fields")
+        field_map.pop("log", None)
+    explicit = getattr(args, "_supplied_study_paths", {})
+    route = resolve_study_route(
+        args.study,
+        {route_field: explicit[field] for field, route_field in field_map.items() if field in explicit},
+    )
+    for field, route_field in field_map.items():
+        if field not in explicit:
+            setattr(args, field, getattr(route, route_field))
+
+    writes = _command_write_paths(args)
+    if route.collection_state == "closed" and writes and args.command not in (
+        _STUDY_RESOLUTION_COMMANDS | {"evidence-snapshot"}
+    ):
+        raise LedgerError("selected study is closed to new collection and repair")
+    if route.collection_state == "active" and writes and args.command in _STUDY_V1_COMMANDS:
+        raise LedgerError("new study requires V2 capture; V1 issuance and mutation are disabled")
+    args._selected_study = route
 
 def _path_candidates(raw_path: str | Path) -> tuple[Path, Path]:
     """Return lexical and symlink-resolved identities for an authorization check."""
@@ -1159,9 +1292,28 @@ def command_ticket_seal(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_study_operations_report(args: argparse.Namespace) -> int:
+    from .study_report import study_operations_report
+
+    result = study_operations_report(
+        criterion_path=ACCOUNT_HOME / ".claude/knowledge/council-eval/blind_seat_kill_criterion.py",
+        criterion_sha256=args.criterion_sha256,
+        legacy_ledger_sha256=args.legacy_ledger_sha256,
+    )
+    print(json.dumps(_json_safe(result), sort_keys=True, allow_nan=False))
+    return result["exitCode"]
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--study", help="explicit source-pinned Council study")
     sub = parser.add_subparsers(dest="command", required=True)
+    operations_report = sub.add_parser(
+        "study-operations-report", help="separate study results and cumulative operational gates",
+    )
+    operations_report.add_argument("--criterion-sha256", required=True)
+    operations_report.add_argument("--legacy-ledger-sha256", required=True)
+    operations_report.set_defaults(func=command_study_operations_report)
 
     def coordinated(
         command: argparse.ArgumentParser,
@@ -1169,7 +1321,7 @@ def build_parser() -> argparse.ArgumentParser:
         anchor_field: str,
         context_fields: tuple[str, ...],
     ) -> None:
-        command.add_argument("--coordination-lock")
+        command.add_argument("--coordination-lock", action=_ExplicitStudyPath)
         command.set_defaults(
             _coordination_anchor_field=anchor_field,
             _coordination_context_fields=context_fields,
@@ -1194,8 +1346,8 @@ def build_parser() -> argparse.ArgumentParser:
     seal.set_defaults(func=command_ticket_seal)
 
     report = sub.add_parser("report")
-    report.add_argument("--log", default=DEFAULT_LOG)
-    report.add_argument("--events", default=DEFAULT_EVENTS)
+    report.add_argument("--log", action=_ExplicitStudyPath, default=DEFAULT_LOG)
+    report.add_argument("--events", action=_ExplicitStudyPath, default=DEFAULT_EVENTS)
     report.add_argument("--today")
     report.add_argument("--json", action="store_true")
     report.set_defaults(func=command_report)
@@ -1211,7 +1363,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     recording.add_argument(
-        "--log", default=DEFAULT_LOG, help="council ledger to read (default: the live ledger)"
+        "--log", action=_ExplicitStudyPath, default=DEFAULT_LOG, help="council ledger to read (default: the live ledger)"
     )
     recording.add_argument(
         "--since",
@@ -1227,7 +1379,7 @@ def build_parser() -> argparse.ArgumentParser:
     recording.set_defaults(func=command_recording_coverage)
 
     record = sub.add_parser("record")
-    record.add_argument("--log", default=DEFAULT_LOG)
+    record.add_argument("--log", action=_ExplicitStudyPath, default=DEFAULT_LOG)
     record.add_argument("--row", required=True)
     record.add_argument("--check-only", action="store_true")
     coordinated(record, anchor_field="log", context_fields=("log",))
@@ -1237,7 +1389,7 @@ def build_parser() -> argparse.ArgumentParser:
         "supersede",
         help="retire one ledger row by appending a council-superseded record",
     )
-    supersede.add_argument("--log", default=DEFAULT_LOG)
+    supersede.add_argument("--log", action=_ExplicitStudyPath, default=DEFAULT_LOG)
     supersede.add_argument("--line", required=True, type=int)
     supersede.add_argument("--confirm-raw-line-sha256", required=True)
     supersede.add_argument("--duplicate-of-line", required=True, type=int)
@@ -1254,14 +1406,14 @@ def build_parser() -> argparse.ArgumentParser:
     supersede.set_defaults(func=command_supersede)
 
     attempt = sub.add_parser("attempt")
-    attempt.add_argument("--log", default=DEFAULT_LOG)
+    attempt.add_argument("--log", action=_ExplicitStudyPath, default=DEFAULT_LOG)
     attempt.add_argument("--spec", required=True)
     attempt.add_argument("--ts")
     coordinated(attempt, anchor_field="log", context_fields=("log",))
     attempt.set_defaults(func=command_attempt)
 
     complete = sub.add_parser("complete")
-    complete.add_argument("--log", default=DEFAULT_LOG)
+    complete.add_argument("--log", action=_ExplicitStudyPath, default=DEFAULT_LOG)
     complete.add_argument("--spec", required=True)
     complete.add_argument("--ts")
     complete.add_argument("--check-only", action="store_true")
@@ -1271,8 +1423,8 @@ def build_parser() -> argparse.ArgumentParser:
     resolve = sub.add_parser("resolve")
     resolve.add_argument("outcome_id")
     resolve.add_argument("outcome", choices=("true", "false", "void"))
-    resolve.add_argument("--log", default=DEFAULT_LOG)
-    resolve.add_argument("--events", default=DEFAULT_EVENTS)
+    resolve.add_argument("--log", action=_ExplicitStudyPath, default=DEFAULT_LOG)
+    resolve.add_argument("--events", action=_ExplicitStudyPath, default=DEFAULT_EVENTS)
     resolve.add_argument("--evidence", required=True)
     resolve.add_argument("--resolver", required=True)
     resolve.add_argument(
@@ -1289,7 +1441,7 @@ def build_parser() -> argparse.ArgumentParser:
     resolve.set_defaults(func=command_resolve)
 
     override = sub.add_parser("override-debt")
-    override.add_argument("--events", default=DEFAULT_EVENTS)
+    override.add_argument("--events", action=_ExplicitStudyPath, default=DEFAULT_EVENTS)
     override.add_argument("--reason", required=True)
     override.add_argument("--operator", required=True)
     override.add_argument("--created-at")
@@ -1309,10 +1461,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     artifact = sub.add_parser("capture-artifact")
     artifact.add_argument("--file", required=True)
-    artifact.add_argument("--artifact-root", default=DEFAULT_ARTIFACT_ROOT)
+    artifact.add_argument("--artifact-root", action=_ExplicitStudyPath, default=DEFAULT_ARTIFACT_ROOT)
     artifact.add_argument("--secret-token-file", action="append", default=[])
     artifact.add_argument("--run-id")
-    artifact.add_argument("--log")
+    artifact.add_argument("--log", action=_ExplicitStudyPath)
     artifact.add_argument("--operator")
     artifact.add_argument("--evidence-ref")
     artifact.add_argument("--control-artifact", action="store_true")
@@ -1324,18 +1476,18 @@ def build_parser() -> argparse.ArgumentParser:
     artifact.set_defaults(func=command_capture_artifact)
 
     activate = sub.add_parser("capture-activate")
-    activate.add_argument("--log", default=DEFAULT_LOG)
+    activate.add_argument("--log", action=_ExplicitStudyPath, default=DEFAULT_LOG)
     activate.add_argument("--spec", required=True)
     activate.add_argument("--approval-manifest-file")
-    activate.add_argument("--artifact-root")
+    activate.add_argument("--artifact-root", action=_ExplicitStudyPath)
     coordinated(activate, anchor_field="log", context_fields=("log",))
     activate.set_defaults(func=command_capture_activate)
 
     renew = sub.add_parser("capture-renew-evidence")
-    renew.add_argument("--log", default=DEFAULT_LOG)
+    renew.add_argument("--log", action=_ExplicitStudyPath, default=DEFAULT_LOG)
     renew.add_argument("--spec", required=True)
     renew.add_argument("--approval-manifest-file", required=True)
-    renew.add_argument("--artifact-root", required=True)
+    renew.add_argument("--artifact-root", action=_ExplicitStudyPath, required=True)
     renew.add_argument("--runtime-source-commit")
     renew.add_argument("--runtime-source-sha256")
     coordinated(renew, anchor_field="log", context_fields=("log",))
@@ -1343,22 +1495,22 @@ def build_parser() -> argparse.ArgumentParser:
 
     readiness = sub.add_parser("activation-readiness")
     readiness.add_argument("--manifest-file", required=True)
-    readiness.add_argument("--artifact-root", required=True)
+    readiness.add_argument("--artifact-root", action=_ExplicitStudyPath, required=True)
     readiness.add_argument("--runtime-source-commit")
     readiness.add_argument("--runtime-source-sha256")
     readiness.add_argument("--at")
     readiness.set_defaults(func=command_activation_readiness)
 
     initiate = sub.add_parser("capture-initiate")
-    initiate.add_argument("--log", default=DEFAULT_LOG)
+    initiate.add_argument("--log", action=_ExplicitStudyPath, default=DEFAULT_LOG)
     initiate.add_argument("--activation-id", required=True)
     initiate.add_argument("--idempotency-key", required=True)
     coordinated(initiate, anchor_field="log", context_fields=("log",))
     initiate.set_defaults(func=command_capture_initiate)
 
     capture_attempt = sub.add_parser("capture-attempt")
-    capture_attempt.add_argument("--log", default=DEFAULT_LOG)
-    capture_attempt.add_argument("--artifact-root", default=DEFAULT_ARTIFACT_ROOT)
+    capture_attempt.add_argument("--log", action=_ExplicitStudyPath, default=DEFAULT_LOG)
+    capture_attempt.add_argument("--artifact-root", action=_ExplicitStudyPath, default=DEFAULT_ARTIFACT_ROOT)
     capture_attempt.add_argument("--spec", required=True)
     capture_attempt.add_argument("--decision-before-file", required=True)
     capture_attempt.add_argument("--visible-input", action="append", default=[])
@@ -1366,14 +1518,14 @@ def build_parser() -> argparse.ArgumentParser:
     capture_attempt.set_defaults(func=command_capture_attempt)
 
     seats_finished = sub.add_parser("capture-seats-finished")
-    seats_finished.add_argument("--log", default=DEFAULT_LOG)
+    seats_finished.add_argument("--log", action=_ExplicitStudyPath, default=DEFAULT_LOG)
     seats_finished.add_argument("--spec", required=True)
     coordinated(seats_finished, anchor_field="log", context_fields=("log",))
     seats_finished.set_defaults(func=command_capture_seats_finished)
 
     capture_complete = sub.add_parser("capture-complete")
-    capture_complete.add_argument("--log", default=DEFAULT_LOG)
-    capture_complete.add_argument("--artifact-root", default=DEFAULT_ARTIFACT_ROOT)
+    capture_complete.add_argument("--log", action=_ExplicitStudyPath, default=DEFAULT_LOG)
+    capture_complete.add_argument("--artifact-root", action=_ExplicitStudyPath, default=DEFAULT_ARTIFACT_ROOT)
     capture_complete.add_argument("--spec", required=True)
     capture_complete.add_argument("--decision-before-file", required=True)
     capture_complete.add_argument("--visible-input", action="append", default=[])
@@ -1382,7 +1534,7 @@ def build_parser() -> argparse.ArgumentParser:
     capture_complete.set_defaults(func=command_capture_complete)
 
     invalidate = sub.add_parser("capture-invalidate")
-    invalidate.add_argument("--log", default=DEFAULT_LOG)
+    invalidate.add_argument("--log", action=_ExplicitStudyPath, default=DEFAULT_LOG)
     invalidate.add_argument("--spec", required=True)
     coordinated(invalidate, anchor_field="log", context_fields=("log",))
     invalidate.set_defaults(func=command_capture_invalidate)
@@ -1390,8 +1542,8 @@ def build_parser() -> argparse.ArgumentParser:
     capture_resolve = sub.add_parser("capture-resolve")
     capture_resolve.add_argument("outcome_id")
     capture_resolve.add_argument("outcome", choices=("true", "false", "void"))
-    capture_resolve.add_argument("--log", default=DEFAULT_LOG)
-    capture_resolve.add_argument("--events", default=DEFAULT_CAPTURE_EVENTS)
+    capture_resolve.add_argument("--log", action=_ExplicitStudyPath, default=DEFAULT_LOG)
+    capture_resolve.add_argument("--events", action=_ExplicitStudyPath, default=DEFAULT_CAPTURE_EVENTS)
     capture_resolve.add_argument("--evidence", required=True)
     capture_resolve.add_argument("--resolver", required=True)
     capture_resolve.add_argument(
@@ -1408,18 +1560,18 @@ def build_parser() -> argparse.ArgumentParser:
     capture_resolve.set_defaults(func=command_capture_resolve)
 
     capture_health = sub.add_parser("capture-report")
-    capture_health.add_argument("--log", default=DEFAULT_LOG)
-    capture_health.add_argument("--events", default=DEFAULT_CAPTURE_EVENTS)
-    capture_health.add_argument("--artifact-root", default=DEFAULT_ARTIFACT_ROOT)
+    capture_health.add_argument("--log", action=_ExplicitStudyPath, default=DEFAULT_LOG)
+    capture_health.add_argument("--events", action=_ExplicitStudyPath, default=DEFAULT_CAPTURE_EVENTS)
+    capture_health.add_argument("--artifact-root", action=_ExplicitStudyPath, default=DEFAULT_ARTIFACT_ROOT)
     capture_health.add_argument("--as-of")
     capture_health.add_argument("--json", action="store_true")
     capture_health.set_defaults(func=command_capture_report)
 
     snapshot = sub.add_parser("evidence-snapshot")
-    snapshot.add_argument("--log", default=DEFAULT_LOG)
-    snapshot.add_argument("--events", default=DEFAULT_CAPTURE_EVENTS)
-    snapshot.add_argument("--control-store", default=DEFAULT_CONTROL_STORE)
-    snapshot.add_argument("--artifact-root", default=DEFAULT_ARTIFACT_ROOT)
+    snapshot.add_argument("--log", action=_ExplicitStudyPath, default=DEFAULT_LOG)
+    snapshot.add_argument("--events", action=_ExplicitStudyPath, default=DEFAULT_CAPTURE_EVENTS)
+    snapshot.add_argument("--control-store", action=_ExplicitStudyPath, default=DEFAULT_CONTROL_STORE)
+    snapshot.add_argument("--artifact-root", action=_ExplicitStudyPath, default=DEFAULT_ARTIFACT_ROOT)
     snapshot.add_argument("--target", required=True)
     snapshot.add_argument("--repository-root", required=True)
     coordinated(
@@ -1496,6 +1648,7 @@ def main(
     args._runtime_source_sha256 = runtime_source_sha256
     args._runtime_source_root = runtime_source_root
     try:
+        _select_study(args)
         _resolve_coordination_lock(args)
         return args.func(args)
     except RecursionError:
