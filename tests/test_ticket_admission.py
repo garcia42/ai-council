@@ -274,6 +274,7 @@ class TicketAdmissionTest(unittest.TestCase):
             "initiative-production-files-budget-exceeded",
             "initiative-runtime-component-not-allowed",
             "initiative-critical-path-growing",
+            "initiative-canary-blocker-open",
             "initiative-principal-scope-change-required",
         )
         self.assertEqual(REASON_CODES, expected)
@@ -381,6 +382,33 @@ class TicketAdmissionTest(unittest.TestCase):
         )
         self.assertEqual(result.status, "SCOPE_REVIEW_REQUIRED")
 
+    def test_open_p0_p1_canary_blocker_requires_scope_review(self):
+        raw = contract()
+        raw["initiativeScope"] = scope()
+        snapshot, context, evidence = valid_inputs(raw)
+        context["initiativeScopeEvidence"]["findings"] = [
+            {
+                "findingId": "F-blocker",
+                "severity": "P1",
+                "classification": "DIRECT",
+                "observedEvidence": "The bounded path fails deterministically.",
+                "canaryFailure": "The supervised cycle cannot seal.",
+                "maximumConsequence": "Activation lacks a valid receipt.",
+                "existingControlsGap": "The preflight does not catch this case.",
+                "smallestMitigation": "Repair only the failing boundary.",
+                "acceptanceTest": "The bounded cycle completes and seals.",
+                "disposition": "BLOCKS_CANARY",
+            }
+        ]
+
+        result = self.assertReasons(
+            snapshot,
+            context,
+            evidence,
+            ("scope-review-required", "initiative-canary-blocker-open"),
+        )
+        self.assertEqual(result.status, "SCOPE_REVIEW_REQUIRED")
+
     def test_malformed_initiative_progress_is_invalid_context(self):
         raw = contract()
         raw["initiativeScope"] = scope()
@@ -448,6 +476,16 @@ class TicketAdmissionTest(unittest.TestCase):
         hostile_closure["dependencyClosure"] = [hostile]
         self.assertReasons(
             snapshot, hostile_closure, evidence, ("invalid-context",)
+        )
+
+        exact_cardinality_context = copy.deepcopy(context)
+        replacement = exact_cardinality_context.pop("repository")
+        exact_cardinality_context[ExplodingKey()] = replacement
+        self.assertReasons(
+            snapshot,
+            exact_cardinality_context,
+            evidence,
+            ("invalid-context",),
         )
 
     def test_snapshot_shape_is_exact_bounded_and_read_before_parsing(self):

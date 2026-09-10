@@ -261,11 +261,12 @@ def _base_commit_evidence(value: Any) -> _BaseCommitEvidence | None:
 def _context(value: Any) -> _AdmissionContext | None:
     if type(value) is not dict:
         return None
+    if any(type(key) is not str for key in value):
+        return None
     present = set(value)
     if (
         not CONTEXT_KEYS <= present
         or not present <= CONTEXT_KEYS | OPTIONAL_CONTEXT_KEYS
-        or any(type(key) is not str for key in value)
     ):
         return None
     repository = value["repository"]

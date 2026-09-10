@@ -109,6 +109,7 @@ SCOPE_REASON_CODES = (
     "initiative-production-files-budget-exceeded",
     "initiative-runtime-component-not-allowed",
     "initiative-critical-path-growing",
+    "initiative-canary-blocker-open",
     "initiative-principal-scope-change-required",
 )
 
@@ -371,6 +372,14 @@ def _finding(value: Any, index: int) -> ScopeFinding:
         raise InitiativeScopeError(
             "nonblocking-severity-blocks-canary", f"{field}.disposition"
         )
+    if (
+        disposition == "REQUIRES_PRINCIPAL_SCOPE_CHANGE"
+        and severity not in {"P0", "P1"}
+    ):
+        raise InitiativeScopeError(
+            "nonblocking-severity-requires-principal-scope-change",
+            f"{field}.disposition",
+        )
     if disposition == "BLOCKS_CANARY" and classification in {
         "INDUCED_BY_DESIGN",
         "POST_CANARY_HARDENING",
@@ -513,6 +522,11 @@ def evaluate_initiative_scope(
         found.add("initiative-runtime-component-not-allowed")
     if progress.consecutive_growing_checkpoints >= 2:
         found.add("initiative-critical-path-growing")
+    if any(
+        finding.disposition == "BLOCKS_CANARY"
+        for finding in progress.findings
+    ):
+        found.add("initiative-canary-blocker-open")
     if any(
         finding.disposition == "REQUIRES_PRINCIPAL_SCOPE_CHANGE"
         for finding in progress.findings

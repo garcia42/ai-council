@@ -97,6 +97,8 @@ class InitiativeScopeTest(unittest.TestCase):
     def test_all_aggregate_boundaries_have_stable_ordered_reasons(self):
         scope = validate_initiative_scope(raw_scope())
         progress_value = raw_progress()
+        canary_blocker = finding()
+        canary_blocker["findingId"] = "F-2"
         progress_value.update(
             {
                 "initiativeId": "other",
@@ -112,7 +114,8 @@ class InitiativeScopeTest(unittest.TestCase):
                     finding(
                         classification="INDUCED_BY_DESIGN",
                         disposition="REQUIRES_PRINCIPAL_SCOPE_CHANGE",
-                    )
+                    ),
+                    canary_blocker,
                 ],
             }
         )
@@ -156,6 +159,14 @@ class InitiativeScopeTest(unittest.TestCase):
             (
                 finding(classification="POST_CANARY_HARDENING"),
                 "classification-cannot-block-canary",
+            ),
+            (
+                finding(
+                    severity="P2",
+                    classification="INDUCED_BY_DESIGN",
+                    disposition="REQUIRES_PRINCIPAL_SCOPE_CHANGE",
+                ),
+                "nonblocking-severity-requires-principal-scope-change",
             ),
         )
         for raw_finding, code in cases:
