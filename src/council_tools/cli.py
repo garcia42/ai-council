@@ -134,7 +134,8 @@ _STUDY_V1_COMMANDS = frozenset({
 })
 _STUDY_COMMANDS = (
     _STUDY_READ_COMMANDS | _STUDY_RESOLUTION_COMMANDS
-    | _STUDY_CAPTURE_COMMANDS | _STUDY_V1_COMMANDS | {"evidence-snapshot"}
+    | _STUDY_CAPTURE_COMMANDS | _STUDY_V1_COMMANDS
+    | {"evidence-snapshot", "prepare-brief"}
 )
 _OTHER_READ_COMMANDS = frozenset({
     "ticket-projection", "evidence-verify", "plan-brief-recovery", "study-operations-report",

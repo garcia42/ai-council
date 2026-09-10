@@ -2674,6 +2674,30 @@ class StudyRoutingCliTest(unittest.TestCase):
                 selected_handler.assert_called_once()
                 self.assertEqual(selected_handler.call_args.args[0].log, self.old.log)
 
+    def test_v1_only_study_allows_required_blind_brief_preparation(self):
+        absent = str(self.root / "absent.json")
+        destination = str(self.home / ".claude/knowledge/brief.md")
+        with mock.patch.object(
+            cli, "command_prepare_brief", return_value=0
+        ) as selected_handler:
+            result = self.run_main(
+                "--study",
+                self.old.study_id,
+                "prepare-brief",
+                "--run-id",
+                "run-test",
+                "--source",
+                absent,
+                "--destination",
+                destination,
+                "--expected-sha256",
+                "a" * 64,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        selected_handler.assert_called_once()
+        self.assertEqual(selected_handler.call_args.args[0].destination, destination)
+
     def test_v1_only_study_denies_v2_capture(self):
         absent = str(self.root / "absent.json")
         result = self.run_main(
