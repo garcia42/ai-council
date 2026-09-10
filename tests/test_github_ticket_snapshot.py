@@ -13,6 +13,10 @@ import unittest
 import council_tools.ticket_admission as ticket_admission
 import council_tools.ticket_policy as ticket_policy
 import council_tools.ticket_review as ticket_review
+from council_tools.initiative_scope import (
+    initiative_scope_sha256,
+    validate_initiative_scope,
+)
 from council_tools.github_ticket_snapshot import (
     GitHubSnapshotError,
     build_admission_context,
@@ -27,6 +31,42 @@ REPOSITORY = "garcia42/ai-council"
 ISSUE_NUMBER = 77
 BASE_COMMIT = "a" * 40
 RUN_ID = "claude-opus-5:11111111-2222-3333-4444-555555555555"
+
+
+def initiative_scope():
+    return {
+        "schemaVersion": 1,
+        "initiativeId": "bounded-activation",
+        "scopeRevision": 1,
+        "objective": "Reach one bounded canary.",
+        "canarySuccess": ["One supervised cycle completes and seals."],
+        "nonGoals": ["General platform hardening"],
+        "maxProductionLinesAdded": 500,
+        "maxProductionFilesChanged": 8,
+        "maxTickets": 5,
+        "maxEngineerDays": 10,
+        "allowedNewRuntimeComponents": [],
+    }
+
+
+def initiative_progress():
+    raw_scope = initiative_scope()
+    return {
+        "initiativeId": raw_scope["initiativeId"],
+        "scopeRevision": raw_scope["scopeRevision"],
+        "initiativeScopeSha256": initiative_scope_sha256(
+            validate_initiative_scope(raw_scope)
+        ),
+        "cumulativeTickets": 2,
+        "cumulativeEngineerDays": 4,
+        "cumulativeProductionLinesAdded": 150,
+        "cumulativeProductionFilesChanged": 4,
+        "newRuntimeComponents": [],
+        "blockersOpened": 1,
+        "blockersClosed": 1,
+        "consecutiveGrowingCheckpoints": 0,
+        "findings": [],
+    }
 
 
 def contract():
@@ -299,6 +339,23 @@ class ContextShapeTests(unittest.TestCase):
     def test_emitted_key_set_is_exactly_the_predicate_context_key_set(self):
         self.assertEqual(set(self.build()), set(ticket_admission.CONTEXT_KEYS))
 
+    def test_optional_initiative_progress_is_validated_and_normalized(self):
+        progress = initiative_progress()
+        context = self.build(initiative_scope_evidence=progress)
+        self.assertEqual(
+            set(context),
+            set(ticket_admission.CONTEXT_KEYS)
+            | set(ticket_admission.OPTIONAL_CONTEXT_KEYS),
+        )
+        self.assertEqual(context["initiativeScopeEvidence"], progress)
+
+        progress["cumulativeTickets"] = True
+        with self.assertRaises(GitHubSnapshotError) as caught:
+            self.build(initiative_scope_evidence=progress)
+        self.assertEqual(
+            caught.exception.code, "invalid-initiative-scope-evidence"
+        )
+
     def test_the_key_set_is_read_from_the_predicate_not_hard_coded(self):
         # This is the guard the ticket exists to add.  When CONTEXT_KEYS gained
         # baseCommitEvidence, an earlier contract went silently stale; a builder
@@ -390,6 +447,33 @@ class EndToEndAdmissionTests(unittest.TestCase):
         result = evaluate_ticket_admission(snapshot, context, [review])
         self.assertTrue(result.structurally_eligible)
         self.assertEqual(result.reasons, ())
+
+    def test_optional_initiative_shapes_are_admitted_end_to_end(self):
+        raw = contract()
+        raw["initiativeScope"] = initiative_scope()
+        snapshot = build_issue_snapshot(
+            payload(raw), repository=REPOSITORY, issue_number=ISSUE_NUMBER
+        )
+        context = build_admission_context(
+            repository=REPOSITORY,
+            issue_number=ISSUE_NUMBER,
+            target_branch="main",
+            base_commit=BASE_COMMIT,
+            dependency_closure=[{"issueNumber": 7, "state": "closed"}],
+            base_commit_evidence={
+                "contractBaseIsAncestor": True,
+                "changedPaths": [],
+            },
+            initiative_scope_evidence=initiative_progress(),
+        )
+        review = ticket_review.validate_ticket_review(
+            review_record(raw), expected_contract_sha256=contract_sha256(raw)
+        )
+
+        result = evaluate_ticket_admission(snapshot, context, [review])
+
+        self.assertTrue(result.structurally_eligible)
+        self.assertEqual(result.status, "STRUCTURALLY_ELIGIBLE")
 
     def test_the_predicate_still_owns_label_adjudication(self):
         # The normalizer passes a bad label set through; the predicate rejects

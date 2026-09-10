@@ -111,6 +111,57 @@ parses it. Like every other digest here, all of this is integrity, not authoriza
 not prove a seat ran, and one process can still construct both seat reviews and recompute
 every digest.
 
+## Initiative scope: the aggregate boundary
+
+The three-day ticket limit constrains one independently shippable change. It does not constrain
+an initiative: an unbounded architecture can be decomposed into an unlimited sequence of valid
+small tickets. Multi-ticket work and work whose terminal outcome is runtime activation therefore
+carry the optional reviewed `initiativeScope` contract field. Older and genuinely standalone
+tickets omit it and retain their exact bytes and digests.
+
+An initiative scope freezes:
+
+- one identity and monotonically changed scope revision;
+- the objective, exact bounded-canary success conditions, and explicit non-goals;
+- cumulative maximums for production lines added, production files changed, tickets, and
+  engineer-days; and
+- the allowed kinds of new runtime component: `daemon`, `systemd-unit`, `schema`, `journal`,
+  `ipc-protocol`, `general-framework`, or `runtime-dependency`.
+
+`initiativeScope` is reviewed content and appears in the sizing projection. Changing it is a
+scope decision and requires a new revision, digest, and review; it is not an implementation
+detail an autonomous session may infer.
+
+Admission requires caller-observed `initiativeScopeEvidence` whenever the contract carries an
+initiative scope, and refuses unexpected evidence when it does not. The evidence binds the
+initiative identity, revision, and `initiativeScopeSha256`, and reports proposed cumulative
+totals including the candidate ticket. It also reports new runtime component kinds, blocker
+counts, consecutive critical-path-growth checkpoints, and structured findings.
+
+Admission returns status `SCOPE_REVIEW_REQUIRED` when any aggregate budget is exceeded, a new
+runtime component kind is outside the envelope, the critical path has grown at two consecutive
+checkpoints, the identity or digest does not match, or a finding requires a principal scope
+change. This status is a stop before more implementation. It is neither ticket rejection nor
+authorization to enlarge the envelope.
+
+### Finding classification and disposition
+
+Every initiative finding records its observed evidence, exact bounded-canary failure, maximum
+consequence, existing-control gap, smallest mitigation, acceptance test, severity,
+classification, and disposition. The classifications are `DIRECT`, `INDUCED_BY_DESIGN`,
+`GOVERNANCE`, and `POST_CANARY_HARDENING`.
+
+Only P0/P1 findings can use `BLOCKS_CANARY`. P2/P3 findings are never canary blockers.
+`INDUCED_BY_DESIGN` cannot block canary by silently extending the implementation; use
+`REQUIRES_PRINCIPAL_SCOPE_CHANGE` when the design itself must change. `POST_CANARY_HARDENING`
+must be `POST_CANARY_BACKLOG` or `REJECTED`. This forces the choice that was previously hidden:
+repair a direct bounded-canary blocker, accept or backlog residual work, reject the finding, or
+ask the principal to change scope.
+
+The scope digest is integrity, not custody or authority. The pure predicate cannot prove who
+measured progress or approved a revised envelope; adapters must source those facts from protected
+evidence before relying on the result.
+
 ## What the base commit guarantees
 
 A contract pins a `baseCommit`, and that value is reviewed content. What admission checks
@@ -227,7 +278,9 @@ an owner or establish a lease.
   fields; `sizing_projection_sha256(contract)` digests it.
 - `SIZING_DERIVED_KEYS` and `SIZING_PROJECTION_KEYS` partition `CONTRACT_KEYS`.
 - `OPTIONAL_CONTRACT_KEYS` names the keys a contract may omit, and
-  `REQUIRED_CONTRACT_KEYS` is the remainder. `readPaths` is the only optional key.
+  `REQUIRED_CONTRACT_KEYS` is the remainder. `readPaths` and `initiativeScope` are optional.
+- `evaluate_initiative_scope(scope, progress)` returns ordered aggregate scope reasons and
+  deliberately cannot authorize work.
 - `TicketPolicyError` covers policy and marker failures.
 - `TicketContractError` covers strict JSON and contract failures.
 

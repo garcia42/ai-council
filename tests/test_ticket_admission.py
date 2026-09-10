@@ -6,6 +6,10 @@ from dataclasses import FrozenInstanceError, replace
 import council_tools.ticket_admission as ticket_admission
 import council_tools.ticket_policy as ticket_policy
 import council_tools.ticket_review as ticket_review
+from council_tools.initiative_scope import (
+    initiative_scope_sha256,
+    validate_initiative_scope,
+)
 from council_tools.ticket_admission import (
     MAX_ADMISSION_CHANGED_PATHS,
     MAX_ADMISSION_EVIDENCE,
@@ -44,6 +48,41 @@ def contract():
         "outOfScope": ["Authorization"],
         "dependencies": [2, 5],
         "rollbackPlan": "Revert the issue commit.",
+    }
+
+
+def scope():
+    return {
+        "schemaVersion": 1,
+        "initiativeId": "bounded-activation",
+        "scopeRevision": 1,
+        "objective": "Reach one bounded canary.",
+        "canarySuccess": ["One supervised cycle completes and seals."],
+        "nonGoals": ["General platform hardening"],
+        "maxProductionLinesAdded": 500,
+        "maxProductionFilesChanged": 8,
+        "maxTickets": 5,
+        "maxEngineerDays": 10,
+        "allowedNewRuntimeComponents": [],
+    }
+
+
+def initiative_progress(raw_scope=None):
+    raw_scope = raw_scope if raw_scope is not None else scope()
+    digest = initiative_scope_sha256(validate_initiative_scope(raw_scope))
+    return {
+        "initiativeId": raw_scope["initiativeId"],
+        "scopeRevision": raw_scope["scopeRevision"],
+        "initiativeScopeSha256": digest,
+        "cumulativeTickets": 2,
+        "cumulativeEngineerDays": 4,
+        "cumulativeProductionLinesAdded": 150,
+        "cumulativeProductionFilesChanged": 4,
+        "newRuntimeComponents": [],
+        "blockersOpened": 1,
+        "blockersClosed": 1,
+        "consecutiveGrowingCheckpoints": 0,
+        "findings": [],
     }
 
 
@@ -139,6 +178,10 @@ def valid_inputs(raw_contract=None):
             for issue_number in raw_contract["dependencies"]
         ],
     }
+    if "initiativeScope" in raw_contract:
+        context["initiativeScopeEvidence"] = initiative_progress(
+            raw_contract["initiativeScope"]
+        )
     evidence = [normalized_review(raw_contract)]
     return snapshot, context, evidence
 
@@ -181,6 +224,7 @@ class TicketAdmissionTest(unittest.TestCase):
         self.assertEqual(result.envelope.contract.issue_number, 77)
         self.assertEqual(result.labels.points, 3)
         self.assertEqual(result.review.state, "eligible")
+        self.assertEqual(result.status, "STRUCTURALLY_ELIGIBLE")
         self.assertFalse(hasattr(result, "eligible"))
         self.assertFalse(hasattr(result, "authorization"))
         with self.assertRaisesRegex(TypeError, "structural admission is not authorization"):
@@ -219,9 +263,147 @@ class TicketAdmissionTest(unittest.TestCase):
             "review-size-mismatch",
             "review-priority-mismatch",
             "review-projection-mismatch",
+            "missing-initiative-scope-evidence",
+            "unexpected-initiative-scope-evidence",
+            "scope-review-required",
+            "initiative-identity-mismatch",
+            "initiative-scope-digest-mismatch",
+            "initiative-ticket-budget-exceeded",
+            "initiative-engineer-days-budget-exceeded",
+            "initiative-production-lines-budget-exceeded",
+            "initiative-production-files-budget-exceeded",
+            "initiative-runtime-component-not-allowed",
+            "initiative-critical-path-growing",
+            "initiative-principal-scope-change-required",
         )
         self.assertEqual(REASON_CODES, expected)
         self.assertEqual(len(REASON_CODES), len(set(REASON_CODES)))
+
+    def test_valid_initiative_scope_and_progress_are_admitted(self):
+        raw = contract()
+        raw["initiativeScope"] = scope()
+        snapshot, context, evidence = valid_inputs(raw)
+
+        result = evaluate_ticket_admission(snapshot, context, evidence)
+
+        self.assertTrue(result.structurally_eligible)
+        self.assertEqual(result.status, "STRUCTURALLY_ELIGIBLE")
+        self.assertEqual(
+            result.envelope.contract.initiative_scope.initiative_id,
+            "bounded-activation",
+        )
+
+    def test_scope_and_progress_must_be_present_together(self):
+        raw = contract()
+        raw["initiativeScope"] = scope()
+        snapshot, context, evidence = valid_inputs(raw)
+        del context["initiativeScopeEvidence"]
+        missing = self.assertReasons(
+            snapshot,
+            context,
+            evidence,
+            ("missing-initiative-scope-evidence",),
+        )
+        self.assertEqual(missing.status, "NOT_READY")
+
+        snapshot, context, evidence = valid_inputs()
+        context["initiativeScopeEvidence"] = initiative_progress()
+        unexpected = self.assertReasons(
+            snapshot,
+            context,
+            evidence,
+            ("unexpected-initiative-scope-evidence",),
+        )
+        self.assertEqual(unexpected.status, "NOT_READY")
+
+    def test_exceeded_initiative_budget_requires_scope_review(self):
+        raw = contract()
+        raw["initiativeScope"] = scope()
+        snapshot, context, evidence = valid_inputs(raw)
+        progress = context["initiativeScopeEvidence"]
+        progress["cumulativeTickets"] = 6
+        progress["cumulativeEngineerDays"] = 11
+        progress["cumulativeProductionLinesAdded"] = 501
+        progress["cumulativeProductionFilesChanged"] = 9
+
+        result = self.assertReasons(
+            snapshot,
+            context,
+            evidence,
+            (
+                "scope-review-required",
+                "initiative-ticket-budget-exceeded",
+                "initiative-engineer-days-budget-exceeded",
+                "initiative-production-lines-budget-exceeded",
+                "initiative-production-files-budget-exceeded",
+            ),
+        )
+        self.assertEqual(result.status, "SCOPE_REVIEW_REQUIRED")
+
+        snapshot["state"] = "closed"
+        mixed = evaluate_ticket_admission(snapshot, context, evidence)
+        self.assertIn("issue-not-open", mixed.reasons)
+        self.assertIn("scope-review-required", mixed.reasons)
+        self.assertEqual(mixed.status, "NOT_READY")
+
+    def test_architecture_growth_and_principal_change_require_scope_review(self):
+        raw = contract()
+        raw["initiativeScope"] = scope()
+        snapshot, context, evidence = valid_inputs(raw)
+        progress = context["initiativeScopeEvidence"]
+        progress["newRuntimeComponents"] = ["daemon"]
+        progress["consecutiveGrowingCheckpoints"] = 2
+        progress["findings"] = [
+            {
+                "findingId": "F-1",
+                "severity": "P1",
+                "classification": "INDUCED_BY_DESIGN",
+                "observedEvidence": "The proposed split creates another writer.",
+                "canaryFailure": "Concurrent writers can race.",
+                "maximumConsequence": "A duplicate append is possible.",
+                "existingControlsGap": "No common lock owns both writers.",
+                "smallestMitigation": "Keep the original single-writer design.",
+                "acceptanceTest": "Only one writer process is present.",
+                "disposition": "REQUIRES_PRINCIPAL_SCOPE_CHANGE",
+            }
+        ]
+
+        result = self.assertReasons(
+            snapshot,
+            context,
+            evidence,
+            (
+                "scope-review-required",
+                "initiative-runtime-component-not-allowed",
+                "initiative-critical-path-growing",
+                "initiative-principal-scope-change-required",
+            ),
+        )
+        self.assertEqual(result.status, "SCOPE_REVIEW_REQUIRED")
+
+    def test_malformed_initiative_progress_is_invalid_context(self):
+        raw = contract()
+        raw["initiativeScope"] = scope()
+        snapshot, context, evidence = valid_inputs(raw)
+        context["initiativeScopeEvidence"]["findings"] = [
+            {
+                "findingId": "F-2",
+                "severity": "P2",
+                "classification": "DIRECT",
+                "observedEvidence": "A noncritical edge is untested.",
+                "canaryFailure": "None in the bounded canary.",
+                "maximumConsequence": "A later maintenance task can fail.",
+                "existingControlsGap": "No long-horizon regression exists.",
+                "smallestMitigation": "Add the regression after canary.",
+                "acceptanceTest": "The regression passes.",
+                "disposition": "BLOCKS_CANARY",
+            }
+        ]
+
+        result = self.assertReasons(
+            snapshot, context, evidence, ("invalid-context",)
+        )
+        self.assertEqual(result.status, "NOT_READY")
 
     def test_arbitrary_top_level_garbage_returns_and_never_raises(self):
         invalid_values = (

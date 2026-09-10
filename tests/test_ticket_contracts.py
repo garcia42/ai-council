@@ -59,6 +59,22 @@ def golden_contract():
     }
 
 
+def initiative_scope():
+    return {
+        "schemaVersion": 1,
+        "initiativeId": "bounded-activation",
+        "scopeRevision": 1,
+        "objective": "Reach one bounded canary without redesigning the runtime.",
+        "canarySuccess": ["One supervised cycle completes and seals."],
+        "nonGoals": ["General platform hardening"],
+        "maxProductionLinesAdded": 500,
+        "maxProductionFilesChanged": 8,
+        "maxTickets": 5,
+        "maxEngineerDays": 10,
+        "allowedNewRuntimeComponents": [],
+    }
+
+
 def envelope(contract=None, *, run_id="premortem-f4d66860"):
     contract = copy.deepcopy(contract if contract is not None else golden_contract())
     return {
@@ -811,6 +827,7 @@ class SizingProjectionTest(unittest.TestCase):
             # Adding an optional reviewed field must move the digest too: a seat
             # that was not shown it reviewed different content.
             "readPaths": [{"kind": "file", "path": "src/council_tools/cli.py"}],
+            "initiativeScope": initiative_scope(),
         }
         # Fails closed: a new reviewed field must be classified and listed here.
         self.assertEqual(set(changes), SIZING_PROJECTION_KEYS)
@@ -1156,7 +1173,10 @@ class ReadPathsTest(unittest.TestCase):
         self.assertEqual(caught.exception.code, "invalid-contract-keys")
 
     def test_the_optional_set_is_pinned(self):
-        self.assertEqual(OPTIONAL_CONTRACT_KEYS, frozenset({"readPaths"}))
+        self.assertEqual(
+            OPTIONAL_CONTRACT_KEYS,
+            frozenset({"readPaths", "initiativeScope"}),
+        )
         self.assertEqual(REQUIRED_CONTRACT_KEYS, CONTRACT_KEYS - OPTIONAL_CONTRACT_KEYS)
         # Optional or not, it is reviewed content and the seats must see it.
         self.assertIn("readPaths", SIZING_PROJECTION_KEYS)

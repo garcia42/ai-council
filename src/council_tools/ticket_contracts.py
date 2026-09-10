@@ -27,6 +27,12 @@ import unicodedata
 from dataclasses import dataclass
 from typing import Any, Mapping
 
+from council_tools.initiative_scope import (
+    InitiativeScope,
+    InitiativeScopeError,
+    validate_initiative_scope,
+)
+
 
 SCHEMA_VERSION = 1
 MAX_ISSUE_NUMBER = 2**63 - 1
@@ -56,7 +62,7 @@ ENVELOPE_KEYS = frozenset({"contract", "reviewRef"})
 #: Together those mean absence has to be the only spelling for "no read
 #: dependencies".  An explicitly empty list is rejected, so one meaning never
 #: has two encodings and two digests.
-OPTIONAL_CONTRACT_KEYS = frozenset({"readPaths"})
+OPTIONAL_CONTRACT_KEYS = frozenset({"readPaths", "initiativeScope"})
 
 CONTRACT_KEYS = frozenset(
     {
@@ -76,6 +82,7 @@ CONTRACT_KEYS = frozenset(
         "dependencies",
         "rollbackPlan",
         "readPaths",
+        "initiativeScope",
     }
 )
 #: What a contract must carry.  Everything else in ``CONTRACT_KEYS`` may be
@@ -100,6 +107,10 @@ SIZING_PROJECTION_KEYS = frozenset(
         # Reviewed, not derived: what a ticket depends on *reading* is part of
         # what a sizing seat is judging, so a seat must be shown it.
         "readPaths",
+        # Reviewed, not derived: the aggregate initiative boundary is what
+        # prevents a large architecture being decomposed into unlimited valid
+        # small tickets.
+        "initiativeScope",
     }
 )
 # Declared independently, then checked, so adding a contract field fails here
@@ -171,6 +182,9 @@ class TicketContract:
     #: implementation may **not** write.  Empty when the contract omitted the
     #: field, which is the only way to express having none.
     read_paths: tuple[AllowedPath, ...] = ()
+    #: Optional aggregate program boundary.  Older tickets omit it and retain
+    #: their exact canonical bytes; new multi-ticket initiatives carry it.
+    initiative_scope: InitiativeScope | None = None
 
     def allows_path(self, candidate: str) -> bool:
         """Return the single normative, case-sensitive v1 scope decision.
@@ -210,6 +224,8 @@ class TicketContract:
         # this field existed.
         if self.read_paths:
             payload["readPaths"] = [scope.as_dict() for scope in self.read_paths]
+        if self.initiative_scope is not None:
+            payload["initiativeScope"] = self.initiative_scope.as_dict()
         return payload
 
 
@@ -639,6 +655,17 @@ def validate_ticket_envelope(value: Mapping[str, Any]) -> TicketEnvelope:
         code="invalid-rollback-plan",
         field="contract.rollbackPlan",
     )
+    initiative_scope: InitiativeScope | None = None
+    if "initiativeScope" in raw_contract:
+        try:
+            initiative_scope = validate_initiative_scope(
+                raw_contract["initiativeScope"]
+            )
+        except InitiativeScopeError as exc:
+            raise TicketContractError(
+                "invalid-initiative-scope",
+                f"contract.{exc.field}",
+            ) from exc
 
     raw_review_ref = _mapping_with_exact_keys(
         envelope["reviewRef"],
@@ -680,6 +707,7 @@ def validate_ticket_envelope(value: Mapping[str, Any]) -> TicketEnvelope:
             dependencies=dependencies,
             rollback_plan=rollback_plan,
             read_paths=read_paths,
+            initiative_scope=initiative_scope,
         ),
         review_ref=TicketReviewRef(
             run_id=run_id,

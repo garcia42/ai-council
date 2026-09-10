@@ -16,6 +16,13 @@ from typing import Any
 import council_tools.ticket_contracts as ticket_contracts
 import council_tools.ticket_policy as ticket_policy
 import council_tools.ticket_review as ticket_review
+from council_tools.initiative_scope import (
+    InitiativeProgress,
+    InitiativeScopeError,
+    SCOPE_REASON_CODES,
+    evaluate_initiative_scope,
+    validate_initiative_progress,
+)
 from council_tools.ticket_contracts import (
     MAX_ISSUE_NUMBER,
     MAX_LIST_ITEMS,
@@ -47,6 +54,7 @@ CONTEXT_KEYS = frozenset(
         "dependencyClosure",
     }
 )
+OPTIONAL_CONTEXT_KEYS = frozenset({"initiativeScopeEvidence"})
 BASE_COMMIT_EVIDENCE_KEYS = frozenset({"contractBaseIsAncestor", "changedPaths"})
 CLOSURE_KEYS = frozenset({"issueNumber", "state"})
 ISSUE_STATES = frozenset({"open", "closed"})
@@ -81,6 +89,10 @@ REASON_CODES = (
     "review-size-mismatch",
     "review-priority-mismatch",
     "review-projection-mismatch",
+    "missing-initiative-scope-evidence",
+    "unexpected-initiative-scope-evidence",
+    "scope-review-required",
+    *SCOPE_REASON_CODES,
 )
 
 _BASE_COMMIT_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
@@ -122,6 +134,7 @@ class _AdmissionContext:
     base_commit: str
     base_commit_evidence: _BaseCommitEvidence
     dependency_closure: tuple[_DependencyState, ...]
+    initiative_progress: InitiativeProgress | None
 
 
 @dataclass(frozen=True)
@@ -133,6 +146,18 @@ class TicketAdmissionResult:
     envelope: TicketEnvelope | None = None
     labels: ParsedTicketLabels | None = None
     review: TicketReview | None = None
+
+    @property
+    def status(self) -> str:
+        if self.structurally_eligible:
+            return "STRUCTURALLY_ELIGIBLE"
+        scope_only_reasons = {"scope-review-required", *SCOPE_REASON_CODES}
+        if (
+            "scope-review-required" in self.reasons
+            and set(self.reasons) <= scope_only_reasons
+        ):
+            return "SCOPE_REVIEW_REQUIRED"
+        return "NOT_READY"
 
     def __bool__(self) -> bool:
         raise TypeError("structural admission is not authorization")
@@ -234,7 +259,14 @@ def _base_commit_evidence(value: Any) -> _BaseCommitEvidence | None:
 
 
 def _context(value: Any) -> _AdmissionContext | None:
-    if not _has_exact_plain_keys(value, CONTEXT_KEYS):
+    if type(value) is not dict:
+        return None
+    present = set(value)
+    if (
+        not CONTEXT_KEYS <= present
+        or not present <= CONTEXT_KEYS | OPTIONAL_CONTEXT_KEYS
+        or any(type(key) is not str for key in value)
+    ):
         return None
     repository = value["repository"]
     issue_number = value["issueNumber"]
@@ -242,6 +274,7 @@ def _context(value: Any) -> _AdmissionContext | None:
     base_commit = value["baseCommit"]
     evidence_value = value["baseCommitEvidence"]
     closure = value["dependencyClosure"]
+    progress_value = value.get("initiativeScopeEvidence")
     if not _bounded_text(repository, max_length=MAX_REPOSITORY_LENGTH):
         return None
     if not _positive_issue_number(issue_number):
@@ -275,6 +308,12 @@ def _context(value: Any) -> _AdmissionContext | None:
                 state=state,
             )
         )
+    initiative_progress: InitiativeProgress | None = None
+    if "initiativeScopeEvidence" in value:
+        try:
+            initiative_progress = validate_initiative_progress(progress_value)
+        except InitiativeScopeError:
+            return None
     return _AdmissionContext(
         repository=repository,
         issue_number=issue_number,
@@ -282,6 +321,7 @@ def _context(value: Any) -> _AdmissionContext | None:
         base_commit=base_commit,
         base_commit_evidence=evidence,
         dependency_closure=tuple(normalized),
+        initiative_progress=initiative_progress,
     )
 
 
@@ -415,6 +455,18 @@ def evaluate_ticket_admission(
         ):
             found.add("dependency-not-closed")
 
+        scope = contract.initiative_scope
+        progress = parsed_context.initiative_progress
+        if scope is None and progress is not None:
+            found.add("unexpected-initiative-scope-evidence")
+        elif scope is not None and progress is None:
+            found.add("missing-initiative-scope-evidence")
+        elif scope is not None and progress is not None:
+            scope_decision = evaluate_initiative_scope(scope, progress)
+            if scope_decision.scope_review_required:
+                found.add("scope-review-required")
+                found.update(scope_decision.reasons)
+
     if parsed_labels is not None and envelope is not None:
         contract = envelope.contract
         if (
@@ -508,6 +560,7 @@ __all__ = [
     "ADMISSION_VERSION",
     "BASE_COMMIT_EVIDENCE_KEYS",
     "CONTEXT_KEYS",
+    "OPTIONAL_CONTEXT_KEYS",
     "CLOSURE_KEYS",
     "ISSUE_STATES",
     "MAX_ADMISSION_CHANGED_PATHS",

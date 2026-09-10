@@ -41,6 +41,11 @@ Reviewed content — `problemStatement`, `acceptanceCriteria`, `testCommands`, `
 `outOfScope`, `rollbackPlan` — must not assert its own size or priority. No "this is a
 one-day change", no "size:1", no "P0", no "trivial".
 
+For a multi-ticket or activation initiative, the projection also includes the reviewed
+`initiativeScope`. The three-day result below is only a per-ticket result; it does not override
+that aggregate envelope. A sequence of individually eligible tickets stops when admission returns
+`SCOPE_REVIEW_REQUIRED`.
+
 This is not hypothetical. Re-qualifying issue #61 required rewording an acceptance criterion
 that read:
 
@@ -155,6 +160,11 @@ acceptance contract and P2 and P3 are retained as backlog (`docs/RUN_GUARD.md`,
 `AGENTS.md`). So "are there any P2s left" has opposite answers depending on which
 scale is meant — none can exist as tickets, while P2 findings are the ordinary
 non-blocking remainder. Name the scale whenever it is not obvious from context.
+
+For initiative findings, P2/P3 cannot use `BLOCKS_CANARY`. Findings caused by a proposed design
+expansion use `INDUCED_BY_DESIGN` and require an explicit principal scope decision rather than
+silently becoming another ticket. Post-canary hardening is backlogged or rejected. The structured
+contract and exact dispositions are documented in `docs/TICKET_GOVERNANCE.md`.
 
 When submitted seats disagree, P0 wins. This permits one seat to escalate a
 live integrity concern conservatively.

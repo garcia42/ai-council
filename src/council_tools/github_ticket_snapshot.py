@@ -28,6 +28,10 @@ from __future__ import annotations
 from typing import Any, Mapping, Sequence
 
 import council_tools.ticket_admission as ticket_admission
+from council_tools.initiative_scope import (
+    InitiativeScopeError,
+    validate_initiative_progress,
+)
 
 
 class GitHubSnapshotError(ValueError):
@@ -152,8 +156,9 @@ def build_admission_context(
     base_commit: str,
     dependency_closure: Sequence[Any],
     base_commit_evidence: Any,
+    initiative_scope_evidence: Any = None,
 ) -> dict[str, Any]:
-    """Build one context whose key set is exactly ``CONTEXT_KEYS``.
+    """Build one context with required keys and optional scope evidence.
 
     The closure and the evidence are resolved elsewhere and validated here, so a
     caller cannot hand the predicate a shape it will reject for reasons this
@@ -170,7 +175,17 @@ def build_admission_context(
             base_commit_evidence
         ),
     }
-    _assert_exact_keys(context, ticket_admission.CONTEXT_KEYS, "context")
+    expected_keys = ticket_admission.CONTEXT_KEYS
+    if initiative_scope_evidence is not None:
+        try:
+            progress = validate_initiative_progress(initiative_scope_evidence)
+        except InitiativeScopeError as exc:
+            raise GitHubSnapshotError(
+                "invalid-initiative-scope-evidence", exc.field
+            ) from exc
+        context["initiativeScopeEvidence"] = progress.as_dict()
+        expected_keys = expected_keys | ticket_admission.OPTIONAL_CONTEXT_KEYS
+    _assert_exact_keys(context, expected_keys, "context")
     return context
 
 
