@@ -1,5 +1,14 @@
 # Usefulness activation contract — 2026-09-07
 
+> Historical activation only. The option D prospective restart preserves this
+> contract and its BLOCKED evidence but does not reuse its ledger, timer dates,
+> September 15 expiry, config digest, ACTIVE.json or maintenance root. A fresh
+> contract must bind `council-fresh-20260910`, the final reviewed runtime and
+> operations source, a principal-approved future window, the shared evidence
+> lock, and limits of 1,024 objects, 2,049 adapter calls, 64 MiB and 30 minutes.
+> The shared lock remains exclusively held from the historical issuance seal
+> through installed closed-route verification. Rollback keeps collection held.
+
 User authority: “Ok, finish activation” after the measurement status and remaining activation steps were explained. Runtime stays at reviewed and rehearsed commit 4ca5c08b97e1ef10ed2c3c5d585a6747275c658c. This operational package does not replace it.
 
 - Prepare fresh source-bound audit and real GCS readback/restore certificates using the existing adapters; preserve failed namespaces and ambiguous outcomes without automatic replay.

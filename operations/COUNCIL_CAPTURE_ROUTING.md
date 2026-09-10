@@ -1,15 +1,28 @@
-# Active Council usefulness capture routing
+# Council usefulness routing during the prospective restart
 
-When the live capture report shows a capture activation, every new
-`/council` invocation must follow the V2 workflow in
-`/var/lib/ai-council-evidence/live-capture-20260907/COUNCIL_CAPTURE_RUNBOOK.md`.
-Read the live capture report before launching seats. Use its actual activation ID, the
-installed wrapper, the explicit external artifact root and the shared evidence lock.
-ACTIVE.json in that evidence root is a convenience record, not the activation authority;
-its absence never authorizes a V1 fallback after the immutable activation row exists.
-A V1-only review after activation is missing usefulness data and remains in the denominator;
-never silently fall back to V1 or backfill a completed review as V2.
+Before the fresh activation, finish or preserve issued old reviews using the
+historical V2 workflow. At cutover, disable old maintenance, prove every old
+collection writer quiescent, then hold the shared evidence lock exclusively
+from the final issuance digest through installation and closed-route
+verification.
+
+After the reviewed runtime is installed, every new `/council` invocation uses
+the installed wrapper with `--study council-fresh-20260910`. Read that study's
+actual activation from its ledger; an `ACTIVE.json` file is a convenience
+record and never activation authority. Use its exact fresh ledger, V2 sidecar,
+artifact root and the shared evidence lock. A V1-only review is missing data and
+remains in the denominator; never fall back to V1 or backfill a completion.
+
+Use `--study council-legacy` only for reports, external snapshots, or governed
+historical outcome resolutions. New collection and repair are closed. Run the
+global `study-operations-report` before and after every Council so separate
+study results and cumulative operational gates are both visible.
 
 Calls already underway when activation is appended retain their original issuance and
 format; do not rewrite them. Count any resulting missingness honestly. Do not make a
 synthetic council just to claim that capture has begun.
+
+The old September 8-14 timer and September 15 maintenance expiry belong to the
+historical activation. Do not reuse them for the fresh study. Install a new
+unit/config only after the principal approves its exact future dates, cycle
+ceiling, limits and planning allowance.

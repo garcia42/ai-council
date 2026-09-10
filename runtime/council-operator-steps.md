@@ -1,5 +1,34 @@
 ## Steps
 
+### Active study routing after the prospective restart
+
+Before every Council command, run the installed cumulative operations report
+and select the study explicitly. New review collection uses:
+
+```
+python3 /home/trader/.claude/knowledge/council-eval/predictions_report.py \
+  --study council-fresh-20260910 <capture-command> ...
+```
+
+The historical store is `--study council-legacy`. It is closed to initiation,
+attempt, completion, activation, renewal, artifacts, overrides, supersession and
+repair. Use it only for read-only reports, an external snapshot, or a governed
+resolution of an already-issued V1/V2 outcome. Never omit `--study` on a live
+mutation and never fall back to V1 in the fresh study.
+
+Run `study-operations-report` without a study selector. Supply the installed
+blind-criterion digest and the old issuance digest from the actual closure
+receipt. Its study results stay separate while grading obligations, blind-seat
+availability and spending remain cumulative.
+
+At cutover, hold the shared evidence lock continuously from the final old-ledger
+digest through installation, replacement of these instructions, and verified
+closed-route refusal. A rollback restores the predecessor while collection
+remains held; it does not authorize resuming its old default writer. The fresh
+maintenance unit and config require their own exact source/config hashes and a
+principal-approved future window. Never reuse the September 8-14 timer or the
+September 15 expiry for a fresh activation.
+
 1. **Establish what is under review -- commit it first.** A council reviews a *named
    commit range*, never a working tree. `git diff` alone shows neither staged changes nor
    **untracked files**, so a review driven off it silently misses whole new modules: on

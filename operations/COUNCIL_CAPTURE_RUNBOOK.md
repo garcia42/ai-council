@@ -1,6 +1,34 @@
-# Live usefulness capture operating runbook
+# Council usefulness capture operating runbook
 
-## Fixed bindings
+## Prospective restart routing
+
+The historical activation below is retained evidence and is closed to new
+collection after the option D cutover. New reviews use the installed wrapper
+with `--study council-fresh-20260910`; historical reads and outcome resolutions
+use `--study council-legacy`. Never use an omitted selector or V1 fallback.
+
+The fresh store paths are source-defined by `council_tools.study_routes` under
+`.claude/knowledge/council-eval/studies/council-fresh-20260910` for the ledger
+and sidecars, and `.local/state/council-tools/studies/council-fresh-20260910`
+for artifacts and controls. Both studies use
+`.local/state/council-tools/evidence.lock`.
+
+Before sealing the old issuance digest, disable its timer, finish or preserve
+in-flight attempts and prove all collection writers quiescent. Keep one
+exclusive descriptor on the shared evidence lock from that digest through
+runtime installation, operator-routing replacement and closed-old refusal.
+Rollback keeps collection held. Release the lock only after the installed fresh
+route and exact maintenance config are verified.
+
+Do not reuse the historical September 8-14 timer, September 15 expiry, config,
+root, ACTIVE.json or unit hash for the fresh study. The new timer/config must
+bind the reviewed runtime and operations source, fresh paths, approved future
+window and the limits 1,024 objects, 2,049 adapter calls, 64 MiB and 30 minutes.
+Real off-host preparation and restore proof must pass before fresh activation.
+Run each study report plus the global cumulative operations report before and
+after every fresh Council.
+
+## Historical fixed bindings
 
 - Principal/study owner: the user. Execution/backup operator: `manny-capture-maintenance`, the pinned scheduled process on manny.
 - Installed runtime: `/home/trader/council-tools`, commit `4ca5c08b97e1ef10ed2c3c5d585a6747275c658c`.
