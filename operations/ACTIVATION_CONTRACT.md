@@ -4,7 +4,7 @@
 
 The principal approved the exact fresh maintenance window in
 `PRINCIPAL_FRESH_WINDOW_APPROVAL.json`: scheduled renewals run on
-`2026-09-11..17 00,12:30:00 UTC`, authorization expires at
+`2026-09-11..17 00,12:30:00 UTC` (00:30 and 12:30 UTC), authorization expires at
 `2026-09-18T00:00:00Z`, and the first checkpoint is September 17. The ceiling
 is 16 cycles: one preparation, one immediate service renewal, and 14 scheduled
 renewals. Each cycle is limited to 1,024 objects, 2,049 adapter calls,
@@ -21,7 +21,10 @@ Both studies retain the single lock
 The new `council-fresh-capture-evidence.service` runs only from the final
 reviewed `/home/trader/council-tools` commit and an exact hash-bound fresh
 config. Its timer is `council-fresh-capture-evidence.timer`. The historical
-unit is disabled before the old issuance seal and is never retargeted.
+unit is disabled before the old issuance seal and is never retargeted. The
+fresh timer is non-persistent, installed disabled, and enabled only after the
+activation acknowledgment and successful immediate renewal. The fresh config
+binds the external blind-criterion bytes used by the global report.
 
 ## Historical activation contract
 

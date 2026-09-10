@@ -1,3 +1,4 @@
+import fcntl
 import hashlib
 import io
 import json
@@ -2143,6 +2144,88 @@ class ForecastCliTest(unittest.TestCase):
             with self.assertRaisesRegex(cli.LedgerError, "source-pinned wrapper"):
                 cli.command_capture_activate(args)
         self.assertFalse(self.log.exists())
+
+    def test_preheld_activation_lock_requires_live_exact_locked_descriptor(self):
+        lock = self.root / "evidence.lock"
+        lock.write_bytes(b"")
+        other = self.root / "other.lock"
+        other.write_bytes(b"")
+        args = SimpleNamespace(
+            coordination_lock=str(lock),
+            preheld_coordination_lock_fd=None,
+            preheld_coordination_parent_fd=None,
+        )
+        self.assertEqual(
+            cli._activation_coordination_lock_for_append(args, live=True),
+            str(lock),
+        )
+
+        with lock.open("rb") as held:
+            args.preheld_coordination_lock_fd = held.fileno()
+            with self.assertRaisesRegex(cli.LedgerError, "restricted to live"):
+                cli._activation_coordination_lock_for_append(args, live=False)
+            with self.assertRaisesRegex(cli.LedgerError, "descriptor is invalid"):
+                cli._activation_coordination_lock_for_append(args, live=True)
+
+            parent_fd = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY)
+            self.addCleanup(os.close, parent_fd)
+            args.preheld_coordination_parent_fd = parent_fd
+            with self.assertRaisesRegex(cli.LedgerError, "not exclusively held"):
+                cli._activation_coordination_lock_for_append(args, live=True)
+
+            fcntl.flock(parent_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            try:
+                self.assertIsNone(
+                    cli._activation_coordination_lock_for_append(args, live=True)
+                )
+                with other.open("rb") as wrong:
+                    args.preheld_coordination_lock_fd = wrong.fileno()
+                    with self.assertRaisesRegex(cli.LedgerError, "does not match"):
+                        cli._activation_coordination_lock_for_append(args, live=True)
+            finally:
+                fcntl.flock(held, fcntl.LOCK_UN)
+                fcntl.flock(parent_fd, fcntl.LOCK_UN)
+
+        commit = "a" * 40
+        source_sha256 = "b" * 64
+        spec = self.root / "preheld-activation.json"
+        spec.write_text(json.dumps({
+            "runtimeSourceCommit": commit,
+            "runtimeSourceSha256": source_sha256,
+        }))
+        manifest = self.root / "preheld-manifest.json"
+        manifest.write_text("{}")
+        args.log = str(self.log)
+        args.spec = str(spec)
+        args.approval_manifest_file = str(manifest)
+        args.artifact_root = str(self.root / "artifacts")
+        args._runtime_source_commit = commit
+        args._runtime_source_sha256 = source_sha256
+        args._runtime_source_root = Path(cli.__file__).parents[2]
+        with lock.open("rb") as held:
+            parent_fd = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                fcntl.flock(parent_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                args.preheld_coordination_lock_fd = held.fileno()
+                args.preheld_coordination_parent_fd = parent_fd
+                with (
+                    mock.patch.object(cli, "_is_live_write_path", return_value=True),
+                    mock.patch.object(cli, "_require_write_authority"),
+                    mock.patch.object(
+                        cli,
+                        "append_evidence_bound_capture_activation",
+                        return_value=({"activationId": "activation-test"}, {}),
+                    ) as append,
+                    redirect_stdout(io.StringIO()),
+                ):
+                    self.assertEqual(cli.command_capture_activate(args), 0)
+                self.assertIsNone(append.call_args.kwargs["coordination_lock"])
+            finally:
+                fcntl.flock(held, fcntl.LOCK_UN)
+                fcntl.flock(parent_fd, fcntl.LOCK_UN)
+                os.close(parent_fd)
 
     def test_activation_readiness_is_read_only_and_returns_gate_status(self):
         manifest = self.root / "manifest.json"

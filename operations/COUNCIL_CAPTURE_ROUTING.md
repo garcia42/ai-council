@@ -24,7 +24,11 @@ synthetic council just to claim that capture has begun.
 
 The old September 8-14 timer and September 15 maintenance expiry belong to the
 historical activation. Do not reuse them for the fresh study. The principal
-approved `2026-09-11..17 00,12:30:00 UTC`, expiry at
+approved `2026-09-11..17 00,12:30:00 UTC` (00:30 and 12:30 UTC), expiry at
 `2026-09-18T00:00:00Z`, a 16-cycle ceiling, 1,024 objects, 2,049 calls, 64 MiB,
 30 minutes and a $2 planning allowance. Install the separate fresh unit/config
 only after their final hashes are reviewed.
+
+The historical issuance ledger is sealed at cutover. Governed resolutions of
+already-issued V1/V2 outcomes remain permitted in their existing sidecars;
+they do not reopen collection or alter the fresh study's score.

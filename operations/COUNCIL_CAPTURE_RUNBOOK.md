@@ -14,15 +14,21 @@ for artifacts and controls. Both studies use
 `.local/state/council-tools/evidence.lock`.
 
 Before sealing the old issuance digest, disable its timer, finish or preserve
-in-flight attempts and prove all collection writers quiescent. Keep one
-exclusive descriptor on the shared evidence lock from that digest through
-runtime installation, operator-routing replacement and closed-old refusal.
-Rollback keeps collection held. Release the lock only after the installed fresh
-route and exact maintenance config are verified.
+in-flight attempts and prove all collection writers quiescent. Keep file
+descriptor 8 exclusively locked on the lock's parent directory and descriptor
+9 exclusively locked on the shared evidence lock from that digest
+through runtime installation, operator-routing replacement, the activation
+append and closed-old refusal. Invoke `capture-activate` with
+`--preheld-coordination-parent-fd 8 --preheld-coordination-lock-fd 9`; do not
+invoke any other lock-taking Council
+command while the external lock is held. Rollback disables the fresh timer and
+keeps both collection routes held. Release both descriptors only after the
+installed fresh route and exact maintenance config are verified. The parent
+lock preserves the namespace custody used by the safe coordination-lock path.
 
 Do not reuse the historical September 8-14 timer, September 15 expiry, config,
 root, ACTIVE.json or unit hash for the fresh study. The approved fresh timer is
-`2026-09-11..17 00,12:30:00 UTC`; its authorization expires at
+`2026-09-11..17 00,12:30:00 UTC` (00:30 and 12:30 UTC); its authorization expires at
 `2026-09-18T00:00:00Z` and its first checkpoint is September 17. The 16-cycle
 ceiling covers preparation, the immediate service renewal and 14 scheduled
 renewals. The new timer/config must bind the reviewed runtime and operations
@@ -32,15 +38,38 @@ Real off-host preparation and restore proof must pass before fresh activation.
 Run each study report plus the global cumulative operations report before and
 after every fresh Council.
 
+Before the fresh activation exists, the global report is expected to refuse:
+missing fresh store files are invalid state (exit 1), and initialized but
+unhealthy fresh capture blocks finalization (exit 3). Create the three empty
+fresh ledger/sidecar files under the held cutover lock, then clear exit 3 only
+by completing the reviewed evidence-bound activation and immediate renewal.
+Neither transient authorizes a Council or a fallback to the historical route.
+
 Render `council-fresh-capture-evidence.service` only after the final reviewed
 commit is known. It runs
 `/home/trader/council-tools/operations/capture_evidence_cycle.py` with the
 fresh config under
 `/home/trader/.local/state/council-tools/studies/council-fresh-20260910` and its
-exact SHA-256. Install the separate
-`council-fresh-capture-evidence.timer`; never overwrite or retarget the
-historical unit. Hash and retain the rendered config and both rendered units
-in the release packet reviewed by every seat.
+exact SHA-256. The config also binds the exact external blind-criterion path
+and SHA-256 used by `study-operations-report`. Install the separate fresh
+service, non-persistent timer and alert unit disabled; never overwrite or
+retarget the historical units. Hash and retain the rendered config, driver,
+criterion, service, timer, alert unit and alert script in the release packet.
+
+Run the real prepare cycle and generation-pinned GCS restore before starting
+the continuously locked cutover. Install the fresh timer disabled. After the
+activation append, read the ledger directly while descriptor 9 remains held,
+verify its activation ID and manifest digest, create the acknowledgment files,
+and prove the installed historical route refuses collection. Then release the
+descriptor, run the immediate renewal service, and enable the timer only if
+that renewal succeeds. `Persistent=false` deliberately drops missed calendar
+slots; no catch-up run consumes the zero-headroom 16-cycle allowance.
+
+For rollback, stop and disable `council-fresh-capture-evidence.timer`, restore
+the reviewed predecessor runtime and routing, verify both timers disabled, and
+leave collection held for a new governed decision. The historical issuance
+ledger remains sealed; its governed V1/V2 resolution sidecars may still receive
+valid resolutions for outcomes that were already issued.
 
 ## Historical fixed bindings
 
@@ -55,7 +84,7 @@ in the release packet reviewed by every seat.
 
 The reviewer assignments in `OWNERSHIP.json` are operational assignments, not proof that any finding has been checked. Each sampled case gets two fresh adjudicator sessions that did not produce its original review. Keep the alias map from them. Retain actual model/version/definition identity digests and exact output artifacts; never replace unavailable reviewers with invented grades. Shared base-model errors may remain correlated even across fresh sessions.
 
-## Before every genuine council
+## Historical workflow before the prospective restart
 
 Run the installed V1 report and blind tally as usual. Also run `capture-report --json` with explicit `--log`, `--events`, and `--artifact-root` above. Inspect `activationReadiness.currentlyHealthy`, not just native exit: a valid unhealthy report can exit zero. Refuse decision finalization on invalid or unhealthy evidence; preserve incident containment/rollback exceptions. Inspect `systemctl --user status council-capture-evidence.service` and its timer on unhealthy evidence.
 
@@ -80,11 +109,11 @@ At each council, inspect whether a selected-family audit case was emitted. Weekl
 
 Grade matured exogenous outcomes using durable evidence and independent review. Use V2's separate sidecar and stable IDs; V1 forecasts stay in V1. Resolve only after the full specified resolution date. A recorded operator action is not evidence that the action helped, and several seats repeating a finding are not several prevented incidents.
 
-## Activation handoff
+## Historical activation handoff
 
 The activating operator owns this handoff. Create the V2 resolution sidecar only if absent. Append activation through the installed writer with the reviewed manifest. Re-read the live ledger under the evidence lock and match the actual activation ID and manifest digest to the prepared cycle. Only after that verification, exclusively create ACTIVE.json (actual ID/time, manifest, source and prospective study anchor) and the prepare cycle complete.json (state ACTIVATION_CONFIRMED, actual ID, manifest digest and acknowledgment time). Never mark a failed cycle successful. If interrupted after the append, reconcile that existing immutable row; do not append a replacement activation. Verify both records, current capture health and routing, then perform the first renewal using systemctl --user start council-capture-evidence.service. Enable the timer only after that real service invocation succeeds.
 
-## Evidence renewal and failure recovery
+## Historical evidence renewal and failure recovery
 
 The system timer runs the hash-bound maintenance driver every 12 hours. It generates fresh protocol rehearsal and off-host generation-pinned restore proof, then requests renewal through the installed wrapper. It cannot change original cohort, source or frozen controls. A fresh manifest alone cannot repair missing accepted history.
 

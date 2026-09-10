@@ -18,20 +18,33 @@ mutation and never fall back to V1 in the fresh study.
 
 Run `study-operations-report` without a study selector. Supply the installed
 blind-criterion digest and the old issuance digest from the actual closure
-receipt. Its study results stay separate while grading obligations, blind-seat
+receipt. Both digests must match the final release config. Its study results stay separate while grading obligations, blind-seat
 availability and spending remain cumulative.
 
 The approved fresh maintenance timer is
-`2026-09-11..17 00,12:30:00 UTC`, expires at
+`2026-09-11..17 00,12:30:00 UTC` (00:30 and 12:30 UTC), expires at
 `2026-09-18T00:00:00Z`, and has a 16-cycle ceiling. The per-cycle limits are
 1,024 objects, 2,049 adapter calls, 64 MiB and 30 minutes. Use the separate
 `council-fresh-capture-evidence.service` and `.timer`; never retarget the
 historical unit.
 
-At cutover, hold the shared evidence lock continuously from the final old-ledger
-digest through installation, replacement of these instructions, and verified
-closed-route refusal. A rollback restores the predecessor while collection
-remains held; it does not authorize resuming its old default writer. The fresh
+Install the fresh service, non-persistent timer and fresh alert unit with the
+timer disabled. Run the real prepare cycle and generation-pinned GCS restore
+before the final cutover lock. Missed timer slots are deliberately skipped.
+
+At cutover, open file descriptor 8 on the lock's parent directory and file
+descriptor 9 on the shared evidence lock. Hold exclusive `flock`s on both
+continuously from the final old-ledger digest through
+installation, replacement of these instructions, activation, and verified
+closed-route refusal. Pass the inherited descriptors only to `capture-activate`
+as `--preheld-coordination-parent-fd 8 --preheld-coordination-lock-fd 9`;
+other Council commands would try to
+reacquire the lock and must not run inside the hold. Read the activation row
+directly for the in-lock acknowledgment. Release both descriptors only after the
+installed route is verified. Then run the immediate renewal and enable the
+fresh timer only after it succeeds. A rollback stops and disables the fresh
+timer, restores the predecessor while both collection routes remain held, and
+does not authorize resuming the old default writer. The fresh
 maintenance unit and config require their own exact source/config hashes and a
 principal-approved future window. Never reuse the September 8-14 timer or the
 September 15 expiry for a fresh activation.

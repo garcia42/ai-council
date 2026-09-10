@@ -1,6 +1,6 @@
 [Unit]
 Description=Fresh AI Council bounded evidence renewal and verified off-host restore
-OnFailure=council-capture-alert.service
+OnFailure=council-fresh-capture-alert.service
 
 [Service]
 Type=oneshot

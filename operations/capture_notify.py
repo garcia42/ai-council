@@ -8,7 +8,9 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 
-def notify(credentials, *, open_url=urlopen):
+def notify(credentials, *, service='council-capture-evidence.service',
+           evidence_root='/var/lib/ai-council-evidence/live-capture-20260907',
+           open_url=urlopen):
     values={}
     for line in Path(credentials).read_text().splitlines():
         line=line.strip().removeprefix('export ')
@@ -24,7 +26,7 @@ def notify(credentials, *, open_url=urlopen):
         raise ValueError('notification credentials missing')
     data=urlencode({'token':values['PUSHOVER_TOKEN'],'user':values['PUSHOVER_USER_KEY'],
         'title':'Council capture maintenance failed','priority':0,
-        'message':'Evidence renewal on manny failed. Retained cycles require inspection; do not retry an ambiguous upload. Check council-capture-evidence.service and /var/lib/ai-council-evidence/live-capture-20260907. Capture may become unhealthy.'}).encode()
+        'message':f'Evidence renewal on manny failed. Retained cycles require inspection; do not retry an ambiguous upload. Check {service} and {evidence_root}. Capture may become unhealthy.'}).encode()
     with open_url(Request('https://api.pushover.net/1/messages.json',data=data,method='POST'),timeout=15) as response:
         result=json.loads(response.read(16384))
     if result.get('status')!=1:
@@ -33,5 +35,11 @@ def notify(credentials, *, open_url=urlopen):
 
 
 if __name__=='__main__':
+    import argparse
+    parser=argparse.ArgumentParser()
+    parser.add_argument('--service',default='council-capture-evidence.service')
+    parser.add_argument('--evidence-root',default='/var/lib/ai-council-evidence/live-capture-20260907')
+    args=parser.parse_args()
     logging.basicConfig(level=logging.INFO)
-    notify('/home/trader/.config/plaintape/pushover.env')
+    notify('/home/trader/.config/plaintape/pushover.env',service=args.service,
+           evidence_root=args.evidence_root)

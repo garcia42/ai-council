@@ -17,8 +17,10 @@ class NotificationTest(unittest.TestCase):
                 self.assertNotIn('fake-token',request.full_url)
                 self.assertIn(b'token=fake-token',request.data)
                 return io.BytesIO(b'{"status":1}')
-            notify(p,open_url=accepted)
+            notify(p,service='fresh.service',evidence_root='/fresh/root',open_url=accepted)
             self.assertEqual(len(calls),1)
+            self.assertIn(b'fresh.service',calls[0].data)
+            self.assertIn(b'%2Ffresh%2Froot',calls[0].data)
             calls.clear()
             def failed(request,timeout):
                 calls.append(request)

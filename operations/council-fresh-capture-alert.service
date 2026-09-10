@@ -1,0 +1,9 @@
+[Unit]
+Description=Notify operator of fresh Council capture evidence failure
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -B /home/trader/council-tools/operations/capture_notify.py --service council-fresh-capture-evidence.service --evidence-root /home/trader/.local/state/council-tools/studies/council-fresh-20260910
+TimeoutStartSec=20
+NoNewPrivileges=true
+UMask=0077

@@ -3,7 +3,7 @@ Description=Refresh fresh AI Council evidence every twelve hours through Septemb
 
 [Timer]
 OnCalendar=2026-09-11..17 00,12:30:00 UTC
-Persistent=true
+Persistent=false
 Unit=council-fresh-capture-evidence.service
 
 [Install]

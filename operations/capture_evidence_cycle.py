@@ -115,6 +115,9 @@ def load_runtime(config):
         digest.update(str(path.relative_to(root)).encode()+b'\0'+path.read_bytes()+b'\0')
     if digest.hexdigest() != config['runtimeSha256']:
         raise CycleError('runtime source changed')
+    criterion = Path(config['criterionPath'])
+    if hashlib.sha256(criterion.read_bytes()).hexdigest() != config['criterionSha256']:
+        raise CycleError('Council usefulness criterion changed')
     sys.path.insert(0,str(root/'src'))
     validate_study_config(config)
     wrapper(config,'report','--json')

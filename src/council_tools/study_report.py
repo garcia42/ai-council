@@ -87,9 +87,13 @@ def _combine_blind(criterion, old_rows, fresh_rows):
         trailing += old["consecutiveRequiredBlockedNonRuns"]
     combined["consecutiveRequiredBlockedNonRuns"] = trailing
     combined["operationalState"] = "BLOCKED_DEGRADED" if trailing >= 2 else "OK"
-    n, changed = combined["completedRuns"], combined["changedDecisionRuns"]
-    combined["decisionChangingRate"] = changed / n if n else None
-    combined["criterion"] = "NOT_YET_EVALUABLE" if n < 10 else "RETIRE" if changed == 0 else "KEEP"
+    # Counts and the trailing availability streak remain cumulative operational
+    # obligations.  A decision-changing rate and its kill criterion are study
+    # results, so pooling them would let the historical sample decide the fresh
+    # study on its first observation.  Each study's tally above retains its own
+    # rate and criterion.
+    combined["decisionChangingRate"] = None
+    combined["criterion"] = "NOT_APPLICABLE_SEPARATE_STUDIES"
     return old, fresh, combined
 
 

@@ -1,3 +1,4 @@
+import hashlib
 import json
 import subprocess
 import tempfile
@@ -68,6 +69,25 @@ class EvidenceCycleTest(unittest.TestCase):
         with mock.patch.object(ops.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, b'{}', b'')) as run:
             ops.wrapper({**self.config, 'wrapper': '/fixture/wrapper.py', 'study': 'council-fresh-20260910'}, 'report', '--json')
         self.assertEqual(run.call_args.args[0][-4:], ['--study', 'council-fresh-20260910', 'report', '--json'])
+
+    def test_runtime_load_binds_the_external_criterion_bytes(self):
+        runtime = Path(__file__).parents[1]
+        digest = hashlib.sha256()
+        for path in sorted((runtime/'src/council_tools').rglob('*.py')):
+            digest.update(str(path.relative_to(runtime)).encode()+b'\0'+path.read_bytes()+b'\0')
+        criterion = self.root/'criterion.py'
+        criterion.write_bytes(b'def tally(rows):\n    return {}\n')
+        config = {**self.config,
+            'runtimeCommit':'c'*40, 'runtimeSha256':digest.hexdigest(),
+            'criterionPath':str(criterion),
+            'criterionSha256':hashlib.sha256(criterion.read_bytes()).hexdigest(),
+            'wrapper':'/fixture/wrapper.py'}
+        revision = subprocess.CompletedProcess([],0,stdout='c'*40+'\n',stderr='')
+        with mock.patch.object(ops.subprocess,'run',return_value=revision), mock.patch.object(ops,'wrapper',return_value={}):
+            ops.load_runtime(config)
+            criterion.write_bytes(b'def tally(rows):\n    raise RuntimeError\n')
+            with self.assertRaisesRegex(ops.CycleError,'criterion changed'):
+                ops.load_runtime(config)
 
     def test_live_maintenance_without_selection_refuses_before_cycle_creation(self):
         with mock.patch('council_tools.cli._is_study_write_path', return_value=True):

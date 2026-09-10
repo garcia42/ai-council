@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import math
 import os
 import pwd
 import socket
+import stat
 import sys
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -767,6 +769,82 @@ def command_capture_artifact(args: argparse.Namespace) -> int:
     return 0
 
 
+def _activation_coordination_lock_for_append(
+    args: argparse.Namespace, *, live: bool
+) -> str | None:
+    """Validate a caller-owned lock retained across a live source cutover."""
+
+    fd = getattr(args, "preheld_coordination_lock_fd", None)
+    parent_fd = getattr(args, "preheld_coordination_parent_fd", None)
+    if fd is None:
+        if parent_fd is not None:
+            raise LedgerError(
+                "preheld coordination parent requires the lock descriptor"
+            )
+        return args.coordination_lock
+    if not live:
+        raise LedgerError(
+            "--preheld-coordination-lock-fd is restricted to live capture activation"
+        )
+    if fd < 0 or parent_fd is None or parent_fd < 0:
+        raise LedgerError("preheld coordination lock descriptor is invalid")
+    try:
+        descriptor = os.fstat(fd)
+        target = os.stat(args.coordination_lock, follow_symlinks=False)
+        parent_descriptor = os.fstat(parent_fd)
+        parent_target = os.stat(
+            Path(args.coordination_lock).parent, follow_symlinks=False
+        )
+    except OSError as exc:
+        raise LedgerError("preheld coordination lock descriptor is invalid") from exc
+    if (
+        not stat.S_ISREG(descriptor.st_mode)
+        or not stat.S_ISREG(target.st_mode)
+        or descriptor.st_nlink != 1
+        or target.st_nlink != 1
+        or descriptor.st_uid != os.geteuid()
+        or target.st_uid != os.geteuid()
+    ):
+        raise LedgerError("preheld coordination lock must be a regular file")
+    if (descriptor.st_dev, descriptor.st_ino) != (target.st_dev, target.st_ino):
+        raise LedgerError(
+            "preheld coordination lock descriptor does not match the lock path"
+        )
+
+    if (
+        not stat.S_ISDIR(parent_descriptor.st_mode)
+        or not stat.S_ISDIR(parent_target.st_mode)
+        or (parent_descriptor.st_dev, parent_descriptor.st_ino)
+        != (parent_target.st_dev, parent_target.st_ino)
+    ):
+        raise LedgerError("preheld coordination parent does not match the lock path")
+
+    # Separately opened descriptors must be excluded. This verifies both layers
+    # of safe_files.exclusive_lock: the pinned-parent namespace lock and the
+    # lock-file inode itself.
+    for path, flags in (
+        (
+            Path(args.coordination_lock).parent,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+        ),
+        (args.coordination_lock, os.O_RDONLY | os.O_NOFOLLOW),
+    ):
+        probe = os.open(path, flags)
+        try:
+            try:
+                fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                continue
+            else:
+                fcntl.flock(probe, fcntl.LOCK_UN)
+                raise LedgerError(
+                    "preheld coordination lock is not exclusively held"
+                )
+        finally:
+            os.close(probe)
+    return None
+
+
 def command_capture_activate(args: argparse.Namespace) -> int:
     _require_ledger_write_authority(args.log, args.coordination_lock)
     spec = _load_spec(args.spec, "capture activation spec")
@@ -809,6 +887,9 @@ def command_capture_activate(args: argparse.Namespace) -> int:
             )
         expected_commit = spec.get("runtimeSourceCommit")
         expected_source_sha256 = spec.get("runtimeSourceSha256")
+    append_coordination_lock = _activation_coordination_lock_for_append(
+        args, live=live
+    )
     escrows_before = _transaction_escrow_paths(args.log)
     if args.approval_manifest_file and args.artifact_root:
         manifest_data = Path(args.approval_manifest_file).read_bytes()
@@ -819,13 +900,13 @@ def command_capture_activate(args: argparse.Namespace) -> int:
             artifact_store=ArtifactStore(args.artifact_root),
             expected_runtime_commit=expected_commit,
             expected_source_sha256=expected_source_sha256,
-            coordination_lock=args.coordination_lock,
+            coordination_lock=append_coordination_lock,
         )
     else:
         row = append_capture_activation(
             args.log,
             spec,
-            coordination_lock=args.coordination_lock,
+            coordination_lock=append_coordination_lock,
         )
         evidence = None
     print(
@@ -1480,6 +1561,8 @@ def build_parser() -> argparse.ArgumentParser:
     activate.add_argument("--spec", required=True)
     activate.add_argument("--approval-manifest-file")
     activate.add_argument("--artifact-root", action=_ExplicitStudyPath)
+    activate.add_argument("--preheld-coordination-lock-fd", type=int)
+    activate.add_argument("--preheld-coordination-parent-fd", type=int)
     coordinated(activate, anchor_field="log", context_fields=("log",))
     activate.set_defaults(func=command_capture_activate)
 

@@ -66,14 +66,16 @@ class StudyReportTest(unittest.TestCase):
         combined = report._combine_blind(self.criterion, rows(seat('old-failure', ran=False)), rows(seat('fresh-failure', ran=False)))[2]
         self.assertEqual(combined['operationalState'], 'BLOCKED_DEGRADED')
 
-    def test_success_resets_streak_but_retains_cumulative_denominators(self):
+    def test_success_resets_streak_without_pooling_study_inference(self):
         old = rows(*(seat('old-'+str(i)) for i in range(9)), seat('old-failure', ran=False))
         fresh = rows(seat('fresh-success', changed=True), seat('fresh-failure', ran=False))
         a, b, combined = report._combine_blind(self.criterion, old, fresh)
         self.assertEqual((a['completedRuns'], b['completedRuns']), (9, 1))
         self.assertEqual(combined['completedRuns'], 10)
         self.assertEqual(combined['changedDecisionRuns'], 1)
-        self.assertEqual(combined['criterion'], 'KEEP')
+        self.assertEqual(b['criterion'], 'NOT_YET_EVALUABLE')
+        self.assertEqual(combined['criterion'], 'NOT_APPLICABLE_SEPARATE_STUDIES')
+        self.assertIsNone(combined['decisionChangingRate'])
         self.assertEqual(combined['consecutiveRequiredBlockedNonRuns'], 1)
 
     def test_cross_study_identity_reuse_and_invalid_rows_refuse(self):
