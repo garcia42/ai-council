@@ -176,42 +176,52 @@ class RuntimeContractTest(unittest.TestCase):
             self.assertIn(required, text)
 
     def test_runtime_contract_carries_the_proportionality_question(self):
-        """The proportionality mechanism must survive every install.py rendering.
+        """The deletion question must survive every install.py rendering.
 
-        install.py rewrites the skill's "## Steps" section wholesale from this file,
-        so a mechanism that is not in it is one the next install silently removes.
+        install.py rewrites the skill's "## Steps" section and its forecast-contract
+        block wholesale from these two files, so a mechanism that is not in them is
+        one the next install silently removes.  Assert the sources rather than the
+        installed skill: the rendering is verbatim, and the installed file cannot
+        carry the mechanism until install.py has run.
 
-        The two pinned strings are asserted on a single raw line, case-sensitively,
-        because a council's sealed shared outcome resolves them with line-oriented
-        ``grep -F`` against the installed skill.  The odd short wrap around
-        "not a threshold a change must pass" and around each pinned string is
-        therefore load-bearing: reflowing that prose would keep a normalizing test
-        green while making the outcome resolve false for a formatting edit.  Assert
-        the source rather than the installed skill: the rendering is verbatim, and
-        the installed file does not carry the mechanism until install.py has run.
+        ``QUESTION`` is asserted on a single raw line, case-sensitively, because a
+        council's sealed shared outcome resolves it with line-oriented ``grep -F``
+        against the installed skill.  Reflowing the paragraph so that string spans
+        two lines would break that resolution, so the wrap around it is load-bearing.
+        Nothing else here is: the other assertions are plain containment.
         """
 
+        QUESTION = "What in this diff would you delete"
         steps = (REPOSITORY_ROOT / "runtime/council-operator-steps.md").read_text(
             encoding="utf-8"
         )
-        lines = steps.splitlines()
-        for pinned in (
-            "What in this diff would you delete",
-            "third council on one piece of work",
+        carrying = [line for line in steps.splitlines() if QUESTION in line]
+        self.assertEqual(
+            len(carrying), 1, f"{QUESTION!r} must appear on exactly one line"
+        )
+
+        # The three parts are ask, report, and reach the prompt checklist.  The
+        # report half is what makes the question consequential rather than ritual,
+        # so it is asserted as explicitly as the question itself.
+        for required in (
             "not a threshold a change must pass",
-            "smallest thing that solves the problem",
+            "a bare \"nothing\" is not an answer",
+            "- **Deletion** — one line per lens",
+            "never counts toward APPROVE / CONCERN / BLOCK",
+            "say whether it was deleted and, if not, why",
         ):
-            matches = [line for line in lines if pinned in line]
-            self.assertEqual(
-                len(matches), 1, f"{pinned!r} must appear on exactly one line"
-            )
+            self.assertIn(required, steps)
+        contract = (REPOSITORY_ROOT / "runtime/council-forecast-contract.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            "together with the deletion question the operator steps require", contract
+        )
+
         # Both measurements stay cited by what they measured, not by their dates:
-        # "2026-09-12" alone occurs several times, so deleting that case entirely
-        # would leave a bare-date assertion green.
-        for measurement in (
-            "963 production lines became 269",
-            "grew to 94 lines",
-        ):
+        # "2026-09-12" alone occurs several times, so a bare-date assertion would
+        # stay green after deleting the case it is meant to protect.
+        for measurement in ("963 production lines became 269", "grew to 94 lines"):
             self.assertIn(measurement, steps)
 
     def _installed_criterion(self):

@@ -87,35 +87,16 @@ explicit principal authority and a reviewed activation plan.
    grew to 94 lines and produced three of the four defects the third council found.
    Deleting that guard was -98/+22; none of the three seats had proposed deleting it.
 
-   Proportionality is asked in two places and is deliberately **not a gate**: it is a
-   question that must get asked and reach a human,
-   not a threshold a change must pass.
-   A line-count threshold would be gamed within a week and would refuse changes that are
-   legitimately large. The first place is every lens's prompt, below. The second is here:
+   Proportionality is deliberately **not a gate**: it is a question that must get asked and
+   reach a human, not a threshold a change must pass. A line-count threshold would be gamed
+   within a week and would refuse changes that are legitimately large. It is asked in one
+   place — every lens's prompt, below.
 
-   **Convening the third council on one piece of work — or any council after it? Brief the
-   principal before any seat launches.** Rounds are counted on the *work*, and commit ids
-   cannot count them
-   — a rebase changes every SHA, which is why the 2026-09-12 rounds read as three unrelated
-   ranges in the ledger. So write the round into the attempt spec's free-text `question`,
-   as `round 2: <what is under review>`: that row is appended before any seat launches, is
-   present on every council row, and is validated only as text, so the next council can
-   count without a schema change or your memory. **If you cannot tell which round this is,
-   brief** — the block costs four lines and failing open costs a round. A revert, rollback
-   or containment change is new work and never inherits the round count of what it undoes;
-   if the principal cannot be reached during an incident, record the four lines in the row
-   and proceed. Put four lines to the principal and wait for the answer:
-
-   1. the original problem, in one sentence;
-   2. the smallest change that solves *that* problem, as you would build it today;
-   3. the current diff — production lines added and removed, and files touched;
-   4. what the delta between 2 and 3 buys, and which round added it.
-
-   Include the net production lines the round just finished added: **a round that exists to
-   close the previous round's findings and *adds* net production lines is the tell**, in
-   both measurements above. State it even when it is negative. Failing to clear twice is
-   evidence about the change, not only about the reviewers. The principal's answer is not a
-   verdict and does not gate the merge; skipping the block is the only thing forbidden here.
+   A second half, escalating to the principal before a third review round on one piece of
+   work, was built on 2026-09-12 and **deliberately dropped by principal decision** after two
+   councils on it (`run-bef6a3f931c34e22bb17ad147b333b72`,
+   `run-16d6349ccd0d4cc8b48318152c494004`): it had zero observations of working and was the
+   source of every defect those two councils found. Read those rows before proposing it again.
 
 3. **Fire all four concurrently, in a single message.** Three `Agent` calls plus one
    `Bash` call — not sequentially, and the blind seat must never see the lenses' output
