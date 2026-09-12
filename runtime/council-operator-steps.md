@@ -75,6 +75,40 @@ explicit principal authority and a reviewed activation plan.
    If you seat it, pick the role: `allocator` for business / client / fee / capacity /
    operational-readiness; `generic` for everything else.
 
+   **Proportionality — the question a council does not ask.** A council reviews a diff
+   against its own stated intent: whether it is correct, never whether it is the
+   smallest thing that solves the problem. Every round then finds real defects, every
+   round makes the diff better, and the change can get bigger and worse at the same time.
+   Twice that has been caught by a principal question and never by a seat. **2026-09-11**,
+   status-change attribution: four rounds without clearing, until the principal asked
+   whether it was still needed — 963 production lines became 269 with no schema change and
+   it cleared on the next round. **2026-09-12**, the T&R rotation-epoch repair: three
+   councils, a 9-line bug fix, and a guard added in round 2 to close a reviewer's P2 that
+   grew to 94 lines and produced three of the four defects the third council found.
+   Deleting that guard was -98/+22; none of the three seats had proposed deleting it.
+
+   Proportionality is asked in two places and is deliberately **not a gate**: it is a
+   question that must get asked and reach a human,
+   not a threshold a change must pass.
+   A line-count threshold would be gamed within a week and would refuse changes that are
+   legitimately large. The first place is every lens's prompt (step 3). The second is here:
+
+   **Convening the third council on one piece of work? Brief the principal before any seat
+   launches.** Count councils on the *work*, not on commit ids — a rebase changes every
+   SHA, which is why the 2026-09-12 rounds read as three unrelated ranges in the ledger.
+   Put four lines to the principal and wait for the answer:
+
+   1. the original problem, in one sentence;
+   2. the smallest change that solves *that* problem, as you would build it today;
+   3. the current diff — production lines added and removed, and files touched;
+   4. what the delta between 2 and 3 buys, and which round added it.
+
+   Include the net production lines the round just finished added: **a round that exists to
+   close the previous round's findings and *adds* net production lines is the tell**, in
+   both measurements above. State it even when it is negative. Failing to clear twice is
+   evidence about the change, not only about the reviewers. The principal's answer is not a
+   verdict and does not gate the merge; skipping the block is the only thing forbidden here.
+
 3. **Fire all four concurrently, in a single message.** Three `Agent` calls plus one
    `Bash` call — not sequentially, and the blind seat must never see the lenses' output
    nor they its.
@@ -88,6 +122,17 @@ explicit principal authority and a reviewed activation plan.
      ```
      /home/trader/.claude/skills/blind-seat/ask_blind.sh <role> <brief-file>
      ```
+
+   Give the three lenses one question beyond their verdict, in the same prompt:
+
+   > **Deletion.** What in this diff would you delete, and what breaks if you do? If
+   > nothing, say so in one line.
+
+   Not the blind seat — it has not seen the code. The answer is reported separately
+   (step 6) and never counts toward APPROVE / CONCERN / BLOCK. It exists because on
+   2026-09-12 the theory seat reached "a field-by-field proxy is what you write when you
+   cannot compare the thing itself" and still returned CONCERN-with-fixes: it had found the
+   94-line guard and had nowhere to say *delete this*.
 
 4. **Write the blind brief properly — this is the binding constraint.** Under a page:
    the facts available *now*, the options, the constraint that binds, and the question.
@@ -114,6 +159,10 @@ explicit principal authority and a reviewed activation plan.
      disagreement is a reason to go get more evidence, not something to average away.
      Sanity-check any claim it makes about platform mechanics — it cannot see the code
      and is occasionally confidently wrong there (1 in 7 in evaluation).
+   - **Deletion** — one line per lens: what it would delete, and what breaks. Its own
+     section, never folded into the verdict table and never scored. If the lenses name the
+     same block and the verdict table still reads two APPROVEs, report that as a
+     proportionality finding rather than a follow-up.
    - **Follow-ups** — non-blocking items, named per lens.
    - If you skipped the blind seat, **say so and say why**. Never drop it silently.
 

@@ -32,6 +32,18 @@ T&R store. That mode rejects live-knowledge paths, filesystem aliases, and non-l
 both variables are required together. It never reads or writes the council ledger and retains the
 legacy timestamp/index resolution interface only for the T&R store.
 
+### Council proportionality
+
+A council reviews a diff against its own stated intent, so it asks whether the change is correct and
+never whether it is the smallest thing that solves the problem. Every seated lens therefore answers
+one deletion question -- what would you delete, and what breaks if you do -- reported as its own
+section and never counted in the verdict. Before convening a third or later council on one piece of
+work, brief the principal first: the original problem in one sentence, the smallest change that
+solves it, the current diff's size, what the delta buys, and the net production lines the last round
+added. Count rounds on the work, not on commit ids. None of this gates a merge or changes the
+approval bar. Proportionality is a question that must reach a human,
+not a threshold a change must pass.
+
 ### Prospective usefulness capture (implemented, not automatically activated)
 
 The runtime also contains additive V2 capture commands for exact visible prompts and answers,

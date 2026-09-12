@@ -104,7 +104,9 @@ class RehearsalTest(unittest.TestCase):
         self.assertTrue(result["liveCoordinationLockUnopened"])
         self.assertTrue(result["stagedInstallClean"])
         self.assertGreater(result["isolatedCoreTests"], 0)
-        self.assertEqual(result["runtimeContractTests"], 6)
+        # Exact, not >=: a runtime-contract test that silently stops running is
+        # the failure this count exists to catch.  Bump it when adding one.
+        self.assertEqual(result["runtimeContractTests"], 7)
         self.assertEqual(
             result["runtimeContractIsolation"]["executedProofTest"],
             "test_rehearsal_audit_guard_denies_live_access_and_path_mutators",

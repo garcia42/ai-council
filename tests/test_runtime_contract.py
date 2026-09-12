@@ -175,6 +175,40 @@ class RuntimeContractTest(unittest.TestCase):
         ):
             self.assertIn(required, text)
 
+    def test_runtime_contract_carries_the_proportionality_question(self):
+        """The proportionality mechanism must survive every install.py rendering.
+
+        install.py rewrites the skill's "## Steps" section and CLAUDE.md's contract
+        block wholesale from these two files, so a mechanism that is not in them is
+        a mechanism the next install silently removes.
+        """
+
+        shared = (
+            "smallest thing that solves the problem",
+            "not a threshold a change must pass",
+        )
+        for relative_path in (
+            "runtime/council-operator-steps.md",
+            "runtime/CLAUDE_FORECAST_CONTRACT.md",
+        ):
+            text = (REPOSITORY_ROOT / relative_path).read_text(encoding="utf-8")
+            normalized = " ".join(text.split())
+            for required in shared:
+                self.assertIn(required, normalized)
+        steps = " ".join(
+            (REPOSITORY_ROOT / "runtime/council-operator-steps.md")
+            .read_text(encoding="utf-8")
+            .split()
+        )
+        # The seats are asked what they would delete, the answer is reported apart
+        # from the verdict, a third round reaches the principal, and both
+        # measurements that produced the mechanism stay cited with it.
+        self.assertIn("what in this diff would you delete", steps.lower())
+        self.assertIn("**Deletion**", steps)
+        self.assertIn("third council on one piece of work", steps)
+        self.assertIn("2026-09-11", steps)
+        self.assertIn("2026-09-12", steps)
+
     def _installed_criterion(self):
         path = RUNTIME_ROOT / "knowledge/council-eval/blind_seat_kill_criterion.py"
         spec = importlib.util.spec_from_file_location("blind_criterion_runtime", path)
