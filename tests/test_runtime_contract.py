@@ -178,36 +178,41 @@ class RuntimeContractTest(unittest.TestCase):
     def test_runtime_contract_carries_the_proportionality_question(self):
         """The proportionality mechanism must survive every install.py rendering.
 
-        install.py rewrites the skill's "## Steps" section and CLAUDE.md's contract
-        block wholesale from these two files, so a mechanism that is not in them is
-        a mechanism the next install silently removes.
+        install.py rewrites the skill's "## Steps" section wholesale from this file,
+        so a mechanism that is not in it is one the next install silently removes.
+
+        The two pinned strings are asserted on a single raw line, case-sensitively,
+        because a council's sealed shared outcome resolves them with line-oriented
+        ``grep -F`` against the installed skill.  The odd short wrap around
+        "not a threshold a change must pass" and around each pinned string is
+        therefore load-bearing: reflowing that prose would keep a normalizing test
+        green while making the outcome resolve false for a formatting edit.  Assert
+        the source rather than the installed skill: the rendering is verbatim, and
+        the installed file does not carry the mechanism until install.py has run.
         """
 
-        shared = (
-            "smallest thing that solves the problem",
+        steps = (REPOSITORY_ROOT / "runtime/council-operator-steps.md").read_text(
+            encoding="utf-8"
+        )
+        lines = steps.splitlines()
+        for pinned in (
+            "What in this diff would you delete",
+            "third council on one piece of work",
             "not a threshold a change must pass",
-        )
-        for relative_path in (
-            "runtime/council-operator-steps.md",
-            "runtime/CLAUDE_FORECAST_CONTRACT.md",
+            "smallest thing that solves the problem",
         ):
-            text = (REPOSITORY_ROOT / relative_path).read_text(encoding="utf-8")
-            normalized = " ".join(text.split())
-            for required in shared:
-                self.assertIn(required, normalized)
-        steps = " ".join(
-            (REPOSITORY_ROOT / "runtime/council-operator-steps.md")
-            .read_text(encoding="utf-8")
-            .split()
-        )
-        # The seats are asked what they would delete, the answer is reported apart
-        # from the verdict, a third round reaches the principal, and both
-        # measurements that produced the mechanism stay cited with it.
-        self.assertIn("what in this diff would you delete", steps.lower())
-        self.assertIn("**Deletion**", steps)
-        self.assertIn("third council on one piece of work", steps)
-        self.assertIn("2026-09-11", steps)
-        self.assertIn("2026-09-12", steps)
+            matches = [line for line in lines if pinned in line]
+            self.assertEqual(
+                len(matches), 1, f"{pinned!r} must appear on exactly one line"
+            )
+        # Both measurements stay cited by what they measured, not by their dates:
+        # "2026-09-12" alone occurs several times, so deleting that case entirely
+        # would leave a bare-date assertion green.
+        for measurement in (
+            "963 production lines became 269",
+            "grew to 94 lines",
+        ):
+            self.assertIn(measurement, steps)
 
     def _installed_criterion(self):
         path = RUNTIME_ROOT / "knowledge/council-eval/blind_seat_kill_criterion.py"

@@ -104,8 +104,10 @@ class RehearsalTest(unittest.TestCase):
         self.assertTrue(result["liveCoordinationLockUnopened"])
         self.assertTrue(result["stagedInstallClean"])
         self.assertGreater(result["isolatedCoreTests"], 0)
-        # Exact, not >=: a runtime-contract test that silently stops running is
-        # the failure this count exists to catch.  Bump it when adding one.
+        # Exact, not >=: this catches a runtime-contract test that is removed or
+        # stops being collected.  It does NOT catch one that starts skipping --
+        # unittest counts skips in testsRun -- which is why the rehearsal also
+        # requires one named test to report "ok" below.  Bump it when adding one.
         self.assertEqual(result["runtimeContractTests"], 7)
         self.assertEqual(
             result["runtimeContractIsolation"]["executedProofTest"],

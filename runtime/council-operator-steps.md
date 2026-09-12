@@ -91,12 +91,20 @@ explicit principal authority and a reviewed activation plan.
    question that must get asked and reach a human,
    not a threshold a change must pass.
    A line-count threshold would be gamed within a week and would refuse changes that are
-   legitimately large. The first place is every lens's prompt (step 3). The second is here:
+   legitimately large. The first place is every lens's prompt, below. The second is here:
 
-   **Convening the third council on one piece of work? Brief the principal before any seat
-   launches.** Count councils on the *work*, not on commit ids — a rebase changes every
-   SHA, which is why the 2026-09-12 rounds read as three unrelated ranges in the ledger.
-   Put four lines to the principal and wait for the answer:
+   **Convening the third council on one piece of work — or any council after it? Brief the
+   principal before any seat launches.** Rounds are counted on the *work*, and commit ids
+   cannot count them
+   — a rebase changes every SHA, which is why the 2026-09-12 rounds read as three unrelated
+   ranges in the ledger. So write the round into the attempt spec's free-text `question`,
+   as `round 2: <what is under review>`: that row is appended before any seat launches, is
+   present on every council row, and is validated only as text, so the next council can
+   count without a schema change or your memory. **If you cannot tell which round this is,
+   brief** — the block costs four lines and failing open costs a round. A revert, rollback
+   or containment change is new work and never inherits the round count of what it undoes;
+   if the principal cannot be reached during an incident, record the four lines in the row
+   and proceed. Put four lines to the principal and wait for the answer:
 
    1. the original problem, in one sentence;
    2. the smallest change that solves *that* problem, as you would build it today;
@@ -126,10 +134,11 @@ explicit principal authority and a reviewed activation plan.
    Give the three lenses one question beyond their verdict, in the same prompt:
 
    > **Deletion.** What in this diff would you delete, and what breaks if you do? If
-   > nothing, say so in one line.
+   > nothing, say so in one line **and say what you examined and why removing it fails** —
+   > a bare "nothing" is not an answer.
 
-   Not the blind seat — it has not seen the code. The answer is reported separately
-   (step 6) and never counts toward APPROVE / CONCERN / BLOCK. It exists because on
+   Not the blind seat — it has not seen the code. The answer is reported in its own
+   section and never counts toward APPROVE / CONCERN / BLOCK. It exists because on
    2026-09-12 the theory seat reached "a field-by-field proxy is what you write when you
    cannot compare the thing itself" and still returned CONCERN-with-fixes: it had found the
    94-line guard and had nowhere to say *delete this*.
@@ -160,9 +169,9 @@ explicit principal authority and a reviewed activation plan.
      Sanity-check any claim it makes about platform mechanics — it cannot see the code
      and is occasionally confidently wrong there (1 in 7 in evaluation).
    - **Deletion** — one line per lens: what it would delete, and what breaks. Its own
-     section, never folded into the verdict table and never scored. If the lenses name the
-     same block and the verdict table still reads two APPROVEs, report that as a
-     proportionality finding rather than a follow-up.
+     section, never folded into the verdict table and never scored. If **any** lens
+     proposes a deletion, say whether it was deleted and, if not, why: that is the
+     difference between a question that is answered and one that is only asked.
    - **Follow-ups** — non-blocking items, named per lens.
    - If you skipped the blind seat, **say so and say why**. Never drop it silently.
 

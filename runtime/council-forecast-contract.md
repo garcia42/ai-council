@@ -87,7 +87,8 @@ authority rule, rehearse on that host, and rerun the council activation review.
    second overwrote the first between its creation and its blind launch, and one blind answer
    became unattributable to the question it was actually given.
 
-5. Put the byte-identical shared outcome and evidence cutoff in every seated reviewer's prompt.
+5. Put the byte-identical shared outcome and evidence cutoff in every seated reviewer's prompt,
+   together with the deletion question the operator steps require of the three lenses.
    Each reviewer must end with:
 
    `SHARED_PROBABILITY: <0-100>%`
