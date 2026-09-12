@@ -88,7 +88,8 @@ authority rule, rehearse on that host, and rerun the council activation review.
    became unattributable to the question it was actually given.
 
 5. Put the byte-identical shared outcome and evidence cutoff in every seated reviewer's prompt,
-   together with the deletion question the operator steps require of the three lenses.
+   together with the deletion question the operator steps require of the three lenses
+   (never the blind seat).
    Each reviewer must end with:
 
    `SHARED_PROBABILITY: <0-100>%`

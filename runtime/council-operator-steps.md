@@ -95,8 +95,9 @@ explicit principal authority and a reviewed activation plan.
    A second half, escalating to the principal before a third review round on one piece of
    work, was built on 2026-09-12 and **deliberately dropped by principal decision** after two
    councils on it (`run-bef6a3f931c34e22bb17ad147b333b72`,
-   `run-16d6349ccd0d4cc8b48318152c494004`): it had zero observations of working and was the
-   source of every defect those two councils found. Read those rows before proposing it again.
+   `run-16d6349ccd0d4cc8b48318152c494004`): it fired once, self-applied by its own author
+   before it was ever installed, and carried three of the seven defects those two councils
+   found. Read those rows before proposing it again.
 
 3. **Fire all four concurrently, in a single message.** Three `Agent` calls plus one
    `Bash` call — not sequentially, and the blind seat must never see the lenses' output

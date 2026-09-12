@@ -188,7 +188,9 @@ class RuntimeContractTest(unittest.TestCase):
         council's sealed shared outcome resolves it with line-oriented ``grep -F``
         against the installed skill.  Reflowing the paragraph so that string spans
         two lines would break that resolution, so the wrap around it is load-bearing.
-        Nothing else here is: the other assertions are plain containment.
+        Everything else is whitespace-normalized first, as the sibling test above
+        does, so that a semantics-preserving reflow of those paragraphs does not red
+        the suite for a reason no sealed outcome depends on.
         """
 
         QUESTION = "What in this diff would you delete"
@@ -203,26 +205,39 @@ class RuntimeContractTest(unittest.TestCase):
         # The three parts are ask, report, and reach the prompt checklist.  The
         # report half is what makes the question consequential rather than ritual,
         # so it is asserted as explicitly as the question itself.
+        normalized = " ".join(steps.split())
         for required in (
             "not a threshold a change must pass",
-            "a bare \"nothing\" is not an answer",
+            'a bare "nothing" is not an answer',
             "- **Deletion** — one line per lens",
             "never counts toward APPROVE / CONCERN / BLOCK",
+            # The report bullet's own scoping clause.  The line above it lives in the
+            # ask half, so without this one the bullet could be tightened into
+            # "folded into the verdict table and scored" with a green suite.
+            "never folded into the verdict table and never scored",
             "say whether it was deleted and, if not, why",
+            # The tombstone for the deleted escalation half.  It carries the two
+            # council runIds that stop the next reader rebuilding 29 lines and
+            # three defects; both lens seats named it the best-value text here.
+            "Read those rows before proposing it again",
         ):
-            self.assertIn(required, steps)
-        contract = (REPOSITORY_ROOT / "runtime/council-forecast-contract.md").read_text(
-            encoding="utf-8"
+            self.assertIn(required, normalized)
+        contract = " ".join(
+            (REPOSITORY_ROOT / "runtime/council-forecast-contract.md")
+            .read_text(encoding="utf-8")
+            .split()
         )
         self.assertIn(
-            "together with the deletion question the operator steps require", contract
+            "together with the deletion question the operator steps require of the "
+            "three lenses (never the blind seat)",
+            contract,
         )
 
         # Both measurements stay cited by what they measured, not by their dates:
         # "2026-09-12" alone occurs several times, so a bare-date assertion would
         # stay green after deleting the case it is meant to protect.
         for measurement in ("963 production lines became 269", "grew to 94 lines"):
-            self.assertIn(measurement, steps)
+            self.assertIn(measurement, normalized)
 
     def _installed_criterion(self):
         path = RUNTIME_ROOT / "knowledge/council-eval/blind_seat_kill_criterion.py"
