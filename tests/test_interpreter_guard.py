@@ -16,6 +16,7 @@ skips explicitly rather than silently when none is present.
 """
 
 import ast
+import os
 import pathlib
 import subprocess
 import sys
@@ -42,9 +43,10 @@ def test_supported_interpreter_is_accepted():
 def test_the_interpreter_that_broke_the_ledger_read_is_refused():
     with pytest.raises(SystemExit) as excinfo:
         _assert_supported_interpreter((3, 10, 18))
-    # An int, and exactly 2. Exit 1 would mean "the ledger is in invalid state", which is
-    # the false conclusion this guard exists to prevent, so 1 must fail this test.
-    assert excinfo.value.code == UNSUPPORTED_INTERPRETER_EXIT
+    # The literal 2 only. `== UNSUPPORTED_INTERPRETER_EXIT` compared the constant to
+    # itself: with that constant mutated to 1 it PASSED while this line failed, which is
+    # the same vacuous-assertion class already removed from this file. Exit 1 would mean
+    # "the ledger is in invalid state", the false conclusion this guard exists to prevent.
     assert excinfo.value.code == 2
 
 
@@ -124,14 +126,16 @@ def test_the_guard_can_speak_on_interpreters_older_than_it_requires():
     )
 
 
+_UNSUPPORTED_CANDIDATES = (
+    "/home/trader/pysystemtrade/venv/bin/python3",
+    "/usr/bin/python3.10",
+    "/usr/bin/python3.9",
+)
+
+
 def _unsupported_interpreter():
     """Any interpreter on this host older than the declared minimum, or None."""
-    candidates = [
-        "/home/trader/pysystemtrade/venv/bin/python3",
-        "/usr/bin/python3.10",
-        "/usr/bin/python3.9",
-    ]
-    for candidate in candidates:
+    for candidate in _UNSUPPORTED_CANDIDATES:
         path = pathlib.Path(candidate)
         if not path.exists():
             continue
@@ -163,7 +167,21 @@ def test_subprocess_import_on_an_unsupported_interpreter_exits_two():
     """
     interpreter = _unsupported_interpreter()
     if interpreter is None:
-        pytest.skip("no sub-3.11 interpreter on this host to test the refusal against")
+        # FAIL, do not skip.  This is the only out-of-process proof of the refusal and it
+        # kills most of the mutations the guard is reviewed against, but every candidate it
+        # searches lives in another project's virtualenv -- and PATH's `python3`,
+        # `python3.11` and `python` all resolve into that same venv, so they vanish
+        # together when it is rebuilt on 3.11.  A skip would then go green and silent among
+        # the skips the suite already has, exactly the blind spot tests/test_rehearse.py
+        # names and anchors for its own neighbour suite.
+        # Set COUNCIL_ALLOW_NO_OLD_INTERPRETER=1 to opt out deliberately and visibly.
+        if os.environ.get("COUNCIL_ALLOW_NO_OLD_INTERPRETER") == "1":
+            pytest.skip("opted out: COUNCIL_ALLOW_NO_OLD_INTERPRETER=1")
+        pytest.fail(
+            "no sub-3.11 interpreter on this host, so the end-to-end refusal is unproven; "
+            f"searched {_UNSUPPORTED_CANDIDATES}. Install one, or set "
+            "COUNCIL_ALLOW_NO_OLD_INTERPRETER=1 to accept the loss of this proof."
+        )
     result = subprocess.run(
         [interpreter, "-c", "import council_tools"],
         capture_output=True,

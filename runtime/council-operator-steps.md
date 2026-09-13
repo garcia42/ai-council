@@ -212,16 +212,26 @@ explicit principal authority and a reviewed activation plan.
    Name the interpreter by absolute path here in particular: this script does not import
    `council_tools`, so the import guard that refuses an unsupported interpreter cannot
    protect it. It carries its own copy of the same parser, and a value it cannot read
-   becomes a record error, so an older interpreter makes the tally report a healthy ledger
-   as invalid and exit 1 -- the same false conclusion the guard prevents, in the one tool
-   the guard cannot reach. Measured with a 9-digit fractional timestamp planted in a ledger
-   copy: 3.10 rejects every `council-superseded` row it cannot parse, so those supersedes go
-   unapplied -- `superseded_rows` falls to 0 and `completed` rises by exactly the number of
-   rows that should have been retired. The retained duplicates then collide on their brief
-   paths, so the loudest errors read `brief path also used on line ...`, which points at the
-   duplicate-blind-brief recovery procedure rather than at the interpreter. No counts are
-   quoted here because they move with every append; reproduce against a copy of the current
-   ledger. Do not read a tally exit 1 as a ledger fault until you have confirmed the
+   becomes a record error rather than a warning, so an older interpreter can make the tally
+   report a healthy ledger as invalid and exit 1 -- the same false conclusion the guard
+   prevents, in the one tool the guard cannot reach.
+
+   LATENT TODAY, NOT CURRENT, and do not go looking for it in the live ledger. Every
+   `council-superseded` row carries six fractional digits, and the only longer timestamps in
+   the ledger are `sharedOutcome.evidenceCutoffAt` values, a field this script never reads.
+   Both interpreters therefore read the live ledger identically. The exposure is an
+   operator-supplied `--approved-at` (`cli.py`, which falls back to now() only when the flag
+   is omitted): a 3.11 appender accepts a nanosecond value that a 3.10 reader then rejects.
+   Reproducing this needs a PLANTED value in a COPY, not today's ledger.
+
+   Measured that way -- a 9-digit fraction planted into the supersede rows of a ledger copy --
+   3.10 rejects each row it cannot parse, so those supersedes go unapplied: `superseded_rows`
+   falls to 0 and `completed` rises by the number of rows that should have been retired, and
+   the retained duplicates then collide on their brief paths. The errors arrive in two pairs,
+   malformed timestamps FIRST and `brief path also used on line ...` second. None of them
+   names the interpreter, so the first thing you see is a data fault and the second points at
+   the duplicate-blind-brief recovery procedure. No counts are quoted because they move with
+   every append. Do not read a tally exit 1 as a ledger fault until you have confirmed the
    interpreter.
 
    Surface any non-zero result in the council report. Exit 1 is an invalid ledger; exit 2

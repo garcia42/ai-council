@@ -179,7 +179,13 @@ class RuntimeContractTest(unittest.TestCase):
             self.assertIn(required, text)
 
     def test_documented_council_tool_invocations_name_a_supported_interpreter(self):
-        """No documented command may reach a council tool through a PATH-resolved interpreter.
+        """Neither anchored council script may be invoked through a PATH-resolved interpreter.
+
+        Scoped deliberately to ``predictions_report.py`` and ``blind_seat_kill_criterion.py``.
+        A broader claim would be false: README.md documents ``python -m council_tools.cli``
+        and passes, because a module invocation names no script path for this regex to
+        anchor. Those reach the guard, which refuses them honestly; the two anchored
+        scripts are the ones where the documented command is doing real work.
 
         One rule over two surfaces, because two tests with two rules were incoherent: the
         earlier pair demanded literally ``/usr/bin/python3.11`` in the rendered docs while
