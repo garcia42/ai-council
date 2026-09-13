@@ -215,10 +215,14 @@ explicit principal authority and a reviewed activation plan.
    becomes a record error, so an older interpreter makes the tally report a healthy ledger
    as invalid and exit 1 -- the same false conclusion the guard prevents, in the one tool
    the guard cannot reach. Measured with a 9-digit fractional timestamp planted in a ledger
-   copy: 3.10 exits 1, reports `completed=403 superseded_rows=0` against the true 401/2, and
-   blames `brief path also used on line ...` -- which points at the duplicate-blind-brief
-   recovery procedure rather than at the interpreter. Do not read a tally exit 1 as a ledger
-   fault until you have confirmed the interpreter.
+   copy: 3.10 rejects every `council-superseded` row it cannot parse, so those supersedes go
+   unapplied -- `superseded_rows` falls to 0 and `completed` rises by exactly the number of
+   rows that should have been retired. The retained duplicates then collide on their brief
+   paths, so the loudest errors read `brief path also used on line ...`, which points at the
+   duplicate-blind-brief recovery procedure rather than at the interpreter. No counts are
+   quoted here because they move with every append; reproduce against a copy of the current
+   ledger. Do not read a tally exit 1 as a ledger fault until you have confirmed the
+   interpreter.
 
    Surface any non-zero result in the council report. Exit 1 is an invalid ledger; exit 2
    is `BLOCKED_DEGRADED` and blocks a decision-shaped gate until a required seat completes.
