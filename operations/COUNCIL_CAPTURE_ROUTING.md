@@ -9,9 +9,9 @@ attempt, repair or backfill a V2 run, or treat a later V1 Council as V2 data.
 New Councils use the original V1 workflow against `--study council-legacy`:
 
 ```text
-python3 /home/trader/.claude/knowledge/council-eval/predictions_report.py \
+/usr/bin/python3.11 /home/trader/.claude/knowledge/council-eval/predictions_report.py \
   --study council-legacy attempt ...
-python3 /home/trader/.claude/knowledge/council-eval/predictions_report.py \
+/usr/bin/python3.11 /home/trader/.claude/knowledge/council-eval/predictions_report.py \
   --study council-legacy complete ...
 ```
 

@@ -46,7 +46,6 @@ def test_the_interpreter_that_broke_the_ledger_read_is_refused():
     # the false conclusion this guard exists to prevent, so 1 must fail this test.
     assert excinfo.value.code == UNSUPPORTED_INTERPRETER_EXIT
     assert excinfo.value.code == 2
-    assert excinfo.value.code != 1
 
 
 def test_refusal_blames_the_interpreter_and_not_the_ledger(capsys):
@@ -88,7 +87,9 @@ def test_minimum_matches_the_declared_requirement():
     declared = pyproject["project"]["requires-python"]
     assert declared.startswith(">="), f"unexpected requires-python form: {declared!r}"
     wanted = tuple(int(part) for part in declared[2:].strip().split("."))
-    assert MINIMUM_PYTHON == wanted[: len(MINIMUM_PYTHON)]
+    # Compared whole, not sliced by MINIMUM_PYTHON itself: slicing by the value under
+    # test let MINIMUM_PYTHON = (3,) satisfy the assertion named for exactly that drift.
+    assert MINIMUM_PYTHON == wanted
 
 
 def test_the_guard_can_speak_on_interpreters_older_than_it_requires():
@@ -145,7 +146,11 @@ def _unsupported_interpreter():
             version = tuple(int(part) for part in probe.stdout.strip().split("."))
         except ValueError:
             continue
-        if version < MINIMUM_PYTHON:
+        # (3, 11) literal, NOT MINIMUM_PYTHON: deriving the probe's threshold from the
+        # constant under test let `MINIMUM_PYTHON = (3, 10)` make this search find
+        # nothing, so the end-to-end proof skipped itself out of existence under the
+        # one mutation it exists to catch.
+        if version < (3, 11):
             return str(path)
     return None
 
@@ -165,9 +170,12 @@ def test_subprocess_import_on_an_unsupported_interpreter_exits_two():
         text=True,
         env={"PYTHONPATH": str(REPO_ROOT / "src"), "PATH": "/usr/bin:/bin"},
     )
-    assert result.returncode == UNSUPPORTED_INTERPRETER_EXIT, (
-        f"expected exit {UNSUPPORTED_INTERPRETER_EXIT}, got {result.returncode}; "
-        f"stderr={result.stderr!r}"
+    # The literal 2, not the constant: asserting against UNSUPPORTED_INTERPRETER_EXIT is
+    # constant-relative, so redefining that constant to 1 left this test PASSING -- and the
+    # sealed shared outcome names "exit status EXACTLY 2", out of process.
+    assert result.returncode == 2, (
+        f"expected exit 2, got {result.returncode}; stderr={result.stderr!r}"
     )
+    assert result.returncode == UNSUPPORTED_INTERPRETER_EXIT
     assert "requires Python" in result.stderr
     assert "ledger is not the problem" in result.stderr.lower()

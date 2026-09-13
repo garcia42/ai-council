@@ -97,7 +97,7 @@ valid resolutions for outcomes that were already issued.
 
 - Principal/study owner: the user. Execution/backup operator: `manny-capture-maintenance`, the pinned scheduled process on manny.
 - Installed runtime: `/home/trader/council-tools`, commit `4ca5c08b97e1ef10ed2c3c5d585a6747275c658c`.
-- Writer: `python3 -B /home/trader/.claude/knowledge/council-eval/predictions_report.py`.
+- Writer: `/usr/bin/python3.11 -B /home/trader/.claude/knowledge/council-eval/predictions_report.py`.
 - Ledger: `/home/trader/.claude/knowledge/futures-panel-log.jsonl`.
 - V2 resolutions: `/home/trader/.claude/knowledge/council-eval/capture_resolved.jsonl`.
 - Artifact root: `/var/lib/ai-council-evidence/live-capture-20260907/artifacts`.

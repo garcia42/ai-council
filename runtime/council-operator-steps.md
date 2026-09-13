@@ -211,8 +211,14 @@ explicit principal authority and a reviewed activation plan.
    ```
    Name the interpreter by absolute path here in particular: this script does not import
    `council_tools`, so the import guard that refuses an unsupported interpreter cannot
-   protect it. It carries its own timestamp parser that returns False on a value it cannot
-   read, so an older interpreter degrades the tally quietly instead of refusing.
+   protect it. It carries its own copy of the same parser, and a value it cannot read
+   becomes a record error, so an older interpreter makes the tally report a healthy ledger
+   as invalid and exit 1 -- the same false conclusion the guard prevents, in the one tool
+   the guard cannot reach. Measured with a 9-digit fractional timestamp planted in a ledger
+   copy: 3.10 exits 1, reports `completed=403 superseded_rows=0` against the true 401/2, and
+   blames `brief path also used on line ...` -- which points at the duplicate-blind-brief
+   recovery procedure rather than at the interpreter. Do not read a tally exit 1 as a ledger
+   fault until you have confirmed the interpreter.
 
    Surface any non-zero result in the council report. Exit 1 is an invalid ledger; exit 2
    is `BLOCKED_DEGRADED` and blocks a decision-shaped gate until a required seat completes.

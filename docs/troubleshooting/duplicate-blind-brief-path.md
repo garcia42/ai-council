@@ -74,14 +74,14 @@ Abandon the attempt and start a new council with a run-scoped brief. An abandone
 sanctioned path. It requires the ledger authority host and explicit principal approval.
 
 ```
-python3 ~/.claude/knowledge/council-eval/predictions_report.py \
+/usr/bin/python3.11 ~/.claude/knowledge/council-eval/predictions_report.py \
   plan-brief-recovery --ledger <ledger> --target-line <line> \
   --replacement-source <the bytes that seat actually read> \
   --operator <name> --approval-reference <where approval was given> \
   --approval-reason <why> > <spec.json>
 
 # read the spec, then:
-python3 ~/.claude/knowledge/council-eval/predictions_report.py \
+/usr/bin/python3.11 ~/.claude/knowledge/council-eval/predictions_report.py \
   recover-brief --spec <spec.json> --confirm-operator-approved-rewrite
 ```
 
@@ -115,7 +115,7 @@ including when a legitimate append has landed on top of the repaired one. If bot
 one topic collide at creation rather than silently sharing bytes:
 
 ```
-python3 ~/.claude/knowledge/council-eval/predictions_report.py \
+/usr/bin/python3.11 ~/.claude/knowledge/council-eval/predictions_report.py \
   prepare-brief --run-id <runId> --source <draft> \
   --destination <briefs-dir>/<date>-<topic>-<runId>.md \
   --expected-sha256 <sha256 of the draft>

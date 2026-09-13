@@ -220,7 +220,7 @@ n = int(sys.argv[1])
 print(n, hashlib.sha256(raw[n - 1]).hexdigest())
 ' <line>
 
-python3 ~/.claude/knowledge/council-eval/predictions_report.py \
+/usr/bin/python3.11 ~/.claude/knowledge/council-eval/predictions_report.py \
   supersede --log ~/.claude/knowledge/futures-panel-log.jsonl \
   --line <line> --confirm-raw-line-sha256 <digest of that exact line> \
   --duplicate-of-line <retained-line> \

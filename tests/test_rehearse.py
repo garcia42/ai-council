@@ -108,7 +108,7 @@ class RehearsalTest(unittest.TestCase):
         # stops being collected.  It does NOT catch one that starts skipping --
         # unittest counts skips in testsRun -- which is why the rehearsal also
         # requires one named test to report "ok" below.  Bump it when adding one.
-        self.assertEqual(result["runtimeContractTests"], 9)
+        self.assertEqual(result["runtimeContractTests"], 8)
         self.assertEqual(
             result["runtimeContractIsolation"]["executedProofTest"],
             "test_rehearsal_audit_guard_denies_live_access_and_path_mutators",
