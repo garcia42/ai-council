@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -174,6 +175,91 @@ class RuntimeContractTest(unittest.TestCase):
             "grading debt",
         ):
             self.assertIn(required, text)
+
+    def test_rendered_runtime_docs_name_a_supported_interpreter(self):
+        """Every interpreter the rendered procedure hands an operator must be a real 3.11.
+
+        install.py renders these files verbatim into the installed skill, so a command
+        written here is a command an operator copies.  On this host `python3` AND
+        `python3.11` on PATH both resolve to a 3.10 build, so a bare name is a trap:
+        under 3.10 `datetime.fromisoformat` rejects the nanosecond `evidenceCutoffAt`
+        values the appender wrote, and the council tools report a healthy ledger as
+        invalid.  The import guard in council_tools turns that into an honest exit 2,
+        but only for tools that import council_tools -- and
+        `blind_seat_kill_criterion.py` does not.  It carries its own copy of the same
+        parser inside `except (OverflowError, ValueError): return False`, so an
+        unsupported interpreter there degrades the tally silently instead of refusing.
+        The documented invocation is therefore the only control, which is why this is
+        asserted rather than left to the guard.
+
+        Matches an *invocation* -- a python3 name followed by an argument -- so that
+        prose naming the trap (``python3`` and ``python3.11`` on PATH) is not flagged.
+        """
+        invocation = re.compile(r"(?P<prefix>\S*)python3(?P<minor>\.\d+)?(?=\s+[-/~<])")
+        offenders = []
+        for relative_path in (
+            "runtime/council-operator-steps.md",
+            "runtime/council-forecast-contract.md",
+            "runtime/CLAUDE_FORECAST_CONTRACT.md",
+        ):
+            text = (REPOSITORY_ROOT / relative_path).read_text(encoding="utf-8")
+            for number, line in enumerate(text.splitlines(), start=1):
+                for match in invocation.finditer(line):
+                    named = match.group("prefix") + "python3" + (match.group("minor") or "")
+                    if named != "/usr/bin/python3.11":
+                        offenders.append(f"{relative_path}:{number}: {named}")
+        self.assertEqual(
+            offenders,
+            [],
+            "rendered runtime docs must invoke /usr/bin/python3.11 by absolute path; "
+            "found: " + "; ".join(offenders),
+        )
+
+    def test_documented_tally_invocations_name_a_supported_interpreter(self):
+        """`blind_seat_kill_criterion.py` is unguarded, so its documented command is the control.
+
+        Separate from the rendered-docs check above because the reason differs.  There the
+        risk is that install.py copies a trap into the installed skill.  Here it is that
+        this particular script cannot be protected at all: it does not import
+        `council_tools`, so the import guard never runs for it, and its
+        `_supersede_timestamp_is_valid` swallows a parse failure with `return False`.  A
+        wrong interpreter therefore produces a *plausible wrong tally* rather than a
+        refusal -- and the forecast contract requires surfacing a non-zero tally, which
+        makes a silently-wrong zero the worst available outcome.
+
+        The rule enforced is "never PATH-resolved", not "must be one blessed path": the
+        trap that caused this is PATH resolution -- `python3` and `python3.11` here both
+        resolve to a 3.10 build -- so an absolute path is the property that makes the
+        invocation auditable.  Playbooks that already pin
+        `/home/trader/ai-council/.venv/bin/python` therefore pass on their own merit
+        rather than by accident of spelling.
+
+        Every markdown file in the repository is scanned, not a fixed list, because a new
+        playbook naming the tally is exactly the drift this is meant to catch, and the
+        match spans a trailing backslash so a continuation-line invocation cannot hide.
+        """
+        invocation = re.compile(
+            r"(?P<interpreter>\S*python[\d.]*)\s+(?:\\\n\s*)?\S*blind_seat_kill_criterion\.py"
+        )
+        offenders = []
+        for path in sorted(REPOSITORY_ROOT.rglob("*.md")):
+            if ".git" in path.parts:
+                continue
+            text = path.read_text(encoding="utf-8")
+            for match in invocation.finditer(text):
+                interpreter = match.group("interpreter")
+                if interpreter.startswith("/"):
+                    continue
+                number = text.count("\n", 0, match.start()) + 1
+                relative = path.relative_to(REPOSITORY_ROOT)
+                offenders.append(f"{relative}:{number}: {interpreter}")
+        self.assertEqual(
+            offenders,
+            [],
+            "the blind-seat tally is unguarded, so it must never be invoked through a "
+            "PATH-resolved interpreter name; give an absolute path. Found: "
+            + "; ".join(offenders),
+        )
 
     def test_runtime_contract_carries_the_proportionality_question(self):
         """The deletion question must survive every install.py rendering.

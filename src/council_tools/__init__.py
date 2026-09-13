@@ -1,5 +1,12 @@
 """Council forecast ledger tools."""
 
+# Deferred so the annotation below is never evaluated at import. A PEP 604 union on a
+# builtin generic needs 3.10, and an interpreter that cannot evaluate it dies with an
+# uncaught TypeError -- exit 1, this CLI's code for an invalid ledger, which is the
+# false verdict the guard below exists to prevent. The guard must outlive its own
+# syntax.
+from __future__ import annotations
+
 import sys
 
 MINIMUM_PYTHON = (3, 11)

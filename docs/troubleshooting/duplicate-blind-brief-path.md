@@ -47,8 +47,8 @@ Establish, in this order, and write down the hashes as you go:
 ```
 sha256sum ~/.claude/knowledge/futures-panel-log.jsonl
 wc -lc     ~/.claude/knowledge/futures-panel-log.jsonl
-python3 ~/.claude/knowledge/council-eval/blind_seat_kill_criterion.py --json
-python3 ~/.claude/knowledge/council-eval/predictions_report.py report
+/usr/bin/python3.11 ~/.claude/knowledge/council-eval/blind_seat_kill_criterion.py --json
+/usr/bin/python3.11 ~/.claude/knowledge/council-eval/predictions_report.py report
 ```
 
 Then identify which run owns the surviving file:

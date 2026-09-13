@@ -91,6 +91,38 @@ def test_minimum_matches_the_declared_requirement():
     assert MINIMUM_PYTHON == wanted[: len(MINIMUM_PYTHON)]
 
 
+def test_the_guard_can_speak_on_interpreters_older_than_it_requires():
+    """The guard must not need the interpreter it is refusing in order to refuse it.
+
+    `_assert_supported_interpreter` is annotated `tuple[int, ...] | None`.  PEP 604
+    unions on builtin generics are a 3.10 feature, and without
+    `from __future__ import annotations` that expression is evaluated when the `def`
+    executes -- at import, before the guard can run.  On 3.9 or older the module would
+    therefore raise an uncaught TypeError, and an uncaught exception exits 1: the exact
+    status that means "the ledger is in invalid state" and the exact false conclusion
+    this whole guard exists to prevent.
+
+    Deferring annotations costs nothing and keeps the refusal working on any interpreter
+    old enough to reach it.  Asserted against the AST rather than by running an old
+    interpreter because this host has none below 3.10, so a runtime check would skip
+    and prove nothing.
+    """
+    source = pathlib.Path(council_tools.__file__).read_text()
+    module = ast.parse(source)
+    deferred = [
+        node
+        for node in module.body
+        if isinstance(node, ast.ImportFrom)
+        and node.module == "__future__"
+        and any(alias.name == "annotations" for alias in node.names)
+    ]
+    assert deferred, (
+        "council_tools/__init__.py evaluates its annotations at import time, so an "
+        "interpreter older than the annotation syntax fails with an uncaught TypeError "
+        "(exit 1) instead of the guard's exit 2"
+    )
+
+
 def _unsupported_interpreter():
     """Any interpreter on this host older than the declared minimum, or None."""
     candidates = [

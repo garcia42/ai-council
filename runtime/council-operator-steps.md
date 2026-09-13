@@ -45,7 +45,7 @@ explicit principal authority and a reviewed activation plan.
    git history:
 
    ```
-   git -C <worktree> rev-list <base>..HEAD | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read().split()))'
+   git -C <worktree> rev-list <base>..HEAD | /usr/bin/python3.11 -c 'import sys,json; print(json.dumps(sys.stdin.read().split()))'
    ```
 
    Existing rows are inconsistent here -- 30 objects, 19 nulls, 15 arrays as of
@@ -207,8 +207,13 @@ explicit principal authority and a reviewed activation plan.
 
    Immediately after `complete` returns, run:
    ```
-   python3 /home/trader/.claude/knowledge/council-eval/blind_seat_kill_criterion.py
+   /usr/bin/python3.11 /home/trader/.claude/knowledge/council-eval/blind_seat_kill_criterion.py
    ```
+   Name the interpreter by absolute path here in particular: this script does not import
+   `council_tools`, so the import guard that refuses an unsupported interpreter cannot
+   protect it. It carries its own timestamp parser that returns False on a value it cannot
+   read, so an older interpreter degrades the tally quietly instead of refusing.
+
    Surface any non-zero result in the council report. Exit 1 is an invalid ledger; exit 2
    is `BLOCKED_DEGRADED` and blocks a decision-shaped gate until a required seat completes.
 

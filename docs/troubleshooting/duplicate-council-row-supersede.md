@@ -56,7 +56,7 @@ instruction that invited it could be removed.
 ```
 sha256sum ~/.claude/knowledge/futures-panel-log.jsonl
 wc -lc    ~/.claude/knowledge/futures-panel-log.jsonl
-python3 ~/.claude/knowledge/council-eval/blind_seat_kill_criterion.py --json
+/usr/bin/python3.11 ~/.claude/knowledge/council-eval/blind_seat_kill_criterion.py --json
 ```
 
 For each line the gate names, compare it against the line it duplicates:
