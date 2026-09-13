@@ -13,14 +13,14 @@ authority rule, rehearse on that host, and rerun the council activation review.
 1. Run the report:
 
    ```
-   python3 /home/trader/.claude/knowledge/council-eval/predictions_report.py report
+   /usr/bin/python3.11 /home/trader/.claude/knowledge/council-eval/predictions_report.py report
    ```
 
    Exit 1 is invalid state and stops the council. Restore a damaged sidecar from its verified
    installer/operator backup or use the narrowly scoped torn-tail procedure below; never skip an
    invalid record. Exit 3 is grading debt: continue convening and
    collecting the council, but mark decision finalization or shipping BLOCKED until the debt is
-   resolved or a principal-approved override is logged. Exit 2 is a command usage error. `--today`
+   resolved or a principal-approved override is logged. Exit 2 is a command usage error, which includes running the tool on an interpreter older than the `requires-python` it declares: `python3` and `python3.11` on PATH may both be older builds, so these steps name `/usr/bin/python3.11` explicitly. An unsupported interpreter exits 2 and says so; it never exits 1, because 1 means the ledger is invalid and an environment fault must not be reported as a data fault. `--today`
    is test-only and is rejected for live council paths.
 
    Exit 3 never blocks incident containment or rollback. The installed reporter verifies its pinned
@@ -56,7 +56,7 @@ authority rule, rehearse on that host, and rerun the council activation review.
    from the expected set. A business-only council may contain blind alone. Append the attempt:
 
    ```
-   python3 /home/trader/.claude/knowledge/council-eval/predictions_report.py \
+   /usr/bin/python3.11 /home/trader/.claude/knowledge/council-eval/predictions_report.py \
      attempt --spec <attempt-spec.json>
    ```
 
@@ -68,7 +68,7 @@ authority rule, rehearse on that host, and rerun the council activation review.
    never named from the date and topic alone:
 
    ```
-   python3 /home/trader/.claude/knowledge/council-eval/predictions_report.py \
+   /usr/bin/python3.11 /home/trader/.claude/knowledge/council-eval/predictions_report.py \
      prepare-brief --run-id <runId> --source <draft-brief> \
      --destination <briefs-dir>/<date>-<topic>-<runId>.md \
      --expected-sha256 <sha256 of the draft>
@@ -117,9 +117,9 @@ validates that relationship.
 Validate the completion spec without writing, then append it:
 
 ```
-python3 /home/trader/.claude/knowledge/council-eval/predictions_report.py \
+/usr/bin/python3.11 /home/trader/.claude/knowledge/council-eval/predictions_report.py \
   complete --spec <completion-spec.json> --check-only
-python3 /home/trader/.claude/knowledge/council-eval/predictions_report.py \
+/usr/bin/python3.11 /home/trader/.claude/knowledge/council-eval/predictions_report.py \
   complete --spec <completion-spec.json>
 ```
 
@@ -134,7 +134,7 @@ finalization even when ordinary grading debt has not reached its escalation thre
 Resolve by stable `outcomeId`, never timestamp or list index:
 
 ```
-python3 /home/trader/.claude/knowledge/council-eval/predictions_report.py \
+/usr/bin/python3.11 /home/trader/.claude/knowledge/council-eval/predictions_report.py \
   resolve <outcomeId> true|false|void --evidence <durable-evidence> \
   --resolver <name> --method deterministic|manual-reviewed
 ```
@@ -157,7 +157,7 @@ Malformed JSON fails closed. Never delete or silently skip an invalid row. If in
 that exactly the final nonblank line is a torn write, record its line number and run:
 
 ```
-python3 /home/trader/.claude/knowledge/council-eval/predictions_report.py \
+/usr/bin/python3.11 /home/trader/.claude/knowledge/council-eval/predictions_report.py \
   repair-tail --path <exact-ledger-or-sidecar-path> \
   --confirm-final-line <line-number> --backup-dir <quarantine-directory>
 ```
@@ -173,13 +173,13 @@ authority host, and only through the hash-pinned command below. Derive the spec 
 read it, then run it:
 
 ```
-python3 /home/trader/.claude/knowledge/council-eval/predictions_report.py \
+/usr/bin/python3.11 /home/trader/.claude/knowledge/council-eval/predictions_report.py \
   plan-brief-recovery --ledger <ledger> --target-line <line> \
   --replacement-source <the bytes that seat actually read> \
   --operator <name> --approval-reference <where approval was given> \
   --approval-reason <why> > <spec.json>
 
-python3 /home/trader/.claude/knowledge/council-eval/predictions_report.py \
+/usr/bin/python3.11 /home/trader/.claude/knowledge/council-eval/predictions_report.py \
   recover-brief --spec <spec.json> --confirm-operator-approved-rewrite
 ```
 
@@ -203,7 +203,7 @@ target and the retained original by line number and the SHA-256 of each complete
 ```
 sed -n '<line>p' <ledger> | sha256sum
 
-python3 /home/trader/.claude/knowledge/council-eval/predictions_report.py \
+/usr/bin/python3.11 /home/trader/.claude/knowledge/council-eval/predictions_report.py \
   supersede --log <ledger> --line <line> \
   --confirm-raw-line-sha256 <digest of that exact line> \
   --duplicate-of-line <retained-line> \

@@ -4,8 +4,14 @@ import sys
 
 MINIMUM_PYTHON = (3, 11)
 
+# Not 1: this CLI reserves 1 for "the ledger is in invalid state, stop the council",
+# which is precisely the wrong conclusion to draw from an environment fault. 3 is taken
+# by grading debt. 2 is the closest available meaning -- the operator invoked the tool
+# wrongly -- and the accompanying contract text says so.
+UNSUPPORTED_INTERPRETER_EXIT = 2
 
-def _assert_supported_interpreter(version: tuple = None) -> None:
+
+def _assert_supported_interpreter(version: tuple[int, ...] | None = None) -> None:
     """Refuse an interpreter older than the one pyproject declares.
 
     This package sets requires-python = ">=3.11" and depends on it at runtime.
@@ -23,9 +29,11 @@ def _assert_supported_interpreter(version: tuple = None) -> None:
     fine under 3.11, and hand-editing the JSONL is forbidden. An operator who trusts the
     exit code is either blocked or "repairs" a healthy ledger.
 
-    Exit status 2, not 1, deliberately: 1 is this CLI's code for a ledger in invalid
-    state, which is the false claim being eliminated here. This is an environment fault
-    and must not be reported as a data fault.
+    Exits with UNSUPPORTED_INTERPRETER_EXIT (2), not 1, deliberately: 1 is this CLI's
+    code for a ledger in invalid state, which is the false claim being eliminated here.
+    This is an environment fault and must not be reported as a data fault. The status is
+    pinned by a subprocess test, because the obvious assertion -- that SystemExit.code is
+    truthy -- is vacuous: .code is the message string when SystemExit carries one.
     """
     if version is None:
         version = sys.version_info
@@ -33,12 +41,18 @@ def _assert_supported_interpreter(version: tuple = None) -> None:
         return
     found = ".".join(str(part) for part in version[:3])
     required = ".".join(str(part) for part in MINIMUM_PYTHON)
-    raise SystemExit(
+    # print + SystemExit(int), NOT SystemExit(str): SystemExit carrying a string prints it
+    # and exits 1, and 1 is this CLI's code for a ledger in invalid state -- the false
+    # claim this guard exists to eliminate. The first version of this guard did exactly
+    # that and was therefore a no-op on the failure it targeted.
+    print(
         f"council-tools requires Python >= {required}; this interpreter is {found} "
         f"({sys.executable}). The ledger is not the problem. Note that `python3` and "
         f"`python3.11` on PATH may both be older builds -- use an absolute path to a "
-        f"real {required}, e.g. /usr/bin/python3.11."
+        f"real {required}, e.g. /usr/bin/python3.11.",
+        file=sys.stderr,
     )
+    raise SystemExit(UNSUPPORTED_INTERPRETER_EXIT)
 
 
 _assert_supported_interpreter()
