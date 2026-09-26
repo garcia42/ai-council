@@ -284,6 +284,19 @@ class ResolveDueCliTest(LedgerCase):
         self.assertNotIn(true_id, again_ids)
         self.assertIn(odd_id, again_ids)
 
+    def test_an_outcome_due_today_waits_until_the_day_has_ended(self):
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+
+        today = datetime.now(ZoneInfo("America/New_York")).date().isoformat()
+        self.issue("today", resolution_date=today, check=check("exit 0"))
+        result = self.resolve_due("--apply")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.lines(result), [
+            {"summary": True, "due": 0, "applied": True, "errors": 0}
+        ])
+        self.assertEqual(self.events.read_text(), "")
+
     def test_apply_refuses_live_paths_off_the_authority_host(self):
         from types import SimpleNamespace
         from unittest import mock
