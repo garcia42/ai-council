@@ -412,9 +412,11 @@ class ResolveDueCliTest(LedgerCase):
         self.assertIn("entries=0", scoped.stdout)
         spanning = self.run_cli(
             "report", "--log", str(self.log), "--events", str(self.events),
-            "--today", "2026-09-01", "--workstream", "pysystemtrade",
-            "--workstream", "tandr",
+            "--today", "2026-09-01", "--workstream", "tandr",
+            "--workstream", "pysystemtrade",
         )
+        # Order matters to the test: a last-flag-wins parser would scope to
+        # pysystemtrade alone and exit 0.
         self.assertEqual(spanning.returncode, 3, spanning.stderr)
         table = self.root / "outcome-workstreams.json"
         table.write_text(json.dumps({"schemaVersion": 1, "workstreams": {}}))
