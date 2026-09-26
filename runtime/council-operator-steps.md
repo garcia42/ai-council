@@ -9,7 +9,10 @@ V2 capture, or backfill a V1 review as V2.
 
 New Councils use the original V1 `attempt` and `complete` commands with explicit
 `--study council-legacy`. Run the ordinary V1 report and blind-seat tally before
-and after the review. A post-retirement V1 Council is outside the ended V2
+and after the review. Before the first report, run `resolve-due --apply`, and scope
+the report with `--workstream` to the workstream of the change under review; give
+the attempt that `workstream`, and a `check` whenever its claim can be decided by a
+command (forecast contract, step 1 and step 2). A post-retirement V1 Council is outside the ended V2
 completeness denominator.
 
 V1 reporting reads the full legacy ledger; V2 reporting verifies only its

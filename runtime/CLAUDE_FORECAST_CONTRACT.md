@@ -11,8 +11,10 @@ shared outcome, seals the returned probabilities, validates the completion recor
 through the version-controlled forecast tool. Never resolve by timestamp or prediction-list index.
 
 Forecast scores are descriptive forecast accuracy, not a reviewer leaderboard. Grading debt
-does not stop a new council from convening, but three or more outcomes over 14 days late block
-decision finalization unless the principal records a time-limited override. Manual grades require
+does not stop a new council from convening, but three or more outcomes over 14 days late in the
+reviewed change's workstream, counting unclassified outcomes against every workstream, block
+decision finalization unless the principal records a time-limited override. Outcomes that carry
+a machine `check` are graded by `resolve-due --apply` before each council. Manual grades require
 independent review and durable evidence. A `submitted` seat requires exactly one probability;
 `abstained` and `unavailable` are explicit accounted states and require none.
 

@@ -57,6 +57,11 @@ LOCK_TIMEOUT_SECONDS = 10.0
 OUTCOME_FINGERPRINT_RE = re.compile(r"^[0-9a-f]{64}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 SUPERSEDE_KIND = "council-superseded"
+#: Registered workstreams for scoped grading debt. Adding one is a reviewed code
+#: change, which is the point: see ``validate_workstream``.
+WORKSTREAMS = ("controller", "council-tools", "plaintape", "pysystemtrade", "tandr")
+CHECK_KEYS = {"type", "argv", "cwd", "timeoutSeconds"}
+CHECK_MAX_TIMEOUT_SECONDS = 600
 
 
 class LedgerError(ValueError):
@@ -110,8 +115,61 @@ def normalize_seat(value: Any) -> str:
         raise LedgerError(f"unknown seat: {raw}") from exc
 
 
+def validate_workstream(value: Any) -> str:
+    """Return a registered workstream slug, or refuse.
+
+    The registry is closed on purpose. Scoped debt counts an outcome only against
+    its own workstream, so a free-text name would let a report name a workstream
+    that owns nothing and see no debt at all.
+    """
+
+    if not isinstance(value, str) or value not in WORKSTREAMS:
+        raise LedgerError(f"workstream must be one of {list(WORKSTREAMS)}")
+    return value
+
+
+def validate_check(value: Any) -> dict[str, Any]:
+    """Validate a machine-checkable resolution command and return it unchanged.
+
+    Exit 0 grades the claim TRUE, exit 1 FALSE; anything else leaves it for a
+    human. The executable and working directory must be absolute so the command
+    means the same thing when ``resolve-due`` runs it days later.
+    """
+
+    if not isinstance(value, dict) or set(value) != CHECK_KEYS:
+        raise LedgerError(f"check must contain exactly {sorted(CHECK_KEYS)}")
+    if value["type"] != "command":
+        raise LedgerError("check.type must be command")
+    argv = value["argv"]
+    if (
+        not isinstance(argv, list)
+        or not argv
+        or not all(isinstance(item, str) and item for item in argv)
+    ):
+        raise LedgerError("check.argv must be a non-empty list of non-empty strings")
+    if not argv[0].startswith("/"):
+        raise LedgerError("check.argv[0] must be an absolute executable path")
+    cwd = value["cwd"]
+    if not isinstance(cwd, str) or not cwd.startswith("/"):
+        raise LedgerError("check.cwd must be an absolute path")
+    timeout = value["timeoutSeconds"]
+    if (
+        isinstance(timeout, bool)
+        or not isinstance(timeout, int)
+        or not 1 <= timeout <= CHECK_MAX_TIMEOUT_SECONDS
+    ):
+        raise LedgerError(
+            f"check.timeoutSeconds must be an integer from 1 to {CHECK_MAX_TIMEOUT_SECONDS}"
+        )
+    return value
+
+
 def outcome_fingerprint(
-    claim: str, resolution_date: str, resolved_by: str, decision_link: str
+    claim: str,
+    resolution_date: str,
+    resolved_by: str,
+    decision_link: str,
+    check: Mapping[str, Any] | None = None,
 ) -> str:
     pieces = (
         _require_text(claim, "claim"),
@@ -120,6 +178,13 @@ def outcome_fingerprint(
         _require_text(decision_link, "decisionLink"),
     )
     canonical = "\x1f".join(" ".join(item.split()).casefold() for item in pieces)
+    if check is not None:
+        # The check decides the grade, so it is part of what the seats priced.
+        # It is bound verbatim: argv is case- and whitespace-sensitive, unlike
+        # the prose pieces above. Absent, the digest is exactly the old one.
+        canonical += "\x1fcheck:" + json.dumps(
+            dict(check), sort_keys=True, separators=(",", ":")
+        )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
@@ -148,6 +213,8 @@ def make_attempt(
     run_id: str | None = None,
     outcome_id: str | None = None,
     related_outcome_ids: Iterable[str] | None = None,
+    workstream: str | None = None,
+    check: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if not isinstance(expected_seats, (list, tuple)):
         raise LedgerError("expectedSeats must be a list")
@@ -164,8 +231,12 @@ def make_attempt(
         "evidenceCutoffAt": evidence_cutoff_at,
         "relatedOutcomeIds": list(related_outcome_ids or []),
     }
+    if workstream is not None:
+        outcome["workstream"] = workstream
+    if check is not None:
+        outcome["check"] = check
     outcome["fingerprint"] = outcome_fingerprint(
-        claim, resolution_date, resolved_by, decision_link
+        claim, resolution_date, resolved_by, decision_link, check
     )
     row = {
         "schemaVersion": SCHEMA_VERSION,
@@ -213,7 +284,14 @@ def validate_attempt(row: dict[str, Any]) -> None:
         raise LedgerError("evidenceCutoffAt cannot be after the attempt timestamp")
     if issued.date() >= deadline:
         raise LedgerError("attempt timestamp must precede resolutionDate")
-    expected = outcome_fingerprint(claim, str(deadline), resolved_by, decision_link)
+    if "workstream" in outcome:
+        validate_workstream(outcome["workstream"])
+    check = outcome.get("check")
+    if "check" in outcome:
+        validate_check(check)
+    expected = outcome_fingerprint(
+        claim, str(deadline), resolved_by, decision_link, check
+    )
     if outcome.get("fingerprint") != expected:
         raise LedgerError("sharedOutcome fingerprint does not match its content")
     related = outcome.get("relatedOutcomeIds", [])
@@ -1546,7 +1624,20 @@ def audit(
     *,
     today: date | None = None,
     as_of: datetime | str | None = None,
+    workstream: str | None = None,
+    workstream_map: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
+    """Audit the ledger.
+
+    ``workstream`` scopes only the grading-debt gate: an overdue outcome counts
+    toward it when it belongs to that workstream or to none. Everything else in
+    the report, including the unscoped overdue total, stays ledger-wide.
+    ``workstream_map`` assigns workstreams to outcomes issued before attempts
+    could carry one; it can never contradict an attempt's own field.
+    """
+
+    if workstream is not None:
+        validate_workstream(workstream)
     if as_of is not None:
         if isinstance(as_of, datetime):
             if as_of.tzinfo is None or as_of.utcoffset() is None:
@@ -1777,6 +1868,35 @@ def audit(
     }
     unresolved_due = due_outcomes - resolved_outcomes - void_outcomes
 
+    outcome_workstreams: dict[str, str] = {}
+    for outcome_id, (canonical_outcome, _issued_at) in issued_outcomes.items():
+        if "workstream" in canonical_outcome:
+            outcome_workstreams[outcome_id] = canonical_outcome["workstream"]
+    for outcome_id, mapped in (workstream_map or {}).items():
+        if outcome_id not in issued_outcomes:
+            invalid_records.append(
+                f"workstream map names an outcome that was never issued: {outcome_id}"
+            )
+            continue
+        own = outcome_workstreams.get(outcome_id)
+        if own is not None and own != mapped:
+            invalid_records.append(
+                f"workstream map contradicts the attempt for {outcome_id}: "
+                f"{mapped} != {own}"
+            )
+            continue
+        outcome_workstreams[outcome_id] = mapped
+    if workstream is None:
+        scoped_old_overdue = old_overdue
+    else:
+        # Unscoped debt is everybody's debt: it counts against every workstream,
+        # so an unclassified outcome can only ever make a scoped gate stricter.
+        scoped_old_overdue = {
+            outcome_id
+            for outcome_id in old_overdue
+            if outcome_workstreams.get(outcome_id) in (None, workstream)
+        }
+
     active_override = any(
         _parse_timestamp(item["createdAt"], "createdAt")
         .astimezone(ZoneInfo("America/New_York"))
@@ -1785,7 +1905,7 @@ def audit(
         <= _parse_date(item["expiresDate"], "expiresDate")
         for item in overrides
     )
-    if len(old_overdue) >= 3:
+    if len(scoped_old_overdue) >= 3:
         debt_state = "OVERRIDDEN" if active_override else "BLOCK_FINALIZATION"
     elif unresolved_due:
         debt_state = "WARN"
@@ -1919,6 +2039,16 @@ def audit(
         ),
         "unresolvedDueOutcomes": len(unresolved_due),
         "oldOverdueOutcomes": len(old_overdue),
+        "debtWorkstream": workstream,
+        "scopedOldOverdueOutcomes": len(scoped_old_overdue),
+        "scopedOldOverdueOutcomeIds": sorted(scoped_old_overdue),
+        "outcomeWorkstreams": dict(sorted(outcome_workstreams.items())),
+        "outcomeChecks": {
+            outcome_id: issued_outcomes[outcome_id][0]["check"]
+            for outcome_id in sorted(issued_outcomes)
+            if "check" in issued_outcomes[outcome_id][0]
+        },
+        "gradedOutcomeIds": sorted(resolved_outcomes | void_outcomes),
         "gradingDebtState": debt_state,
         "scoreStatus": score_status,
         "seatScores": seat_scores,

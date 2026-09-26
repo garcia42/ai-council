@@ -10,11 +10,28 @@ authority rule, rehearse on that host, and rerun the council activation review.
 
 ### Before firing seats
 
-1. Run the report:
+1. Grade what the machine can grade, then run the report scoped to the change's workstream:
 
    ```
-   /usr/bin/python3.11 /home/trader/.claude/knowledge/council-eval/predictions_report.py report
+   /usr/bin/python3.11 /home/trader/.claude/knowledge/council-eval/predictions_report.py \
+     --study council-legacy resolve-due --apply
+   /usr/bin/python3.11 /home/trader/.claude/knowledge/council-eval/predictions_report.py \
+     --study council-legacy report --workstream <workstream>
    ```
+
+   `resolve-due` runs the `check` of every outcome whose resolution date has ended and records
+   exit 0 as TRUE and exit 1 as FALSE, each as a `deterministic` resolution with a retained JSON
+   evidence file. Any other exit, a timeout, or a command that cannot start records nothing and
+   leaves the outcome with a human. Without `--apply` it only lists the commands it would run.
+
+   `--workstream` scopes the grading-debt gate, and only that gate: an overdue outcome counts
+   when it belongs to the named workstream or to none, so unclassified debt blocks every
+   workstream. The registered workstreams are `controller`, `council-tools`, `plaintape`,
+   `pysystemtrade` and `tandr`; adding one is a reviewed code change. Outcomes issued before
+   attempts carried a workstream are classified in `outcome-workstreams.json` beside the
+   resolution sidecar; a missing table leaves them unscoped, which is stricter, never looser.
+   Name the workstream of the change under review, not the one with the least debt. Without
+   `--workstream` the report counts all debt, as before.
 
    Exit 1 is invalid state and stops the council. Restore a damaged sidecar from its verified
    installer/operator backup or use the narrowly scoped torn-tail procedure below; never skip an
@@ -47,7 +64,14 @@ authority rule, rehearse on that host, and rerun the council activation review.
    - `claim`, `resolutionDate`, and `resolvedBy`;
    - `decisionLink` and `materiality`;
    - `actionIfTrue` and `actionIfFalse`;
-   - `evidenceCutoffAt`.
+   - `evidenceCutoffAt`;
+   - `workstream`, one of the registered slugs above;
+   - `check`, whenever the claim can be decided by a command:
+     `{"type": "command", "argv": ["/abs/path", ...], "cwd": "/abs/dir", "timeoutSeconds": N}`
+     (N at most 600). Exit 0 means the claim came true and exit 1 that it did not; the command
+     runs with a fixed minimal environment. The check is bound into the outcome fingerprint and
+     is part of what the seats price, so put it in their prompts verbatim, and make it read the
+     same evidence the claim names. A check that cannot fail is a defect the seats should call.
 
    A merely convenient uptime or delivery claim is invalid unless it changes the decision.
 
@@ -131,7 +155,9 @@ finalization even when ordinary grading debt has not reached its escalation thre
 
 ### Resolution
 
-Resolve by stable `outcomeId`, never timestamp or list index:
+Outcomes with a `check` are graded by `resolve-due --apply` (step 1), whose resolver is
+`resolve-due`. Everything else, and any check that left its outcome undetermined, is resolved by
+hand. Resolve by stable `outcomeId`, never timestamp or list index:
 
 ```
 /usr/bin/python3.11 /home/trader/.claude/knowledge/council-eval/predictions_report.py \

@@ -77,7 +77,10 @@ from .forecasts import (
     repair_trailing_jsonl,
     transaction_escrow_inventory,
     validate_ledger_row,
+    validate_check,
+    validate_workstream,
 )
+from .due_checks import RESOLVER, due_candidates, run_check, write_evidence
 
 
 ACCOUNT_HOME = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
@@ -123,7 +126,7 @@ class _ExplicitStudyPath(argparse.Action):
 _STUDY_READ_COMMANDS = frozenset({
     "report", "capture-report", "recording-coverage", "activation-readiness",
 })
-_STUDY_RESOLUTION_COMMANDS = frozenset({"resolve", "capture-resolve"})
+_STUDY_RESOLUTION_COMMANDS = frozenset({"resolve", "resolve-due", "capture-resolve"})
 _STUDY_CAPTURE_COMMANDS = frozenset({
     "capture-initiate", "capture-attempt", "capture-seats-finished",
     "capture-complete", "capture-invalidate", "capture-activate",
@@ -180,6 +183,11 @@ def _command_write_paths(args: argparse.Namespace) -> list[str]:
         return []
     if args.command in {"record", "complete", "supersede"} and args.check_only:
         return []
+    if args.command == "resolve-due":
+        if not args.apply:
+            return []
+        fields = ("events", "coordination_lock", "evidence_dir")
+        return [getattr(args, f) for f in fields if getattr(args, f, None) is not None]
     if args.command == "recover-brief":
         return _recovery_write_paths(args)
     if args.command == "evidence-snapshot":
@@ -457,6 +465,11 @@ def _print_human(result: dict) -> None:
         "unresolvable_overdue={unresolvableOverdueOutcomes} "
         "debt={gradingDebtState} score={scoreStatus}".format(**result)
     )
+    if result["debtWorkstream"] is not None:
+        print(
+            "debt_workstream={debtWorkstream} "
+            "scoped_old_overdue={scopedOldOverdueOutcomes}".format(**result)
+        )
     if result["unresolvableOverdueOutcomes"]:
         # These are overdue and ungradeable: `resolve` refuses any outcome with
         # no issued fingerprint, so they cannot be cleared through the supported
@@ -497,15 +510,57 @@ def _print_human(result: dict) -> None:
     print(result["label"])
 
 
+WORKSTREAM_MAP_NAME = "outcome-workstreams.json"
+
+
+def _workstream_map_path(args: argparse.Namespace) -> Path:
+    if getattr(args, "workstream_map", None):
+        return Path(args.workstream_map)
+    return Path(args.events).with_name(WORKSTREAM_MAP_NAME)
+
+
+def load_workstream_map(path: str | Path) -> dict[str, str]:
+    """Read the legacy outcome-to-workstream table; a missing file is an empty one.
+
+    Missing is safe rather than an error because an unmapped outcome counts
+    against every workstream: losing the table can only make scoped debt stricter.
+    """
+
+    path = Path(path)
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        return {}
+    value = strict_json_loads(raw)
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"schemaVersion", "workstreams"}
+        or value["schemaVersion"] != 1
+        or not isinstance(value["workstreams"], dict)
+    ):
+        raise LedgerError(
+            f"{path} must be {{\"schemaVersion\": 1, \"workstreams\": {{outcomeId: slug}}}}"
+        )
+    for outcome_id, slug in value["workstreams"].items():
+        if not isinstance(outcome_id, str) or not outcome_id.startswith("outcome-"):
+            raise LedgerError(f"{path} key is not an outcomeId: {outcome_id!r}")
+        validate_workstream(slug)
+    return dict(value["workstreams"])
+
+
 def command_report(args: argparse.Namespace) -> int:
     if args.today and (
         _is_live_write_path(args.log) or _is_live_write_path(args.events)
     ):
         raise LedgerError("--today is test-only and cannot be used with live council paths")
+    scope = dict(
+        workstream=args.workstream,
+        workstream_map=load_workstream_map(_workstream_map_path(args)),
+    )
     result = (
-        audit(args.log, args.events, today=_today(args.today))
+        audit(args.log, args.events, today=_today(args.today), **scope)
         if args.today
-        else audit(args.log, args.events, as_of=_now())
+        else audit(args.log, args.events, as_of=_now(), **scope)
     )
     if args.json:
         print(json.dumps(result, sort_keys=True))
@@ -599,6 +654,8 @@ def command_attempt(args: argparse.Namespace) -> int:
         evidence_cutoff_at=outcome.get("evidenceCutoffAt") or ts,
         ts=ts,
         related_outcome_ids=related_outcome_ids,
+        workstream=outcome.get("workstream"),
+        check=outcome.get("check"),
     )
     append_ledger_row(
         args.log, row, coordination_lock=args.coordination_lock
@@ -690,6 +747,76 @@ def command_resolve(args: argparse.Namespace) -> int:
     )
     print(event["resolutionId"])
     return 0
+
+
+def command_resolve_due(args: argparse.Namespace) -> int:
+    """List, or with --apply run and record, the checks of due outcomes.
+
+    Without --apply nothing runs and nothing is written: the listing shows each
+    command so an operator can read what --apply would execute.
+    """
+
+    if args.apply:
+        _require_ledger_write_authority(
+            args.events, args.coordination_lock, args.evidence_dir
+        )
+    today = datetime.now(ZoneInfo("America/New_York")).date()
+    current = audit(args.log, args.events, as_of=_now())
+    if current["invalidRecords"]:
+        raise LedgerError("cannot resolve while the forecast ledger is invalid")
+    candidates = due_candidates(current, today)
+    failures = 0
+    for outcome_id in candidates:
+        check = current["outcomeChecks"][outcome_id]
+        line = {"outcomeId": outcome_id, "argv": check["argv"], "cwd": check["cwd"]}
+        if not args.apply:
+            print(json.dumps({**line, "status": "due"}, sort_keys=True))
+            continue
+        result = run_check(check)
+        line.update(verdict=result["verdict"], reason=result["reason"])
+        if result["verdict"] == "undetermined":
+            # Left for a human, like every outcome without a check. Nothing is
+            # retained: a run that decided nothing is not evidence of anything.
+            print(json.dumps({**line, "status": "left-for-human"}, sort_keys=True))
+            continue
+        fingerprint = current["outcomeFingerprints"][outcome_id]
+        try:
+            evidence = write_evidence(
+                Path(args.evidence_dir), outcome_id, fingerprint, check, result
+            )
+            event = append_resolution(
+                args.events,
+                outcome_id=outcome_id,
+                resolution_date=current["outcomeResolutionDates"][outcome_id],
+                outcome_fingerprint=fingerprint,
+                came_true=result["verdict"] == "true",
+                evidence=evidence,
+                resolver=RESOLVER,
+                resolved_at=_now(),
+                method="deterministic",
+                coordination_lock=args.coordination_lock,
+            )
+        except LedgerError as exc:
+            # Per-outcome boundary: a concurrent grade or a write fault on one
+            # outcome must not stop the others. It still fails the command.
+            failures += 1
+            print(json.dumps({**line, "status": "error", "error": str(exc)}, sort_keys=True))
+            continue
+        print(
+            json.dumps(
+                {**line, "status": "recorded", "resolutionId": event["resolutionId"],
+                 "evidence": evidence},
+                sort_keys=True,
+            )
+        )
+    print(
+        json.dumps(
+            {"summary": True, "due": len(candidates), "applied": bool(args.apply),
+             "errors": failures},
+            sort_keys=True,
+        )
+    )
+    return 1 if failures else 0
 
 
 def command_override(args: argparse.Namespace) -> int:
@@ -1445,6 +1572,14 @@ def build_parser() -> argparse.ArgumentParser:
     report.add_argument("--events", action=_ExplicitStudyPath, default=DEFAULT_EVENTS)
     report.add_argument("--today")
     report.add_argument("--json", action="store_true")
+    report.add_argument(
+        "--workstream",
+        help="scope the grading-debt gate to one workstream (plus unscoped outcomes)",
+    )
+    report.add_argument(
+        "--workstream-map",
+        help=f"legacy outcome-to-workstream table (default: {WORKSTREAM_MAP_NAME} beside --events)",
+    )
     report.set_defaults(func=command_report)
 
     recording = sub.add_parser(
@@ -1534,6 +1669,21 @@ def build_parser() -> argparse.ArgumentParser:
         context_fields=("log", "events"),
     )
     resolve.set_defaults(func=command_resolve)
+
+    resolve_due = sub.add_parser(
+        "resolve-due",
+        help="list, or with --apply run and record, machine checks of due outcomes",
+    )
+    resolve_due.add_argument("--log", action=_ExplicitStudyPath, default=DEFAULT_LOG)
+    resolve_due.add_argument("--events", action=_ExplicitStudyPath, default=DEFAULT_EVENTS)
+    resolve_due.add_argument("--evidence-dir")
+    resolve_due.add_argument("--apply", action="store_true")
+    coordinated(
+        resolve_due,
+        anchor_field="log",
+        context_fields=("log", "events"),
+    )
+    resolve_due.set_defaults(func=command_resolve_due)
 
     override = sub.add_parser("override-debt")
     override.add_argument("--events", action=_ExplicitStudyPath, default=DEFAULT_EVENTS)
