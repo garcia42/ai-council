@@ -16,22 +16,34 @@ authority rule, rehearse on that host, and rerun the council activation review.
    /usr/bin/python3.11 /home/trader/.claude/knowledge/council-eval/predictions_report.py \
      --study council-legacy resolve-due --apply
    /usr/bin/python3.11 /home/trader/.claude/knowledge/council-eval/predictions_report.py \
-     --study council-legacy report --workstream <workstream>
+     --study council-legacy report --workstream <workstream> [--workstream <another>]
    ```
 
    `resolve-due` runs the `check` of every outcome whose resolution date has ended and records
-   exit 0 as TRUE and exit 1 as FALSE, each as a `deterministic` resolution with a retained JSON
+   exit 10 as TRUE and exit 11 as FALSE, each as a `deterministic` resolution with a retained JSON
    evidence file. Any other exit, a timeout, or a command that cannot start records nothing and
-   leaves the outcome with a human. Without `--apply` it only lists the commands it would run.
+   leaves the outcome with a human. Evidence goes to `resolution-evidence/auto/` beside the sidecar
+   unless `--evidence-dir` says otherwise, and records the sha256 of every argument that names a
+   file, since the fingerprint binds a script's path and not its bytes. Without `--apply` it only
+   lists the commands it would run. It stops starting new checks after `--budget-seconds`
+   (default 900) and leaves the rest due for the next council. A check may run more than once
+   (a retry, or two sessions at the same time), so it must only read. `resolve-due` exits 1 when
+   a per-outcome write failed, typically because another session graded that outcome first. That
+   is not invalid ledger state, and it does not stop the council; run the report and read its
+   exit status instead.
 
    `--workstream` scopes the grading-debt gate, and only that gate: an overdue outcome counts
    when it belongs to the named workstream or to none, so unclassified debt blocks every
-   workstream. The registered workstreams are `controller`, `council-tools`, `plaintape`,
+   workstream. Name every workstream a cross-project change touches. Independently of scope, 30
+   or more old overdue outcomes across the whole ledger block every report, so debt in a
+   workstream nobody reports on cannot sit forever. The registered workstreams are `controller`, `council-tools`, `plaintape`,
    `pysystemtrade` and `tandr`; adding one is a reviewed code change. Outcomes issued before
    attempts carried a workstream are classified in `outcome-workstreams.json` beside the
    resolution sidecar; a missing table leaves them unscoped, which is stricter, never looser.
-   Name the workstream of the change under review, not the one with the least debt. Without
-   `--workstream` the report counts all debt, as before.
+   Name the workstream of the change under review, not the one with the least debt. The scoped
+   report prints its scope and the table's path, sha256 and entry count; copy those lines into the
+   completion row's notes so the scope that decided the gate is on record. Without `--workstream`
+   the report counts all debt, as before, and does not read the table.
 
    Exit 1 is invalid state and stops the council. Restore a damaged sidecar from its verified
    installer/operator backup or use the narrowly scoped torn-tail procedure below; never skip an
@@ -68,10 +80,15 @@ authority rule, rehearse on that host, and rerun the council activation review.
    - `workstream`, one of the registered slugs above;
    - `check`, whenever the claim can be decided by a command:
      `{"type": "command", "argv": ["/abs/path", ...], "cwd": "/abs/dir", "timeoutSeconds": N}`
-     (N at most 600). Exit 0 means the claim came true and exit 1 that it did not; the command
-     runs with a fixed minimal environment. The check is bound into the outcome fingerprint and
-     is part of what the seats price, so put it in their prompts verbatim, and make it read the
-     same evidence the claim names. A check that cannot fail is a defect the seats should call.
+     (N at most 600). Exit 10 means the claim came true and exit 11 that it did not; every other
+     exit, including 0 and the 1 that a crash, `set -e` or an unmatched `grep` produces, leaves the
+     outcome with a human. The command runs with a fixed minimal environment. The check is part of
+     what the seats price, so put it in their prompts verbatim and ask each lens whether it
+     decides the claim as written, not an easier proxy. Make it read the same evidence, for the
+     same period, that the claim names: it runs after the date, so current state is not evidence
+     about a past window. A check that cannot fail is a defect the seats should call. `check` and
+     `workstream` are outside the fingerprint, so older runtimes still read these rows and a
+     rollback target stays valid; the append-only attempt row is what fixes the check that runs.
 
    A merely convenient uptime or delivery claim is invalid unless it changes the decision.
 

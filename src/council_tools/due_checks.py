@@ -2,7 +2,7 @@
 
 An attempt may carry ``sharedOutcome.check``: an absolute command the seats saw
 and the fingerprint binds. Once the outcome's resolution date has ended in
-America/New_York, ``resolve-due`` runs it. Exit 0 records TRUE and exit 1 FALSE,
+America/New_York, ``resolve-due`` runs it. Exit 10 records TRUE and exit 11 FALSE,
 both as ``deterministic`` resolutions whose evidence is a retained JSON record
 of exactly what ran. Any other exit, a timeout, or a command that cannot start
 records nothing: that outcome stays with a human, like every outcome without a
@@ -24,6 +24,11 @@ from .forecasts import LedgerError, validate_check
 from .safe_files import SafeFileError, create_bytes_exclusive
 
 RESOLVER = "resolve-due"
+#: Reserved verdict codes. Not 0 and 1: an uncaught Python exception, `set -e`,
+#: and a grep that matched nothing all exit 1, so a broken check would have been
+#: recorded as a confident deterministic FALSE.
+CHECK_EXIT_TRUE = 10
+CHECK_EXIT_FALSE = 11
 OUTPUT_LIMIT_BYTES = 65536
 #: The environment every check runs in. A check must not depend on whoever
 #: happens to run ``resolve-due``: same command, same inputs, same grade.
@@ -82,19 +87,29 @@ def run_check(check: Mapping[str, Any]) -> dict[str, Any]:
             os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
-        stdout, stderr = process.communicate()
+        try:
+            stdout, stderr = process.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            # Something that left the session still holds the pipes. The grade
+            # is already undetermined; do not wait on it.
+            process.kill()
+            process.wait()
+            stdout, stderr = b"", b""
         timed_out = True
     out_text, out_truncated = _truncate(stdout)
     err_text, err_truncated = _truncate(stderr)
     code = None if timed_out else process.returncode
     if timed_out:
         verdict, reason = "undetermined", f"timed out after {check['timeoutSeconds']}s"
-    elif code == 0:
-        verdict, reason = "true", "exit 0"
-    elif code == 1:
-        verdict, reason = "false", "exit 1"
+    elif code == CHECK_EXIT_TRUE:
+        verdict, reason = "true", f"exit {CHECK_EXIT_TRUE}"
+    elif code == CHECK_EXIT_FALSE:
+        verdict, reason = "false", f"exit {CHECK_EXIT_FALSE}"
     else:
-        verdict, reason = "undetermined", f"exit {code} is neither 0 nor 1"
+        verdict, reason = (
+            "undetermined",
+            f"exit {code} is neither {CHECK_EXIT_TRUE} (true) nor {CHECK_EXIT_FALSE} (false)",
+        )
     return {
         "startedAt": started,
         "finishedAt": _now(),
@@ -105,7 +120,26 @@ def run_check(check: Mapping[str, Any]) -> dict[str, Any]:
         "stdoutTruncated": out_truncated,
         "stderr": err_text,
         "stderrTruncated": err_truncated,
+        "argvFileSha256": _argv_file_digests(check),
     }
+
+
+def _argv_file_digests(check: Mapping[str, Any]) -> dict[str, str]:
+    """Digest every argv entry that names a regular file, as read at run time.
+
+    The fingerprint binds a script's path, not its bytes, so the evidence records
+    what the path held when it graded the claim.
+    """
+
+    digests = {}
+    for item in check["argv"]:
+        path = Path(check["cwd"], item)
+        try:
+            if path.is_file():
+                digests[item] = hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError:
+            continue
+    return digests
 
 
 def due_candidates(current: Mapping[str, Any], today) -> list[str]:

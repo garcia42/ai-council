@@ -62,6 +62,10 @@ SUPERSEDE_KIND = "council-superseded"
 WORKSTREAMS = ("controller", "council-tools", "plaintape", "pysystemtrade", "tandr")
 CHECK_KEYS = {"type", "argv", "cwd", "timeoutSeconds"}
 CHECK_MAX_TIMEOUT_SECONDS = 600
+#: Ledger-wide old-overdue count that blocks every scoped report too: about a
+#: week of hand grading. Scoping must not turn "forecasts get scored" into
+#: "active projects keep their own queue short".
+GLOBAL_DEBT_BACKSTOP = 30
 
 
 class LedgerError(ValueError):
@@ -131,7 +135,7 @@ def validate_workstream(value: Any) -> str:
 def validate_check(value: Any) -> dict[str, Any]:
     """Validate a machine-checkable resolution command and return it unchanged.
 
-    Exit 0 grades the claim TRUE, exit 1 FALSE; anything else leaves it for a
+    Exit 10 grades the claim TRUE, exit 11 FALSE; anything else leaves it for a
     human. The executable and working directory must be absolute so the command
     means the same thing when ``resolve-due`` runs it days later.
     """
@@ -165,11 +169,7 @@ def validate_check(value: Any) -> dict[str, Any]:
 
 
 def outcome_fingerprint(
-    claim: str,
-    resolution_date: str,
-    resolved_by: str,
-    decision_link: str,
-    check: Mapping[str, Any] | None = None,
+    claim: str, resolution_date: str, resolved_by: str, decision_link: str
 ) -> str:
     pieces = (
         _require_text(claim, "claim"),
@@ -178,13 +178,6 @@ def outcome_fingerprint(
         _require_text(decision_link, "decisionLink"),
     )
     canonical = "\x1f".join(" ".join(item.split()).casefold() for item in pieces)
-    if check is not None:
-        # The check decides the grade, so it is part of what the seats priced.
-        # It is bound verbatim: argv is case- and whitespace-sensitive, unlike
-        # the prose pieces above. Absent, the digest is exactly the old one.
-        canonical += "\x1fcheck:" + json.dumps(
-            dict(check), sort_keys=True, separators=(",", ":")
-        )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
@@ -235,8 +228,13 @@ def make_attempt(
         outcome["workstream"] = workstream
     if check is not None:
         outcome["check"] = check
+    # ``check`` and ``workstream`` stay outside the fingerprint on purpose: an
+    # older runtime recomputes the fingerprint from the four pieces alone, so
+    # binding either would make the first such attempt an invalid row to every
+    # rollback target. The attempt row is append-only and ``resolve-due`` reads
+    # the check from that row, so the check the seats priced is the one that runs.
     outcome["fingerprint"] = outcome_fingerprint(
-        claim, resolution_date, resolved_by, decision_link, check
+        claim, resolution_date, resolved_by, decision_link
     )
     row = {
         "schemaVersion": SCHEMA_VERSION,
@@ -286,12 +284,9 @@ def validate_attempt(row: dict[str, Any]) -> None:
         raise LedgerError("attempt timestamp must precede resolutionDate")
     if "workstream" in outcome:
         validate_workstream(outcome["workstream"])
-    check = outcome.get("check")
     if "check" in outcome:
-        validate_check(check)
-    expected = outcome_fingerprint(
-        claim, str(deadline), resolved_by, decision_link, check
-    )
+        validate_check(outcome["check"])
+    expected = outcome_fingerprint(claim, str(deadline), resolved_by, decision_link)
     if outcome.get("fingerprint") != expected:
         raise LedgerError("sharedOutcome fingerprint does not match its content")
     related = outcome.get("relatedOutcomeIds", [])
@@ -1624,20 +1619,28 @@ def audit(
     *,
     today: date | None = None,
     as_of: datetime | str | None = None,
-    workstream: str | None = None,
+    workstream: str | Iterable[str] | None = None,
     workstream_map: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """Audit the ledger.
 
-    ``workstream`` scopes only the grading-debt gate: an overdue outcome counts
-    toward it when it belongs to that workstream or to none. Everything else in
-    the report, including the unscoped overdue total, stays ledger-wide.
-    ``workstream_map`` assigns workstreams to outcomes issued before attempts
-    could carry one; it can never contradict an attempt's own field.
+    ``workstream`` (one slug or several, for a change that spans projects)
+    scopes the grading-debt gate: an overdue outcome counts toward it when it
+    belongs to one of those workstreams or to none. The ledger-wide total still
+    blocks at ``GLOBAL_DEBT_BACKSTOP``, so debt in a workstream nobody reports on
+    cannot sit forever. ``workstream_map`` assigns workstreams to outcomes issued
+    before attempts could carry one; it can never contradict an attempt's own
+    field, and a key naming no issued outcome is reported, not applied.
     """
 
-    if workstream is not None:
-        validate_workstream(workstream)
+    if workstream is None:
+        scope = None
+    else:
+        scope = (workstream,) if isinstance(workstream, str) else tuple(workstream)
+        if not scope:
+            raise LedgerError("workstream scope must name at least one workstream")
+        for item in scope:
+            validate_workstream(item)
     if as_of is not None:
         if isinstance(as_of, datetime):
             if as_of.tzinfo is None or as_of.utcoffset() is None:
@@ -1872,11 +1875,11 @@ def audit(
     for outcome_id, (canonical_outcome, _issued_at) in issued_outcomes.items():
         if "workstream" in canonical_outcome:
             outcome_workstreams[outcome_id] = canonical_outcome["workstream"]
+    unknown_map_ids = []
     for outcome_id, mapped in (workstream_map or {}).items():
         if outcome_id not in issued_outcomes:
-            invalid_records.append(
-                f"workstream map names an outcome that was never issued: {outcome_id}"
-            )
+            # Stale metadata must not stop every council; it assigns nothing.
+            unknown_map_ids.append(outcome_id)
             continue
         own = outcome_workstreams.get(outcome_id)
         if own is not None and own != mapped:
@@ -1886,7 +1889,7 @@ def audit(
             )
             continue
         outcome_workstreams[outcome_id] = mapped
-    if workstream is None:
+    if scope is None:
         scoped_old_overdue = old_overdue
     else:
         # Unscoped debt is everybody's debt: it counts against every workstream,
@@ -1894,7 +1897,7 @@ def audit(
         scoped_old_overdue = {
             outcome_id
             for outcome_id in old_overdue
-            if outcome_workstreams.get(outcome_id) in (None, workstream)
+            if outcome_workstreams.get(outcome_id) in (None, *scope)
         }
 
     active_override = any(
@@ -1905,7 +1908,7 @@ def audit(
         <= _parse_date(item["expiresDate"], "expiresDate")
         for item in overrides
     )
-    if len(scoped_old_overdue) >= 3:
+    if len(scoped_old_overdue) >= 3 or len(old_overdue) >= GLOBAL_DEBT_BACKSTOP:
         debt_state = "OVERRIDDEN" if active_override else "BLOCK_FINALIZATION"
     elif unresolved_due:
         debt_state = "WARN"
@@ -2039,7 +2042,9 @@ def audit(
         ),
         "unresolvedDueOutcomes": len(unresolved_due),
         "oldOverdueOutcomes": len(old_overdue),
-        "debtWorkstream": workstream,
+        "debtWorkstream": None if scope is None else ",".join(scope),
+        "globalDebtBackstop": GLOBAL_DEBT_BACKSTOP,
+        "workstreamMapUnknownIds": sorted(unknown_map_ids),
         "scopedOldOverdueOutcomes": len(scoped_old_overdue),
         "scopedOldOverdueOutcomeIds": sorted(scoped_old_overdue),
         "outcomeWorkstreams": dict(sorted(outcome_workstreams.items())),

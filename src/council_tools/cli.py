@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import json
 import math
 import os
@@ -11,6 +12,7 @@ import pwd
 import socket
 import stat
 import sys
+import time
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -470,6 +472,18 @@ def _print_human(result: dict) -> None:
             "debt_workstream={debtWorkstream} "
             "scoped_old_overdue={scopedOldOverdueOutcomes}".format(**result)
         )
+    if result["workstreamMapUnknownIds"]:
+        print(
+            "WARNING: workstream map names outcomes that were never issued: "
+            + ",".join(result["workstreamMapUnknownIds"]),
+            file=sys.stderr,
+        )
+    if "workstreamMap" in result:
+        print(
+            "workstream_map={path} sha256={sha256} entries={entries}".format(
+                **result["workstreamMap"]
+            )
+        )
     if result["unresolvableOverdueOutcomes"]:
         # These are overdue and ungradeable: `resolve` refuses any outcome with
         # no issued fingerprint, so they cannot be cleared through the supported
@@ -511,6 +525,7 @@ def _print_human(result: dict) -> None:
 
 
 WORKSTREAM_MAP_NAME = "outcome-workstreams.json"
+DEFAULT_EVIDENCE_SUBDIR = "resolution-evidence/auto"
 
 
 def _workstream_map_path(args: argparse.Namespace) -> Path:
@@ -553,15 +568,27 @@ def command_report(args: argparse.Namespace) -> int:
         _is_live_write_path(args.log) or _is_live_write_path(args.events)
     ):
         raise LedgerError("--today is test-only and cannot be used with live council paths")
-    scope = dict(
-        workstream=args.workstream,
-        workstream_map=load_workstream_map(_workstream_map_path(args)),
-    )
+    # The table only matters to a scoped gate, so an unscoped report never
+    # reads it and cannot be stopped by it.
+    map_path = _workstream_map_path(args) if args.workstream else None
+    workstream_map = load_workstream_map(map_path) if map_path else {}
+    scope = dict(workstream=args.workstream, workstream_map=workstream_map)
     result = (
         audit(args.log, args.events, today=_today(args.today), **scope)
         if args.today
         else audit(args.log, args.events, as_of=_now(), **scope)
     )
+    # Which table decided a scoped gate must be visible in the council's record.
+    if map_path is not None:
+        result["workstreamMap"] = {
+            "path": str(map_path),
+            "sha256": (
+                hashlib.sha256(map_path.read_bytes()).hexdigest()
+                if map_path.exists()
+                else None
+            ),
+            "entries": len(workstream_map),
+        }
     if args.json:
         print(json.dumps(result, sort_keys=True))
     else:
@@ -756,6 +783,10 @@ def command_resolve_due(args: argparse.Namespace) -> int:
     command so an operator can read what --apply would execute.
     """
 
+    if args.evidence_dir is None:
+        args.evidence_dir = str(
+            Path(args.events).parent / DEFAULT_EVIDENCE_SUBDIR
+        )
     if args.apply:
         _require_ledger_write_authority(
             args.events, args.coordination_lock, args.evidence_dir
@@ -766,11 +797,17 @@ def command_resolve_due(args: argparse.Namespace) -> int:
         raise LedgerError("cannot resolve while the forecast ledger is invalid")
     candidates = due_candidates(current, today)
     failures = 0
+    started = time.monotonic()
     for outcome_id in candidates:
         check = current["outcomeChecks"][outcome_id]
         line = {"outcomeId": outcome_id, "argv": check["argv"], "cwd": check["cwd"]}
         if not args.apply:
             print(json.dumps({**line, "status": "due"}, sort_keys=True))
+            continue
+        if time.monotonic() - started >= args.budget_seconds:
+            # The step runs before every council, so it must not hold one up.
+            # Whatever is left is simply due again next time.
+            print(json.dumps({**line, "status": "deferred-budget"}, sort_keys=True))
             continue
         result = run_check(check)
         line.update(verdict=result["verdict"], reason=result["reason"])
@@ -796,7 +833,7 @@ def command_resolve_due(args: argparse.Namespace) -> int:
                 method="deterministic",
                 coordination_lock=args.coordination_lock,
             )
-        except LedgerError as exc:
+        except (LedgerError, OSError) as exc:
             # Per-outcome boundary: a concurrent grade or a write fault on one
             # outcome must not stop the others. It still fails the command.
             failures += 1
@@ -1574,7 +1611,11 @@ def build_parser() -> argparse.ArgumentParser:
     report.add_argument("--json", action="store_true")
     report.add_argument(
         "--workstream",
-        help="scope the grading-debt gate to one workstream (plus unscoped outcomes)",
+        action="append",
+        help=(
+            "scope the grading-debt gate to this workstream plus unscoped outcomes; "
+            "repeat for a change that spans workstreams"
+        ),
     )
     report.add_argument(
         "--workstream-map",
@@ -1678,6 +1719,12 @@ def build_parser() -> argparse.ArgumentParser:
     resolve_due.add_argument("--events", action=_ExplicitStudyPath, default=DEFAULT_EVENTS)
     resolve_due.add_argument("--evidence-dir")
     resolve_due.add_argument("--apply", action="store_true")
+    resolve_due.add_argument(
+        "--budget-seconds",
+        type=int,
+        default=900,
+        help="stop starting new checks after this much wall time (default 900)",
+    )
     coordinated(
         resolve_due,
         anchor_field="log",

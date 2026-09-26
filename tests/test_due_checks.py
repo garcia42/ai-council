@@ -49,22 +49,21 @@ def attempt(claim, resolution_date, **extra):
 
 
 class FingerprintAndSchemaTest(unittest.TestCase):
-    def test_fingerprint_without_check_is_the_pre_existing_digest(self):
-        pieces = ("claim", "2026-07-10", "rule", "link")
+    def test_check_stays_outside_the_fingerprint_so_older_readers_accept_it(self):
+        # An older runtime recomputes the digest from the four prose pieces. If
+        # the check were bound in, the first check-bearing attempt would be an
+        # invalid row to every rollback target, for ever (append-only ledger).
+        row = attempt("claim", "2026-07-10", check=check("exit 10"), workstream="tandr")
+        outcome = row["sharedOutcome"]
+        pieces = [" ".join(outcome[k].split()).casefold()
+                  for k in ("claim", "resolutionDate", "resolvedBy", "decisionLink")]
         legacy = hashlib.sha256("\x1f".join(pieces).encode()).hexdigest()
-        self.assertEqual(outcome_fingerprint(*pieces), legacy)
-        self.assertEqual(outcome_fingerprint(*pieces, None), legacy)
+        self.assertEqual(outcome["fingerprint"], legacy)
 
-    def test_check_is_bound_into_the_fingerprint(self):
-        pieces = ("claim", "2026-07-10", "rule", "link")
-        first = outcome_fingerprint(*pieces, check("exit 0"))
-        self.assertNotEqual(first, outcome_fingerprint(*pieces))
-        self.assertNotEqual(first, outcome_fingerprint(*pieces, check("exit 1")))
-
-    def test_a_check_swapped_after_issuance_is_refused(self):
-        row = attempt("swap", "2026-07-10", check=check("exit 1"))
-        row["sharedOutcome"]["check"] = check("exit 0")
-        with self.assertRaisesRegex(LedgerError, "fingerprint"):
+    def test_a_malformed_check_in_a_row_is_refused(self):
+        row = attempt("bad", "2026-07-10", check=check("exit 10"))
+        row["sharedOutcome"]["check"] = {**check("exit 10"), "timeoutSeconds": 0}
+        with self.assertRaisesRegex(LedgerError, "timeoutSeconds"):
             validate_attempt(row)
 
     def test_workstream_is_outside_the_fingerprint_but_must_be_registered(self):
@@ -78,14 +77,14 @@ class FingerprintAndSchemaTest(unittest.TestCase):
 
     def test_malformed_checks_are_refused(self):
         cases = {
-            "relative executable": {**check("exit 0"), "argv": ["sh", "-c", "exit 0"]},
+            "relative executable": {**check("exit 10"), "argv": ["sh", "-c", "exit 10"]},
             "relative cwd": check("exit 0", cwd="repo"),
             "boolean timeout": check("exit 0", timeout=True),
             "zero timeout": check("exit 0", timeout=0),
             "long timeout": check("exit 0", timeout=601),
-            "extra key": {**check("exit 0"), "env": {}},
-            "wrong type": {**check("exit 0"), "type": "http"},
-            "empty argv": {**check("exit 0"), "argv": []},
+            "extra key": {**check("exit 10"), "env": {}},
+            "wrong type": {**check("exit 10"), "type": "http"},
+            "empty argv": {**check("exit 10"), "argv": []},
         }
         for label, value in cases.items():
             with self.subTest(label), self.assertRaises(LedgerError):
@@ -94,9 +93,34 @@ class FingerprintAndSchemaTest(unittest.TestCase):
 
 class RunCheckTest(unittest.TestCase):
     def test_exit_codes_map_to_verdicts(self):
-        self.assertEqual(run_check(check("exit 0"))["verdict"], "true")
-        self.assertEqual(run_check(check("exit 1"))["verdict"], "false")
-        self.assertEqual(run_check(check("exit 2"))["verdict"], "undetermined")
+        self.assertEqual(run_check(check("exit 10"))["verdict"], "true")
+        self.assertEqual(run_check(check("exit 11"))["verdict"], "false")
+        for code in (0, 1, 2):
+            with self.subTest(code=code):
+                self.assertEqual(
+                    run_check(check(f"exit {code}"))["verdict"], "undetermined"
+                )
+
+    def test_a_crashing_check_is_not_graded_false(self):
+        crash = {**check(""), "argv": ["/usr/bin/python3", "-c", "raise RuntimeError('bug')"]}
+        self.assertEqual(run_check(crash)["verdict"], "undetermined")
+        unmatched = check("grep -q never-there /etc/hostname")
+        self.assertEqual(run_check(unmatched)["verdict"], "undetermined")
+
+    def test_evidence_digests_the_script_a_path_names(self):
+        with tempfile.TemporaryDirectory() as root:
+            script = Path(root) / "check.sh"
+            script.write_text("exit 10\n")
+            result = run_check(
+                {"type": "command", "argv": ["/bin/sh", "check.sh"], "cwd": root,
+                 "timeoutSeconds": 30}
+            )
+            self.assertEqual(result["verdict"], "true")
+            self.assertEqual(
+                result["argvFileSha256"]["check.sh"],
+                hashlib.sha256(b"exit 10\n").hexdigest(),
+            )
+            self.assertIn("/bin/sh", result["argvFileSha256"])
 
     def test_timeout_is_undetermined_and_kills_the_session(self):
         with tempfile.TemporaryDirectory() as root:
@@ -110,13 +134,13 @@ class RunCheckTest(unittest.TestCase):
             self.assertFalse(marker.exists(), "a grandchild outlived the timeout")
 
     def test_a_command_that_cannot_start_is_undetermined(self):
-        missing = {**check("exit 0"), "argv": ["/nonexistent/binary"]}
+        missing = {**check("exit 10"), "argv": ["/nonexistent/binary"]}
         self.assertEqual(run_check(missing)["verdict"], "undetermined")
 
     def test_the_caller_environment_does_not_reach_the_check(self):
         os.environ["COUNCIL_DUE_CHECK_LEAK"] = "1"
         try:
-            result = run_check(check('test -z "$COUNCIL_DUE_CHECK_LEAK"'))
+            result = run_check(check('test -z "$COUNCIL_DUE_CHECK_LEAK" && exit 10 || exit 11'))
         finally:
             del os.environ["COUNCIL_DUE_CHECK_LEAK"]
         self.assertEqual(result["verdict"], "true")
@@ -182,13 +206,37 @@ class WorkstreamScopeTest(LedgerCase):
         self.assertTrue(
             any("contradicts" in item for item in contradicted["invalidRecords"])
         )
+        stray = "outcome-" + "0" * 32
         unknown = audit(
-            self.log,
-            self.events,
-            today=self.TODAY,
-            workstream_map={"outcome-" + "0" * 32: "tandr"},
+            self.log, self.events, today=self.TODAY, workstream_map={stray: "tandr"}
         )
-        self.assertTrue(any("never issued" in item for item in unknown["invalidRecords"]))
+        self.assertEqual(unknown["invalidRecords"], [])
+        self.assertEqual(unknown["workstreamMapUnknownIds"], [stray])
+
+    def test_a_change_spanning_workstreams_carries_all_their_debt(self):
+        for claim in "ab":
+            self.issue(claim, workstream="tandr")
+        self.issue("c", workstream="council-tools")
+        single = audit(self.log, self.events, today=self.TODAY, workstream="council-tools")
+        self.assertEqual(single["scopedOldOverdueOutcomes"], 1)
+        both = audit(
+            self.log, self.events, today=self.TODAY,
+            workstream=["council-tools", "tandr"],
+        )
+        self.assertEqual(both["scopedOldOverdueOutcomes"], 3)
+        self.assertEqual(both["gradingDebtState"], "BLOCK_FINALIZATION")
+
+    def test_ledger_wide_backstop_blocks_every_scope(self):
+        from council_tools.forecasts import GLOBAL_DEBT_BACKSTOP
+
+        for index in range(GLOBAL_DEBT_BACKSTOP - 1):
+            self.issue(f"dormant {index}", workstream="plaintape")
+        below = audit(self.log, self.events, today=self.TODAY, workstream="tandr")
+        self.assertEqual(below["gradingDebtState"], "WARN")
+        self.issue("one more", workstream="plaintape")
+        at = audit(self.log, self.events, today=self.TODAY, workstream="tandr")
+        self.assertEqual(at["scopedOldOverdueOutcomes"], 0)
+        self.assertEqual(at["gradingDebtState"], "BLOCK_FINALIZATION")
 
     def test_unregistered_report_workstream_is_refused(self):
         with self.assertRaises(LedgerError):
@@ -244,11 +292,11 @@ class ResolveDueCliTest(LedgerCase):
         self.assertFalse((self.root / "evidence").exists())
 
     def test_apply_records_true_and_false_and_leaves_the_rest(self):
-        true_id = self.issue("t", check=check("exit 0"))
-        false_id = self.issue("f", check=check("exit 1"))
+        true_id = self.issue("t", check=check("exit 10"))
+        false_id = self.issue("f", check=check("exit 11"))
         odd_id = self.issue("o", check=check("exit 7"))
         manual_id = self.issue("m")
-        future_id = self.issue("later", resolution_date="2099-01-01", check=check("exit 0"))
+        future_id = self.issue("later", resolution_date="2099-01-01", check=check("exit 10"))
 
         result = self.resolve_due("--apply")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -284,12 +332,34 @@ class ResolveDueCliTest(LedgerCase):
         self.assertNotIn(true_id, again_ids)
         self.assertIn(odd_id, again_ids)
 
+    def test_evidence_dir_defaults_beside_the_sidecar(self):
+        outcome_id = self.issue("t", check=check("exit 10"))
+        result = self.run_cli(
+            "resolve-due", "--log", str(self.log), "--events", str(self.events), "--apply"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        event = json.loads(self.events.read_text())
+        self.assertEqual(event["outcomeId"], outcome_id)
+        path = Path(event["evidence"].split("#sha256=")[0])
+        self.assertEqual(path.parent, self.root / "resolution-evidence" / "auto")
+        self.assertTrue(path.is_file())
+
+    def test_budget_defers_checks_instead_of_holding_up_a_council(self):
+        marker = self.root / "ran"
+        outcome_id = self.issue("t", check=check(f"touch {marker}; exit 10"))
+        result = self.resolve_due("--apply", "--budget-seconds", "0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = {row.get("outcomeId"): row for row in self.lines(result)}
+        self.assertEqual(rows[outcome_id]["status"], "deferred-budget")
+        self.assertFalse(marker.exists())
+        self.assertEqual(self.events.read_text(), "")
+
     def test_an_outcome_due_today_waits_until_the_day_has_ended(self):
         from datetime import datetime
         from zoneinfo import ZoneInfo
 
         today = datetime.now(ZoneInfo("America/New_York")).date().isoformat()
-        self.issue("today", resolution_date=today, check=check("exit 0"))
+        self.issue("today", resolution_date=today, check=check("exit 10"))
         result = self.resolve_due("--apply")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.lines(result), [
@@ -328,6 +398,29 @@ class ResolveDueCliTest(LedgerCase):
         )
         self.assertEqual(scoped.returncode, 0, scoped.stderr)
         self.assertIn("debt_workstream=pysystemtrade scoped_old_overdue=0", scoped.stdout)
+        self.assertIn("entries=0", scoped.stdout)
+        spanning = self.run_cli(
+            "report", "--log", str(self.log), "--events", str(self.events),
+            "--today", "2026-09-01", "--workstream", "pysystemtrade",
+            "--workstream", "tandr",
+        )
+        self.assertEqual(spanning.returncode, 3, spanning.stderr)
+        table = self.root / "outcome-workstreams.json"
+        table.write_text(json.dumps({"schemaVersion": 1, "workstreams": {}}))
+        shown = self.run_cli(
+            "report", "--log", str(self.log), "--events", str(self.events),
+            "--today", "2026-09-01", "--workstream", "tandr", "--json",
+        )
+        disclosed = json.loads(shown.stdout)["workstreamMap"]
+        table.write_text("not json")
+        unscoped = self.run_cli(
+            "report", "--log", str(self.log), "--events", str(self.events),
+            "--today", "2026-09-01", "--json",
+        )
+        self.assertNotIn("workstreamMap", json.loads(unscoped.stdout))
+        table.write_text(json.dumps({"schemaVersion": 1, "workstreams": {}}))
+        self.assertEqual(disclosed["path"], str(table))
+        self.assertEqual(disclosed["sha256"], hashlib.sha256(table.read_bytes()).hexdigest())
 
 
 if __name__ == "__main__":
