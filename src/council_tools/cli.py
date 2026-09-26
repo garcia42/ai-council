@@ -745,6 +745,9 @@ def command_resolve(args: argparse.Namespace) -> int:
         raise LedgerError("outcome must be true, false, or void")
     if args.outcome == "void" and not void_reason:
         raise LedgerError("void outcome requires --void-reason")
+    if args.resolver == RESOLVER:
+        # Reserved so a hand-recorded grade can never pass for a machine one.
+        raise LedgerError(f"--resolver {RESOLVER} is reserved for the resolve-due command")
     if args.outcome != "void" and void_reason:
         raise LedgerError("--void-reason is valid only with outcome=void")
     current = audit(args.log, args.events)

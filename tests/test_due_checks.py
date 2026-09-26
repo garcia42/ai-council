@@ -367,6 +367,17 @@ class ResolveDueCliTest(LedgerCase):
         ])
         self.assertEqual(self.events.read_text(), "")
 
+    def test_the_machine_resolver_name_is_reserved(self):
+        outcome_id = self.issue("t")
+        result = self.run_cli(
+            "resolve", outcome_id, "false", "--log", str(self.log),
+            "--events", str(self.events), "--evidence", "x",
+            "--resolver", "resolve-due", "--method", "deterministic",
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("reserved", result.stderr)
+        self.assertEqual(self.events.read_text(), "")
+
     def test_apply_refuses_live_paths_off_the_authority_host(self):
         from types import SimpleNamespace
         from unittest import mock
