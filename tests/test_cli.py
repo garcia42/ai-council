@@ -738,7 +738,15 @@ class ForecastCliTest(unittest.TestCase):
             encoding="utf-8",
         )
         args = cli.build_parser().parse_args(
-            ["attempt", "--log", str(self.log), "--spec", str(attempt_spec)]
+            [
+                "attempt",
+                "--log",
+                str(self.log),
+                "--spec",
+                str(attempt_spec),
+                "--ts",
+                "2026-08-22T12:00:00Z",
+            ]
         )
         self.assertIsNone(args.coordination_lock)
         cli._resolve_coordination_lock(args)
@@ -832,6 +840,8 @@ class ForecastCliTest(unittest.TestCase):
                 "--spec",
                 str(complete_spec),
                 "--check-only",
+                "--ts",
+                "2026-08-22T12:00:00Z",
             ]
         )
         cli._resolve_coordination_lock(args)
