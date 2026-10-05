@@ -292,6 +292,8 @@ def rehearse(source_root: Path, *, today: str) -> dict:
                         "actionIfTrue": "Continue activation review",
                         "actionIfFalse": "Hold activation and repair sealing",
                         "evidenceCutoffAt": "2026-08-22T12:00:00Z",
+                        "workstream": "council-tools",
+                        "noCheckReason": "fixture outcome; no command decides it",
                     },
                 }
             ),

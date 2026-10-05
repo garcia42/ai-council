@@ -77,8 +77,13 @@ authority rule, rehearse on that host, and rerun the council activation review.
    - `decisionLink` and `materiality`;
    - `actionIfTrue` and `actionIfFalse`;
    - `evidenceCutoffAt`;
-   - `workstream`, one of the registered slugs above;
-   - `check`, whenever the claim can be decided by a command:
+   - `workstream`, one of the registered slugs above (required: `attempt` refuses without it);
+   - exactly one of `check` or a non-empty `noCheckReason` saying why no command can decide
+     the claim (`attempt` refuses neither and both). The check's argv must carry the claim
+     verbatim, once, as `--claim <claim>`, so claim and predicate cannot drift. For the common
+     shapes, generate it: `/usr/bin/python3 /home/trader/council-tools/src/council_tools/claim_checks.py
+     spec merged-by|release-active-by|round-sealed --claim <claim> --deadline <resolutionDate> ...`
+     prints the `check` object. Otherwise write one by hand:
      `{"type": "command", "argv": ["/abs/path", ...], "cwd": "/abs/dir", "timeoutSeconds": N}`
      (N at most 600). Exit 10 means the claim came true and exit 11 that it did not; every other
      exit, including 0 and the 1 that a crash, `set -e` or an unmatched `grep` produces, leaves the

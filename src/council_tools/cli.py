@@ -74,6 +74,7 @@ from .forecasts import (
     load_jsonl,
     load_jsonl_with_raw_identity,
     make_attempt,
+    require_gradable_outcome,
     make_completion,
     make_supersede,
     repair_trailing_jsonl,
@@ -668,6 +669,7 @@ def command_attempt(args: argparse.Namespace) -> int:
     related_outcome_ids = outcome.get("relatedOutcomeIds") or []
     if not isinstance(related_outcome_ids, list):
         raise LedgerError("sharedOutcome.relatedOutcomeIds must be a list")
+    require_gradable_outcome(outcome)
     row = make_attempt(
         question=spec.get("question"),
         expected_seats=spec.get("expectedSeats"),
@@ -683,6 +685,7 @@ def command_attempt(args: argparse.Namespace) -> int:
         related_outcome_ids=related_outcome_ids,
         workstream=outcome.get("workstream"),
         check=outcome.get("check"),
+        no_check_reason=outcome.get("noCheckReason"),
     )
     append_ledger_row(
         args.log, row, coordination_lock=args.coordination_lock

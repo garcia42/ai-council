@@ -1,0 +1,17 @@
+[Unit]
+# STAGED, NOT INSTALLED. See operations/COUNCIL_RESOLVE_DUE_TIMER.md.
+Description=AI Council: grade due outcomes daily, just after each resolution day ends
+
+[Timer]
+# resolve-due grades an outcome only once its resolutionDate has ended in
+# America/New_York, so run shortly after midnight there. Checks that date their
+# evidence (reflog, pointer mtime, --at-field) do not care how late this runs;
+# round-sealed without --at-field turns undetermined after 24 h, so a day's lag
+# costs grades, never correctness.
+OnCalendar=*-*-* 00:40:00 America/New_York
+Persistent=true
+RandomizedDelaySec=5min
+Unit=council-resolve-due.service
+
+[Install]
+WantedBy=timers.target

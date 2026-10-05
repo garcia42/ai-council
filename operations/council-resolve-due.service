@@ -1,0 +1,21 @@
+[Unit]
+# STAGED, NOT INSTALLED. A new timer is a principal-only activation; see
+# operations/COUNCIL_RESOLVE_DUE_TIMER.md for the exact install and removal commands.
+# Runs on manny only: manny is the sole writer of the council ledger and its
+# resolution sidecar, and a second host appending would fork them.
+Description=AI Council: grade due council outcomes by their machine checks
+ConditionHost=manny
+
+[Service]
+Type=oneshot
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+UMask=0077
+# Exit 1 means a check's grade could not be recorded, or the ledger is invalid;
+# the unit then shows failed in `systemctl --user list-units --failed`.
+ExecStart=/usr/bin/python3 -B /home/trader/.claude/knowledge/council-eval/predictions_report.py --study council-legacy resolve-due --apply
+# resolve-due stops starting checks after --budget-seconds (default 900); each
+# check is capped at 600 s, so this bound is never the normal exit.
+TimeoutStartSec=30min
+KillMode=control-group
+NoNewPrivileges=true

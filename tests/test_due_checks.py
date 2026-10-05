@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -89,6 +90,89 @@ class FingerprintAndSchemaTest(unittest.TestCase):
         for label, value in cases.items():
             with self.subTest(label), self.assertRaises(LedgerError):
                 validate_check(value)
+
+
+class NoCheckReasonRowTest(unittest.TestCase):
+    def test_reason_stays_outside_the_fingerprint_and_rows_without_either_stay_valid(self):
+        plain = attempt("r", "2026-07-10")
+        reasoned = attempt("r", "2026-07-10", no_check_reason="needs a human reading")
+        self.assertEqual(
+            plain["sharedOutcome"]["fingerprint"], reasoned["sharedOutcome"]["fingerprint"]
+        )
+        # A row from before the rule carries neither; it must stay readable.
+        validate_attempt(plain)
+
+    def test_a_row_cannot_carry_both_or_an_empty_reason(self):
+        row = attempt("r", "2026-07-10", check=check("exit 10"))
+        row["sharedOutcome"]["noCheckReason"] = "and also a reason"
+        with self.assertRaisesRegex(LedgerError, "noCheckReason must be absent"):
+            validate_attempt(row)
+        with self.assertRaisesRegex(LedgerError, "noCheckReason"):
+            attempt("r", "2026-07-10", no_check_reason="   ")
+
+
+class AttemptCliRuleTest(unittest.TestCase):
+    """The rule binds where a NEW attempt is written: ``attempt``, not the reader."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.log = self.root / "log.jsonl"
+        self.log.touch()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def write(self, claim="c", **outcome):
+        spec = self.root / "attempt.json"
+        spec.write_text(json.dumps({
+            "question": "Merge it?",
+            "expectedSeats": ["code"],
+            "sharedOutcome": {
+                "claim": claim,
+                "resolutionDate": "2099-01-01",
+                "resolvedBy": "r",
+                "decisionLink": "d",
+                "materiality": "m",
+                "actionIfTrue": "t",
+                "actionIfFalse": "f",
+                **outcome,
+            },
+        }))
+        env = dict(os.environ)
+        env["PYTHONPATH"] = str(Path(__file__).parents[1] / "src")
+        return subprocess.run(
+            [sys.executable, "-m", "council_tools.cli", "attempt", "--log", str(self.log),
+             "--spec", str(spec)],
+            text=True, capture_output=True, env=env, check=False,
+        )
+
+    def test_an_ungradable_attempt_is_refused_and_nothing_is_written(self):
+        for outcome, message in (
+            ({}, "requires sharedOutcome.workstream"),
+            ({"workstream": "tandr"}, "exactly one of"),
+            ({"workstream": "tandr", "check": check("exit 10")}, "carry the claim"),
+        ):
+            with self.subTest(message):
+                result = self.write(**outcome)
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn(message, result.stderr)
+                self.assertEqual(self.log.read_text(), "")
+
+    def test_a_check_or_a_reason_is_recorded(self):
+        bound = {**check("exit 10"), "argv": ["/bin/sh", "-c", "exit 10", "sh", "--claim", "c"]}
+        for claim, outcome in (
+            ("c", {"workstream": "tandr", "check": bound}),
+            ("judged", {"workstream": "tandr",
+                        "noCheckReason": "production behaviour needs a human read"}),
+        ):
+            result = self.write(claim, **outcome)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        rows = [json.loads(line) for line in self.log.read_text().splitlines()]
+        self.assertEqual(rows[0]["sharedOutcome"]["check"], bound)
+        self.assertEqual(
+            rows[1]["sharedOutcome"]["noCheckReason"], "production behaviour needs a human read"
+        )
 
 
 class RunCheckTest(unittest.TestCase):
@@ -438,3 +522,35 @@ class ResolveDueCliTest(LedgerCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StagedTimerTest(unittest.TestCase):
+    """The staged resolve-due units say what the operator steps say."""
+
+    OPS = Path(__file__).parents[1] / "operations"
+
+    def test_service_grades_the_legacy_study_on_manny_only(self):
+        text = (self.OPS / "council-resolve-due.service").read_text()
+        exec_line = next(l for l in text.splitlines() if l.startswith("ExecStart="))
+        argv = exec_line.split("=", 1)[1].split()
+        self.assertEqual(argv[0], "/usr/bin/python3")
+        # --study is a global flag: it must come before the subcommand.
+        self.assertLess(argv.index("--study"), argv.index("resolve-due"))
+        self.assertEqual(argv[argv.index("--study") + 1], "council-legacy")
+        self.assertEqual(argv[-1], "--apply")
+        self.assertIn("ConditionHost=manny", text.splitlines())
+
+    def test_timer_fires_after_the_new_york_day_ends(self):
+        text = (self.OPS / "council-resolve-due.timer").read_text()
+        self.assertIn("OnCalendar=*-*-* 00:40:00 America/New_York", text.splitlines())
+        self.assertIn("Unit=council-resolve-due.service", text.splitlines())
+
+    @unittest.skipUnless(shutil.which("systemd-analyze"), "systemd-analyze not available")
+    def test_units_verify(self):
+        result = subprocess.run(
+            ["systemd-analyze", "--user", "verify",
+             str(self.OPS / "council-resolve-due.service"),
+             str(self.OPS / "council-resolve-due.timer")],
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)

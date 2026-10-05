@@ -62,6 +62,9 @@ SUPERSEDE_KIND = "council-superseded"
 WORKSTREAMS = ("controller", "council-tools", "plaintape", "pysystemtrade", "tandr")
 CHECK_KEYS = {"type", "argv", "cwd", "timeoutSeconds"}
 CHECK_MAX_TIMEOUT_SECONDS = 600
+#: The argv flag that carries the claim text into a check, so the predicate that
+#: grades a claim and the claim the seats priced are one string, not two.
+CHECK_CLAIM_FLAG = "--claim"
 #: Ledger-wide old-overdue count that blocks every scoped report too: about a
 #: week of hand grading. Scoping must not turn "forecasts get scored" into
 #: "active projects keep their own queue short".
@@ -168,6 +171,42 @@ def validate_check(value: Any) -> dict[str, Any]:
     return value
 
 
+def require_gradable_outcome(outcome: dict[str, Any]) -> None:
+    """Refuse a NEW attempt whose outcome no machine and no stated reason accounts for.
+
+    Every new attempt names its workstream and either carries a ``check`` that
+    passes the claim to its predicate verbatim, or explains in ``noCheckReason``
+    why no command can decide it. Called only where an attempt is written, never
+    by ``validate_attempt``: rows from before this rule stay valid as they are.
+    """
+
+    if "workstream" not in outcome:
+        raise LedgerError(
+            f"a new attempt requires sharedOutcome.workstream, one of {list(WORKSTREAMS)}"
+        )
+    has_check = "check" in outcome
+    has_reason = "noCheckReason" in outcome
+    if has_check == has_reason:
+        raise LedgerError(
+            "a new attempt requires exactly one of sharedOutcome.check and "
+            "sharedOutcome.noCheckReason"
+        )
+    if has_reason:
+        return
+    argv = validate_check(outcome["check"])["argv"]
+    claim = _require_text(outcome.get("claim"), "claim")
+    carried = [
+        argv[index + 1]
+        for index, item in enumerate(argv[:-1])
+        if item == CHECK_CLAIM_FLAG
+    ]
+    if carried != [claim]:
+        raise LedgerError(
+            f"check.argv must carry the claim exactly once as {CHECK_CLAIM_FLAG} <claim>, "
+            "byte-identical to sharedOutcome.claim"
+        )
+
+
 def outcome_fingerprint(
     claim: str, resolution_date: str, resolved_by: str, decision_link: str
 ) -> str:
@@ -208,6 +247,7 @@ def make_attempt(
     related_outcome_ids: Iterable[str] | None = None,
     workstream: str | None = None,
     check: dict[str, Any] | None = None,
+    no_check_reason: str | None = None,
 ) -> dict[str, Any]:
     if not isinstance(expected_seats, (list, tuple)):
         raise LedgerError("expectedSeats must be a list")
@@ -228,7 +268,9 @@ def make_attempt(
         outcome["workstream"] = workstream
     if check is not None:
         outcome["check"] = check
-    # ``check`` and ``workstream`` stay outside the fingerprint on purpose: an
+    if no_check_reason is not None:
+        outcome["noCheckReason"] = no_check_reason
+    # ``check``, ``noCheckReason`` and ``workstream`` stay outside the fingerprint on purpose: an
     # older runtime recomputes the fingerprint from the four pieces alone, so
     # binding either would make the first such attempt an invalid row to every
     # rollback target. The attempt row is append-only and ``resolve-due`` reads
@@ -286,6 +328,10 @@ def validate_attempt(row: dict[str, Any]) -> None:
         validate_workstream(outcome["workstream"])
     if "check" in outcome:
         validate_check(outcome["check"])
+    if "noCheckReason" in outcome:
+        if "check" in outcome:
+            raise LedgerError("sharedOutcome.noCheckReason must be absent when check is present")
+        _require_text(outcome["noCheckReason"], "sharedOutcome.noCheckReason")
     expected = outcome_fingerprint(claim, str(deadline), resolved_by, decision_link)
     if outcome.get("fingerprint") != expected:
         raise LedgerError("sharedOutcome fingerprint does not match its content")

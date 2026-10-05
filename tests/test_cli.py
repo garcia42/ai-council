@@ -145,6 +145,8 @@ class ForecastCliTest(unittest.TestCase):
                         "actionIfTrue": "Keep collecting",
                         "actionIfFalse": "Repair emission",
                         "evidenceCutoffAt": "2026-08-22T12:00:00Z",
+                        "workstream": "council-tools",
+                        "noCheckReason": "fixture outcome; no command decides it",
                     },
                 }
             ),
@@ -247,6 +249,8 @@ class ForecastCliTest(unittest.TestCase):
                 "actionIfTrue": "Proceed",
                 "actionIfFalse": "Hold",
                 "evidenceCutoffAt": "2026-08-22T12:00:00Z",
+                "workstream": "council-tools",
+                "noCheckReason": "fixture outcome; no command decides it",
             },
         }
         spec.write_text(json.dumps(payload), encoding="utf-8")
@@ -382,6 +386,8 @@ class ForecastCliTest(unittest.TestCase):
                         "actionIfTrue": "Continue local rehearsal",
                         "actionIfFalse": "Repair the lock boundary",
                         "evidenceCutoffAt": "2026-08-22T12:00:00Z",
+                        "workstream": "council-tools",
+                        "noCheckReason": "fixture outcome; no command decides it",
                     },
                 }
             ),
@@ -580,6 +586,8 @@ class ForecastCliTest(unittest.TestCase):
                         "actionIfTrue": "Continue local testing",
                         "actionIfFalse": "Repair identity checks",
                         "evidenceCutoffAt": "2026-08-22T12:00:00Z",
+                        "workstream": "council-tools",
+                        "noCheckReason": "fixture outcome; no command decides it",
                     },
                 }
             ),
@@ -732,6 +740,8 @@ class ForecastCliTest(unittest.TestCase):
                         "actionIfTrue": "Continue rehearsal",
                         "actionIfFalse": "Repair lock derivation",
                         "evidenceCutoffAt": "2026-08-22T12:00:00Z",
+                        "workstream": "council-tools",
+                        "noCheckReason": "fixture outcome; no command decides it",
                     },
                 }
             ),
