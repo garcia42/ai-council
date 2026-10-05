@@ -180,21 +180,26 @@ def require_gradable_outcome(outcome: dict[str, Any]) -> None:
     by ``validate_attempt``: rows from before this rule stay valid as they are.
     """
 
-    if "workstream" not in outcome:
+    # Values, not keys: ``make_attempt`` drops a None, so a JSON null would
+    # otherwise satisfy this rule and write a row carrying neither.
+    if outcome.get("workstream") is None:
         raise LedgerError(
             f"a new attempt requires sharedOutcome.workstream, one of {list(WORKSTREAMS)}"
         )
-    has_check = "check" in outcome
-    has_reason = "noCheckReason" in outcome
+    validate_workstream(outcome["workstream"])
+    has_check = outcome.get("check") is not None
+    has_reason = outcome.get("noCheckReason") is not None
     if has_check == has_reason:
         raise LedgerError(
             "a new attempt requires exactly one of sharedOutcome.check and "
             "sharedOutcome.noCheckReason"
         )
     if has_reason:
+        _require_text(outcome["noCheckReason"], "sharedOutcome.noCheckReason")
         return
     argv = validate_check(outcome["check"])["argv"]
-    claim = _require_text(outcome.get("claim"), "claim")
+    claim = outcome.get("claim")
+    _require_text(claim, "claim")
     carried = [
         argv[index + 1]
         for index, item in enumerate(argv[:-1])
@@ -205,6 +210,19 @@ def require_gradable_outcome(outcome: dict[str, Any]) -> None:
             f"check.argv must carry the claim exactly once as {CHECK_CLAIM_FLAG} <claim>, "
             "byte-identical to sharedOutcome.claim"
         )
+    # A library check reads its deadline from argv. One later than the outcome's
+    # would quietly grade "true by then" as "true now".
+    if len(argv) > 1 and argv[1].endswith("/claim_checks.py"):
+        deadlines = [
+            argv[index + 1]
+            for index, item in enumerate(argv[:-1])
+            if item == "--deadline"
+        ]
+        if deadlines != [outcome.get("resolutionDate")]:
+            raise LedgerError(
+                "a claim_checks.py check must carry --deadline equal to "
+                "sharedOutcome.resolutionDate"
+            )
 
 
 def outcome_fingerprint(

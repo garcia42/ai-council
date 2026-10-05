@@ -1,7 +1,7 @@
 """Run the machine-checkable resolution of due council outcomes.
 
-An attempt may carry ``sharedOutcome.check``: an absolute command the seats saw
-and the fingerprint binds. Once the outcome's resolution date has ended in
+An attempt may carry ``sharedOutcome.check``: an absolute command the seats saw.
+It is outside the fingerprint; the append-only attempt row is what fixes it. Once the outcome's resolution date has ended in
 America/New_York, ``resolve-due`` runs it. Exit 10 records TRUE and exit 11 FALSE,
 both as ``deterministic`` resolutions whose evidence is a retained JSON record
 of exactly what ran. Any other exit, a timeout, or a command that cannot start

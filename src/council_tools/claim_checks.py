@@ -184,13 +184,20 @@ def merged_by(args: argparse.Namespace) -> tuple[int, str]:
     The remote branch is read with ``ls-remote`` (and its tip fetched if absent),
     so a stale local clone cannot hide a merge.
 
-    * Not an ancestor of the remote tip now: FALSE. A merge is not undone short
-      of a force-push, which this check does not try to see.
+    * Not an ancestor of the remote tip now: FALSE, unless a patch-equivalent
+      commit is on the branch (a squash or rebase landed the same change under
+      another id), which is undetermined. A merge is not undone short of a
+      force-push, which this check does not try to see.
     * TRUE needs positive evidence from before the deadline ended: a reflog entry
-      of ``refs/remotes/<remote>/<branch>`` or ``refs/heads/<branch>`` stamped no
-      later than the deadline whose commit contains the sha (a push or fetch from
-      this clone saw it there), or a merge commit that GitHub itself created
-      before the deadline.
+      of ``refs/remotes/<remote>/<branch>`` stamped no later than the deadline
+      whose commit contains the sha (a push or fetch from this clone saw it on
+      the remote), or a merge commit that GitHub itself created before the
+      deadline. The local ``refs/heads/<branch>`` reflog is not evidence: it
+      records local merges, which can be pushed after the deadline.
+    * ``--repo`` must be the clone that pushes or fetches the branch, since that
+      is where the reflog lives; ``spec`` resolves a worktree to its main clone.
+      ``resolve-due`` gives a check no ssh-agent, so a remote that needs one
+      leaves every such claim undetermined.
     * FALSE also when the first-parent commit that brought the sha into the
       branch was committed after the deadline: it cannot have entered sooner.
     * Anything else, for example a fast-forward pushed from another machine and
@@ -210,15 +217,19 @@ def merged_by(args: argparse.Namespace) -> tuple[int, str]:
     if git(repo, "cat-file", "-e", f"{sha}^{{commit}}", ok=(0, 1, 128)).returncode != 0:
         raise Undetermined(f"{sha} is not a commit in {repo}")
     if not is_ancestor(repo, sha, tip):
+        cherry = git(repo, "cherry", tip, sha, f"{sha}^", ok=(0, 128)).stdout.split()
+        if cherry[:1] == ["-"]:
+            raise Undetermined(f"{sha} is not on {remote}/{branch}, but an equivalent patch is")
         return EXIT_FALSE, f"{sha} is not on {remote}/{branch} (tip {tip})"
-    for ref in (f"refs/remotes/{remote}/{branch}", f"refs/heads/{branch}"):
-        before = [entry for entry in _reflog(repo, ref) if entry[1] <= end]
-        for seen, stamp in before:
-            if git(repo, "cat-file", "-e", f"{seen}^{{commit}}", ok=(0, 1, 128)).returncode:
-                continue
-            if is_ancestor(repo, sha, seen):
-                when = datetime.fromtimestamp(stamp, timezone.utc).isoformat()
-                return EXIT_TRUE, f"{ref} held {seen}, which contains {sha}, at {when}"
+    ref = f"refs/remotes/{remote}/{branch}"
+    for seen, stamp in _reflog(repo, ref):
+        if stamp > end:
+            continue
+        if git(repo, "cat-file", "-e", f"{seen}^{{commit}}", ok=(0, 1, 128)).returncode:
+            continue
+        if is_ancestor(repo, sha, seen):
+            when = datetime.fromtimestamp(stamp, timezone.utc).isoformat()
+            return EXIT_TRUE, f"{ref} held {seen}, which contains {sha}, at {when}"
     introducing = _introducing_commit(repo, sha, tip)
     shown = git(repo, "show", "-s", "--format=%P%x09%ce%x09%ct", introducing).stdout.strip()
     parents, committer, committed = shown.split("\t")
@@ -260,6 +271,11 @@ def release_active_by(args: argparse.Namespace) -> tuple[int, str]:
     commit id: an installed shim's ``EXPECTED_COMMIT``, a unit file's
     ``releases/<sha>`` path, a ``current`` symlink. Every 40-hex id it contains
     must have ``--sha`` as an ancestor in ``--repo``.
+
+    Every id counts, so a pointer that also names a rollback commit in a comment
+    grades as if that release were active too. A copy that preserves the old
+    mtime (``cp -p``, ``install -p``, ``rsync -t``) defeats the rule below; write
+    pointers without preserving timestamps.
 
     The state now is the state at the deadline only for a pointer that has not
     changed since (its mtime, or a symlink's own lstat mtime, is no later than the
@@ -351,9 +367,9 @@ def round_sealed(args: argparse.Namespace) -> tuple[int, str]:
       that matches nothing is far likelier a mistake than a fact.
     * With ``--at-field``, a matched record passes only if that timestamp is no
       later than the deadline: TRUE if one does, otherwise FALSE.
-    * Without it, sealing is taken to be permanent: none sealed now is FALSE,
-      and one sealed now is TRUE only within ``--max-lateness-hours`` of the
-      deadline, since nothing then shows it was sealed in time.
+    * Without it, sealing is taken to be permanent: none sealed now is FALSE.
+      One sealed now is undetermined, because nothing shows it was sealed in
+      time; give ``--at-field`` whenever the record carries a timestamp.
     """
 
     end = deadline_end(args.deadline)
@@ -381,12 +397,7 @@ def round_sealed(args: argparse.Namespace) -> tuple[int, str]:
         return EXIT_FALSE, f"{len(matched)} matched; none sealed by {end.isoformat()}"
     if not passing:
         return EXIT_FALSE, f"{len(matched)} matched; none sealed now, so none by the deadline"
-    lateness = datetime.now(timezone.utc) - end
-    if lateness > timedelta(hours=args.max_lateness_hours):
-        raise Undetermined(
-            f"sealed now, but checked {lateness} after the deadline with no --at-field to date it"
-        )
-    return EXIT_TRUE, f"{len(matched)} matched; sealed when checked {lateness} after the deadline"
+    raise Undetermined("sealed now, but with no --at-field nothing dates it before the deadline")
 
 
 # ------------------------------------------------------------------- the CLI
@@ -430,7 +441,6 @@ def parser() -> argparse.ArgumentParser:
     rounds.add_argument("--require", action="append", type=key_value, default=[])
     rounds.add_argument("--require-prefix", action="append", type=key_value, default=[])
     rounds.add_argument("--at-field")
-    rounds.add_argument("--max-lateness-hours", type=int, default=24)
     return top
 
 
@@ -463,6 +473,19 @@ def spec(argv: list[str]) -> dict:
     front.add_argument("--python", default=CHECK_PYTHON, type=absolute_path)
     known, rest = front.parse_known_args(argv)
     args = parser().parse_args(rest)
+    if getattr(args, "repo", None):
+        # A session worktree is deleted after merge; its main clone keeps the
+        # objects and the remote-tracking reflog the check reads.
+        try:
+            common = git(args.repo, "rev-parse", "--path-format=absolute",
+                         "--git-common-dir").stdout.strip()
+        except Undetermined as exc:
+            raise SystemExit(f"spec: {exc}") from exc
+        main_clone = str(Path(common).parent) if Path(common).name == ".git" else common
+        positions = [i for i in range(1, len(rest)) if rest[i - 1] == "--repo"]
+        if len(positions) != 1:
+            raise SystemExit("spec: pass the repository as a separate argument: --repo <dir>")
+        rest[positions[0]] = args.repo = main_clone
     if getattr(args, "sha", None) and not FULL_SHA_RE.fullmatch(args.sha):
         try:
             full = resolve_commit(args.repo, args.sha)

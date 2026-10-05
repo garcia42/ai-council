@@ -16,6 +16,8 @@ installs these files.
   match.
 - The host is `manny`. The unit also carries `ConditionHost=manny`, because
   manny is the only host allowed to write the ledger and its sidecar.
+- The on-duty failure template `onduty-failed@.service` is installed as a user
+  unit (it is the service's `OnFailure=` target; verified present 2026-10-05).
 - Lingering is enabled for `trader` (`loginctl show-user trader -p Linger`), so
   user timers run without a login session. This was verified on 2026-10-04.
 
@@ -39,8 +41,9 @@ journalctl --user -u council-resolve-due.service -n 50
 ```
 
 The last line of the output is a summary: `{"applied": true, "due": N, "errors": 0, "summary": true}`.
-Exit 1 means at least one grade could not be recorded, or the ledger is
-invalid. Either way the unit shows as failed.
+Exit 1 means at least one grade could not be recorded, the ledger is
+invalid, or the shim's pin does not match. Either way the unit fails and
+`OnFailure=onduty-failed@%n.service` sends a Pushover.
 
 ## Remove
 
@@ -53,16 +56,5 @@ systemctl --user daemon-reload
 Removing the timer loses nothing. Step 1 of every council still runs
 `resolve-due --apply`.
 
-## Cron alternative
-
-If a crontab entry is preferred to a user timer, use one or the other, never
-both. `resolve-due` can safely run twice, because a graded outcome is skipped,
-but two schedulers firing together contend for the ledger's evidence lock.
-
-```
-CRON_TZ=America/New_York
-40 0 * * * /home/trader/bin/cron_safe.sh /usr/bin/python3 -B /home/trader/.claude/knowledge/council-eval/predictions_report.py --study council-legacy resolve-due --apply
-```
-
-Note that `cron_safe.sh` pages only on exit 127 (script missing). The systemd
-unit reports exit 1 as a failed unit, so prefer the timer.
+Use this timer, never a second scheduler beside it: two would contend for the
+ledger's evidence lock.

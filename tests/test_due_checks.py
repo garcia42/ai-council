@@ -539,6 +539,7 @@ class StagedTimerTest(unittest.TestCase):
         self.assertEqual(argv[argv.index("--study") + 1], "council-legacy")
         self.assertEqual(argv[-1], "--apply")
         self.assertIn("ConditionHost=manny", text.splitlines())
+        self.assertIn("OnFailure=onduty-failed@%n.service", text.splitlines())
 
     def test_timer_fires_after_the_new_york_day_ends(self):
         text = (self.OPS / "council-resolve-due.timer").read_text()

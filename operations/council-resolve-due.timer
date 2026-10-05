@@ -4,10 +4,10 @@ Description=AI Council: grade due outcomes daily, just after each resolution day
 
 [Timer]
 # resolve-due grades an outcome only once its resolutionDate has ended in
-# America/New_York, so run shortly after midnight there. Checks that date their
-# evidence (reflog, pointer mtime, --at-field) do not care how late this runs;
-# round-sealed without --at-field turns undetermined after 24 h, so a day's lag
-# costs grades, never correctness.
+# America/New_York, so run shortly after midnight there. Library checks date
+# their evidence (reflog, pointer mtime, --at-field), so lateness never changes
+# a verdict; it only costs grades, e.g. a release pointer rewritten by the next
+# install before the check ran.
 OnCalendar=*-*-* 00:40:00 America/New_York
 Persistent=true
 RandomizedDelaySec=5min

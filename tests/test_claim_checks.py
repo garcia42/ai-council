@@ -90,8 +90,12 @@ class GitFixture(unittest.TestCase):
     def commit(self, repo, when):
         # Distinct messages: two empty commits with one parent, date and message
         # are the same commit, which would quietly turn a merge into a no-op.
+        # Each commit also carries its own file, so patch identity (git cherry)
+        # tells commits apart the way it does real changes.
         self.commits = getattr(self, "commits", 0) + 1
-        sh(repo, "commit", "-q", "--allow-empty", "-m", f"{self.commits} at {when}", when=when)
+        Path(repo, f"f{self.commits}").write_text(f"{self.commits}\n")
+        sh(repo, "add", f"f{self.commits}")
+        sh(repo, "commit", "-q", "-m", f"{self.commits} at {when}", when=when)
         return sh(repo, "rev-parse", "HEAD")
 
     def merged(self, sha, *, env=None, repo=None):
@@ -129,6 +133,27 @@ class MergedByTest(GitFixture):
         result = self.merged(sha)
         self.assertEqual(result.returncode, EXIT_UNDETERMINED, result.stdout + result.stderr)
         self.assertIn("nothing recorded here", result.stdout)
+
+    def test_a_local_merge_before_the_deadline_pushed_after_is_not_true(self):
+        # refs/heads/main moved before the deadline, but the remote only got it
+        # after: the local branch reflog is not evidence about the remote.
+        sha = self.commit(self.clone, BEFORE)
+        sh(self.clone, "push", "-q", "origin", "HEAD:main", when=AFTER)
+        result = self.merged(sha)
+        self.assertEqual(result.returncode, EXIT_UNDETERMINED, result.stdout + result.stderr)
+
+    def test_an_equivalent_patch_under_another_id_is_left_for_a_human(self):
+        # The reviewed commit stays on a topic branch in the author's clone; a
+        # rebase lands the same patch on main under another id.
+        sh(self.clone, "checkout", "-q", "-b", "topic")
+        sha = self.commit(self.clone, BEFORE)
+        sh(self.clone, "checkout", "-q", "main")
+        self.commit(self.clone, BEFORE)
+        sh(self.clone, "cherry-pick", sha, when=BEFORE)
+        sh(self.clone, "push", "-q", "origin", "HEAD:main", when=BEFORE)
+        result = self.merged(sha)
+        self.assertEqual(result.returncode, EXIT_UNDETERMINED, result.stdout + result.stderr)
+        self.assertIn("equivalent patch", result.stdout)
 
     def test_a_fetch_seen_before_the_deadline_counts(self):
         sha = self.commit(self.other, BEFORE)
@@ -259,11 +284,11 @@ class RoundSealedTest(unittest.TestCase):
         self.rows({"round": {"id": "r2"}, "status": "OPEN"})
         self.assertEqual(self.sealed().returncode, EXIT_UNDETERMINED)
 
-    def test_sealed_now_without_a_timestamp_is_true_only_soon_after_the_deadline(self):
+    def test_sealed_now_without_a_timestamp_is_never_graded_true(self):
+        # "Sealed when checked" says nothing about the deadline, however soon after.
         self.rows({"round": {"id": "r1"}, "status": "SEALED"})
         yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).date().isoformat()
-        self.assertEqual(self.sealed(deadline=yesterday).returncode, EXIT_TRUE)
-        self.assertEqual(self.sealed(deadline="2026-01-01").returncode, EXIT_UNDETERMINED)
+        self.assertEqual(self.sealed(deadline=yesterday).returncode, EXIT_UNDETERMINED)
 
     def test_an_unreadable_source_is_undetermined(self):
         self.assertEqual(self.sealed().returncode, EXIT_UNDETERMINED)
@@ -301,9 +326,22 @@ class SpecTest(GitFixture):
         spec = json.loads(made.stdout)
         self.assertIn(sha, spec["argv"])
         validate_check(spec)
-        require_gradable_outcome({"claim": claim, "workstream": "council-tools", "check": spec})
+        require_gradable_outcome({"claim": claim, "workstream": "council-tools",
+                                  "resolutionDate": DEADLINE, "check": spec})
         # End to end, the way resolve-due runs it: clean environment, verdict by exit code.
         self.assertEqual(run_check(spec)["verdict"], "true")
+
+    def test_spec_names_the_main_clone_not_a_worktree(self):
+        sha = self.commit(self.clone, BEFORE)
+        worktree = Path(self.tmp.name) / "session"
+        sh(self.clone, "worktree", "add", "-q", "-b", "session", str(worktree))
+        made = check(
+            "spec", "merged-by", "--claim", "c", "--deadline", DEADLINE,
+            "--repo", str(worktree), "--sha", sha, "--branch", "main",
+        )
+        self.assertEqual(made.returncode, 0, made.stderr)
+        argv = json.loads(made.stdout)["argv"]
+        self.assertEqual(argv[argv.index("--repo") + 1], str(self.clone.resolve()))
 
     def test_spec_defaults_name_the_installed_runtime(self):
         made = check(
@@ -321,6 +359,30 @@ class SpecTest(GitFixture):
 
 class GradableOutcomeRuleTest(unittest.TestCase):
     CHECK = {"type": "command", "argv": ["/bin/true", "--claim", "c"], "cwd": "/", "timeoutSeconds": 5}
+    LIBRARY = {**CHECK, "argv": ["/usr/bin/python3", "/x/claim_checks.py", "merged-by",
+                                 "--claim", "c", "--deadline", "2026-10-04"]}
+
+    def test_a_library_check_must_use_the_outcome_deadline(self):
+        base = {"claim": "c", "workstream": "tandr", "check": self.LIBRARY}
+        require_gradable_outcome({**base, "resolutionDate": "2026-10-04"})
+        with self.assertRaisesRegex(LedgerError, "--deadline equal to"):
+            require_gradable_outcome({**base, "resolutionDate": "2026-10-03"})
+
+    def test_null_is_not_a_value(self):
+        # make_attempt drops None, so a null would otherwise write a row with neither.
+        for outcome in (
+            {"claim": "c", "workstream": None, "noCheckReason": "r"},
+            {"claim": "c", "workstream": "tandr", "noCheckReason": None},
+            {"claim": "c", "workstream": "tandr", "check": None, "noCheckReason": None},
+            {"claim": "c", "workstream": "nobody", "noCheckReason": "r"},
+            {"claim": "c", "workstream": "tandr", "noCheckReason": "  "},
+        ):
+            with self.subTest(outcome), self.assertRaises(LedgerError):
+                require_gradable_outcome(outcome)
+
+    def test_the_claim_is_compared_as_written(self):
+        with self.assertRaisesRegex(LedgerError, "carry the claim"):
+            require_gradable_outcome({"claim": "c ", "workstream": "tandr", "check": self.CHECK})
 
     def test_accepts_a_check_carrying_the_claim_or_a_reason(self):
         require_gradable_outcome({"claim": "c", "workstream": "tandr", "check": self.CHECK})
