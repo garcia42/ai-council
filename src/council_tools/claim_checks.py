@@ -184,10 +184,6 @@ def merged_by(args: argparse.Namespace) -> tuple[int, str]:
     The remote branch is read with ``ls-remote`` (and its tip fetched if absent),
     so a stale local clone cannot hide a merge.
 
-    * Not an ancestor of the remote tip now: FALSE, unless a patch-equivalent
-      commit is on the branch (a squash or rebase landed the same change under
-      another id), which is undetermined. A merge is not undone short of a
-      force-push, which this check does not try to see.
     * TRUE needs positive evidence from before the deadline ended: a reflog entry
       of ``refs/remotes/<remote>/<branch>`` stamped no later than the deadline
       whose commit contains the sha (a push or fetch from this clone saw it on
@@ -198,6 +194,15 @@ def merged_by(args: argparse.Namespace) -> tuple[int, str]:
       is where the reflog lives; ``spec`` resolves a worktree to its main clone.
       ``resolve-due`` gives a check no ssh-agent, so a remote that needs one
       leaves every such claim undetermined.
+    * Not an ancestor of the remote tip now, and no such evidence: FALSE, unless
+      ``git cherry`` finds the commit's own patch on the branch (a cherry-pick or
+      a rebase of it), which is undetermined. A squash of several commits is NOT
+      recognised and grades FALSE: name the commit that landed. A commit removed
+      by a force-push after the deadline also grades FALSE unless this clone saw
+      it there first; the branches councils name are not force-pushed.
+    * It is not read-only: a missing tip is fetched into ``--repo``, adding
+      objects and a remote-tracking reflog entry stamped now, after the deadline,
+      so it can never be evidence for the claim it was fetched for.
     * FALSE also when the first-parent commit that brought the sha into the
       branch was committed after the deadline: it cannot have entered sooner.
     * Anything else, for example a fast-forward pushed from another machine and
@@ -216,11 +221,6 @@ def merged_by(args: argparse.Namespace) -> tuple[int, str]:
             f"refs/heads/{branch}")
     if git(repo, "cat-file", "-e", f"{sha}^{{commit}}", ok=(0, 1, 128)).returncode != 0:
         raise Undetermined(f"{sha} is not a commit in {repo}")
-    if not is_ancestor(repo, sha, tip):
-        cherry = git(repo, "cherry", tip, sha, f"{sha}^", ok=(0, 128)).stdout.split()
-        if cherry[:1] == ["-"]:
-            raise Undetermined(f"{sha} is not on {remote}/{branch}, but an equivalent patch is")
-        return EXIT_FALSE, f"{sha} is not on {remote}/{branch} (tip {tip})"
     ref = f"refs/remotes/{remote}/{branch}"
     for seen, stamp in _reflog(repo, ref):
         if stamp > end:
@@ -230,6 +230,15 @@ def merged_by(args: argparse.Namespace) -> tuple[int, str]:
         if is_ancestor(repo, sha, seen):
             when = datetime.fromtimestamp(stamp, timezone.utc).isoformat()
             return EXIT_TRUE, f"{ref} held {seen}, which contains {sha}, at {when}"
+    if not is_ancestor(repo, sha, tip):
+        parents = git(repo, "rev-list", "--parents", "-n", "1", sha).stdout.split()
+        if len(parents) > 1:
+            cherry = git(repo, "cherry", tip, sha, parents[1]).stdout.split()
+            if cherry[:1] == ["-"]:
+                raise Undetermined(
+                    f"{sha} is not on {remote}/{branch}, but an equivalent patch is"
+                )
+        return EXIT_FALSE, f"{sha} is not on {remote}/{branch} (tip {tip})"
     introducing = _introducing_commit(repo, sha, tip)
     shown = git(repo, "show", "-s", "--format=%P%x09%ce%x09%ct", introducing).stdout.strip()
     parents, committer, committed = shown.split("\t")
@@ -410,11 +419,15 @@ SHAPES = {
 
 
 def parser() -> argparse.ArgumentParser:
-    top = argparse.ArgumentParser(prog="claim_checks.py", description=__doc__.split("\n\n")[0])
+    # No abbreviations: ``--deadl`` or ``--cla`` after the bound ``--deadline`` and
+    # ``--claim`` would silently win and unbind what the attempt rule checked.
+    top = argparse.ArgumentParser(
+        prog="claim_checks.py", description=__doc__.split("\n\n")[0], allow_abbrev=False
+    )
     shapes = top.add_subparsers(dest="shape", required=True)
 
     def shape(name: str) -> argparse.ArgumentParser:
-        sub = shapes.add_parser(name)
+        sub = shapes.add_parser(name, allow_abbrev=False)
         sub.add_argument("--claim", required=True)
         sub.add_argument("--deadline", required=True, type=iso_date,
                          help="the outcome's resolutionDate")
@@ -467,7 +480,7 @@ def spec(argv: list[str]) -> dict:
     author can still see which commit they name.
     """
 
-    front = argparse.ArgumentParser(add_help=False)
+    front = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     front.add_argument("--timeout-seconds", type=int)
     front.add_argument("--script", default=INSTALLED_SCRIPT, type=absolute_path)
     front.add_argument("--python", default=CHECK_PYTHON, type=absolute_path)

@@ -41,9 +41,11 @@ journalctl --user -u council-resolve-due.service -n 50
 ```
 
 The last line of the output is a summary: `{"applied": true, "due": N, "errors": 0, "summary": true}`.
-Exit 1 means at least one grade could not be recorded, the ledger is
-invalid, or the shim's pin does not match. Either way the unit fails and
-`OnFailure=onduty-failed@%n.service` sends a Pushover.
+Exit 1 means a grade could not be written for a reason other than another
+session grading the same outcome first (that race prints `graded-elsewhere`
+and is not a failure), the ledger is invalid, or the shim's pin does not
+match. Any of those fails the unit and `OnFailure=onduty-failed@%n.service`
+sends a Pushover; read the journal before concluding the ledger is damaged.
 
 ## Remove
 
@@ -56,5 +58,5 @@ systemctl --user daemon-reload
 Removing the timer loses nothing. Step 1 of every council still runs
 `resolve-due --apply`.
 
-Use this timer, never a second scheduler beside it: two would contend for the
-ledger's evidence lock.
+Use this timer, never a second scheduler beside it: two would run the same
+checks twice, and the loser of each race records nothing.

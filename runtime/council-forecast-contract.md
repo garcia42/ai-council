@@ -28,9 +28,9 @@ authority rule, rehearse on that host, and rerun the council activation review.
    lists the commands it would run. It stops starting new checks after `--budget-seconds`
    (default 900) and leaves the rest due for the next council. A check may run more than once
    (a retry, or two sessions at the same time), so it must only read. `resolve-due` exits 1 when
-   a per-outcome write failed, typically because another session graded that outcome first. That
-   is not invalid ledger state, and it does not stop the council; run the report and read its
-   exit status instead.
+   a per-outcome write failed for a reason other than another session grading that outcome first
+   (that race prints `graded-elsewhere` and is not a failure). Neither is invalid ledger state, and
+   neither stops the council; run the report and read its exit status instead.
 
    `--workstream` scopes the grading-debt gate, and only that gate: an overdue outcome counts
    when it belongs to the named workstream or to none, so unclassified debt blocks every
@@ -80,7 +80,8 @@ authority rule, rehearse on that host, and rerun the council activation review.
    - `workstream`, one of the registered slugs above (required: `attempt` refuses without it);
    - exactly one of `check` or a non-empty `noCheckReason` saying why no command can decide
      the claim (`attempt` refuses neither and both). The check's argv must carry the claim
-     verbatim, once, as `--claim <claim>`, so claim and predicate cannot drift. For the common
+     verbatim, once, as `--claim <claim>`, so the evidence record carries the claim the seats
+     priced; whether the predicate tests that claim and not a proxy is still the seats' call. For the common
      shapes, generate it: `/usr/bin/python3 /home/trader/council-tools/src/council_tools/claim_checks.py
      spec merged-by|release-active-by|round-sealed --claim <claim> --deadline <resolutionDate> ...`
      prints the `check` object. Otherwise write one by hand:

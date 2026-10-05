@@ -782,6 +782,19 @@ def command_resolve(args: argparse.Namespace) -> int:
     return 0
 
 
+def _graded_elsewhere(events: str, outcome_id: str) -> bool:
+    """Whether the sidecar now holds a resolution for ``outcome_id``."""
+
+    try:
+        rows = [item for _, item in load_jsonl(events)]
+    except (LedgerError, OSError):
+        return False
+    return any(
+        row.get("kind") == "outcome-resolution" and row.get("outcomeId") == outcome_id
+        for row in rows
+    )
+
+
 def command_resolve_due(args: argparse.Namespace) -> int:
     """List, or with --apply run and record, the checks of due outcomes.
 
@@ -840,8 +853,12 @@ def command_resolve_due(args: argparse.Namespace) -> int:
                 coordination_lock=args.coordination_lock,
             )
         except (LedgerError, OSError) as exc:
-            # Per-outcome boundary: a concurrent grade or a write fault on one
-            # outcome must not stop the others. It still fails the command.
+            # Per-outcome boundary: a write fault on one outcome must not stop the
+            # others. A grade another session recorded first is not a fault: the
+            # timer's OnFailure page must not fire for that race.
+            if isinstance(exc, LedgerError) and _graded_elsewhere(args.events, outcome_id):
+                print(json.dumps({**line, "status": "graded-elsewhere"}, sort_keys=True))
+                continue
             failures += 1
             print(json.dumps({**line, "status": "error", "error": str(exc)}, sort_keys=True))
             continue

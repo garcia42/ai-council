@@ -212,7 +212,7 @@ def require_gradable_outcome(outcome: dict[str, Any]) -> None:
         )
     # A library check reads its deadline from argv. One later than the outcome's
     # would quietly grade "true by then" as "true now".
-    if len(argv) > 1 and argv[1].endswith("/claim_checks.py"):
+    if any(item.endswith("/claim_checks.py") for item in argv[1:]):
         deadlines = [
             argv[index + 1]
             for index, item in enumerate(argv[:-1])

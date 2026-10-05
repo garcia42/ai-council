@@ -155,6 +155,28 @@ class MergedByTest(GitFixture):
         self.assertEqual(result.returncode, EXIT_UNDETERMINED, result.stdout + result.stderr)
         self.assertIn("equivalent patch", result.stdout)
 
+    def test_seen_on_the_remote_before_the_deadline_stays_true_after_a_force_push(self):
+        sha = self.commit(self.clone, BEFORE)
+        sh(self.clone, "push", "-q", "origin", "HEAD:main", when=BEFORE)
+        # Another machine force-pushes main back after the deadline; this clone
+        # saw the commit on the remote before it, which is what the claim asks.
+        sh(self.other, "fetch", "-q", "origin")
+        base = sh(self.clone, "rev-parse", "HEAD~1")
+        sh(self.other, "push", "-q", "--force", "origin", f"{base}:refs/heads/main", when=AFTER)
+        result = self.merged(sha)
+        self.assertEqual(result.returncode, EXIT_TRUE, result.stdout + result.stderr)
+
+    def test_abbreviated_flags_cannot_override_the_bound_ones(self):
+        sha = self.commit(self.clone, BEFORE)
+        sh(self.clone, "push", "-q", "origin", "HEAD:main", when=BEFORE)
+        for extra in (["--deadl", "2099-01-01"], ["--cla", "another claim"]):
+            with self.subTest(extra):
+                result = check(
+                    "merged-by", "--claim", "c", "--deadline", DEADLINE, *extra,
+                    "--repo", str(self.clone), "--sha", sha, "--branch", "main",
+                )
+                self.assertNotIn(result.returncode, (EXIT_TRUE, EXIT_FALSE), result.stdout)
+
     def test_a_fetch_seen_before_the_deadline_counts(self):
         sha = self.commit(self.other, BEFORE)
         sh(self.other, "push", "-q", "origin", "HEAD:main", when=BEFORE)
@@ -367,6 +389,10 @@ class GradableOutcomeRuleTest(unittest.TestCase):
         require_gradable_outcome({**base, "resolutionDate": "2026-10-04"})
         with self.assertRaisesRegex(LedgerError, "--deadline equal to"):
             require_gradable_outcome({**base, "resolutionDate": "2026-10-03"})
+        # An interpreter flag before the script must not hide it from the rule.
+        flagged = {**self.LIBRARY, "argv": ["/usr/bin/python3", "-I", *self.LIBRARY["argv"][1:]]}
+        with self.assertRaisesRegex(LedgerError, "--deadline equal to"):
+            require_gradable_outcome({**base, "check": flagged, "resolutionDate": "2026-10-03"})
 
     def test_null_is_not_a_value(self):
         # make_attempt drops None, so a null would otherwise write a row with neither.

@@ -16,6 +16,7 @@ from council_tools.forecasts import (
     append_ledger_row,
     audit,
     make_attempt,
+    new_id,
     outcome_fingerprint,
     validate_attempt,
     validate_check,
@@ -363,6 +364,25 @@ class ResolveDueCliTest(LedgerCase):
 
     def lines(self, result):
         return [json.loads(line) for line in result.stdout.splitlines()]
+
+    def test_a_grade_recorded_first_by_another_session_is_not_a_failure(self):
+        # The check itself plays the other session: it records a human grade for
+        # its own outcome, then exits 10, so resolve-due's append loses the race.
+        # A staged timer pages on exit 1, and this race is not a fault.
+        outcome_id = new_id("outcome")
+        src = Path(__file__).parents[1] / "src"
+        human = (
+            f"PYTHONPATH={src} {sys.executable} -m council_tools.cli resolve {outcome_id} true "
+            f"--log {self.log} --events {self.events} --evidence elsewhere "
+            "--resolver human --method manual-reviewed --reviewer other; exit 10"
+        )
+        self.issue("raced", check=check(human), outcome_id=outcome_id)
+        result = self.resolve_due("--apply")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        rows = {row.get("outcomeId"): row for row in self.lines(result)}
+        self.assertEqual(rows[outcome_id]["status"], "graded-elsewhere")
+        events = [json.loads(line) for line in self.events.read_text().splitlines()]
+        self.assertEqual([e["resolver"] for e in events], ["human"])
 
     def test_dry_run_lists_and_writes_nothing(self):
         marker = self.root / "ran"
